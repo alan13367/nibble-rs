@@ -108,6 +108,10 @@ difference in a comment.
   `nibble inspect <file>`.** Do not rely on memory or on the Hugging Face config.
 - **Reference binaries** are llama.cpp release builds in `tools/llama.cpp/<build>/`.
   Download them from the ggml-org/llama.cpp GitHub releases if they are missing.
+  On Apple Silicon, put the macOS x64 build in `tools/llama.cpp/<build>-x64/`
+  too: with Rosetta 2 and `ROSETTA_ADVERTISE_AVX=1`, it and
+  `--target x86_64-apple-darwin` builds of nibble run the AVX2 kernels, so
+  the x86 path can be compared locally (correctness only, not speed).
 
 ### Tokenizer changes
 
@@ -127,12 +131,22 @@ combining marks, emoji sequences, and special tokens.
 Compare greedy output with llama.cpp:
 
 ```sh
-nibble run -m models/MODEL.gguf -f prompt.txt -n 64 --greedy
+nibble run -m models/MODEL.gguf -f prompt.txt -n 64 --greedy -c 512
 tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 64 \
-    --temp 0 -no-cnv --no-display-prompt -fa off
+    --temp 0 -no-cnv --no-display-prompt -c 512 \
+    -ngl 0 --device none -fa off --no-repack -b 512 -ub 1
 ```
 
 - **Use `-fa off`.** nibble's attention matches llama.cpp's non-flash-attention path.
+- **Use `--no-repack`.** By default llama.cpp repacks Q4_K, Q5_K, Q6_K and
+  Q8_0 weights and multiplies them with other kernels than the ones nibble
+  transcribes.
+- **Use `-ub 1`.** nibble evaluates a prompt one token at a time; llama.cpp
+  evaluates a batch with GEMM kernels that round differently. Keep `-b`
+  large: llama-completion stops early when a chunk of `-b` prompt tokens
+  ends with an end-of-generation token such as `<|im_end|>`, which every
+  chat prompt contains.
+- **Use `--device none`** so that no layer or op goes to the GPU.
 - **llama.cpp's `-f` strips one trailing newline** from the prompt file. Make
   sure both tools tokenize the same prompt, e.g. with `--verbose-prompt`.
 - **`llama-completion` appends `[end of text]`** when generation stops on an
@@ -142,17 +156,32 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
   - the top two logits at that step are within roughly 0.1 of each other, and
   - llama.cpp itself flips at that token between `-fa on` and `-fa off`.
 
-  Anything else is a bug: find the first layer that differs. Running nibble
-  with `NIBBLE_KERNELS=scalar` tells a SIMD kernel bug from a model bug.
+  Anything else is a bug: find the first layer that differs (a
+  `cb_eval` callback in a program linked against the release's `libllama`
+  prints llama.cpp's tensors by name). Running nibble with
+  `NIBBLE_KERNELS=scalar` tells a SIMD kernel bug from a model bug.
 - **Match ggml's numerics.** Activations are converted to the weight type's dot
-  type before matrix products (F16→F16, BF16→BF16, Q8_0→Q8_0), and the KV cache
-  is F16. Keep this when adding formats or kernels.
+  type before matrix products (BF16→BF16, Q8_0→Q8_0, K-quants→Q8_K); F32
+  and F16 weights, and the F16 KV cache, meet the f32 activation as it is
+  (ggml stopped rounding it to f16 in November 2026, before b12359). Keep
+  this when adding formats or kernels.
 - **SIMD kernels transcribe ggml's kernel for the same instruction set**,
   accumulator layout and reduction order included (they differ between
   `vec.cpp` and `quants.c`), so results match llama.cpp on the same CPU.
   Attention follows llama.cpp without flash attention: V is stored
-  transposed, the softmax probabilities are rounded to f16, and rows are
-  padded as llama.cpp pads the cache.
+  transposed, the queries and softmax probabilities stay f32, and the
+  softmax runs over the row padded with masked (`-inf`) positions, as
+  llama.cpp pads the cache.
+- **Fuse where clang fuses.** llama.cpp's releases are built with
+  `-ffp-contract=on`, so `a * b + c` within one C expression becomes a fused
+  multiply-add (`sumf += d * isum`, `vmlaq_n_f32`, `x0*cos - x1*sin`). Rust
+  never fuses: write `f32::mul_add` (or `vfmaq_*`) at exactly those places,
+  in the scalar reference too. A last-bit difference is not harmless: it can
+  flip a Q8_0 or bf16 rounding of the next activation and change the output.
+- **Check bit for bit against ggml itself.** A small C program linked against
+  the release's `libggml-cpu` can run `ggml_get_type_traits_cpu(type)->vec_dot`
+  and `from_float` on the inputs a test builds; record its results in the
+  test. Keep such programs outside the repository.
 
 ### Tests
 

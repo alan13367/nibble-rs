@@ -54,10 +54,13 @@ impl Avx2 {
         unsafe { dot_rows(ty, rows, row_bytes, xq, out) }
     }
 
-    /// See [`super::Kernels::dot_f16`].
-    pub(crate) fn dot_f16(self, a: &[u8], b: &[u8]) -> f32 {
-        // SAFETY: see `encode`.
-        unsafe { dot_f16(a, b) }
+    /// See [`super::Kernels::dot_f16_f32_rows`].
+    pub(crate) fn dot_f16_f32_rows(self, a: &[u8], stride: usize, b: &[f32], out: &mut [f32]) {
+        for (r, o) in out.iter_mut().enumerate() {
+            let row = &a[r * stride..r * stride + 2 * b.len()];
+            // SAFETY: see `encode`.
+            *o = unsafe { dot_f16_f32(row, b) };
+        }
     }
 
     /// See [`super::Kernels::to_f16`].
@@ -209,9 +212,12 @@ fn encode(dt: DotType, x: &[f32], out: &mut [u8]) {
     match dt {
         // A copy; nothing to vectorize beyond what the compiler does.
         DotType::F32 => quant::encode_activation(dt, x, out),
-        DotType::F16 => to_f16(x, out),
         DotType::Bf16 => to_bf16(x, out),
         DotType::Q8_0 => quantize_q8_0(x, out),
+        // The x86 AVX2 `Q8_K` kernel is not here yet; it has to be
+        // transcribed and checked on an x86 machine. The scalar encoder
+        // produces the bytes every architecture agrees on.
+        DotType::Q8K => quant::encode_activation(dt, x, out),
     }
 }
 
@@ -311,7 +317,7 @@ fn dot_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f
         }
         GgmlType::F16 => {
             for (o, row) in out.iter_mut().zip(rows) {
-                *o = dot_f16(row, xq);
+                *o = dot_f16_f32_le(row, xq);
             }
         }
         GgmlType::Bf16 => {
@@ -322,6 +328,14 @@ fn dot_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f
         GgmlType::F32 => {
             for (o, row) in out.iter_mut().zip(rows) {
                 *o = dot_f32_le(row, xq);
+            }
+        }
+        // AVX2 kernels for the K-quants will be added and tested on an x86
+        // machine. Until then the scalar reference keeps those types correct
+        // on x86 too, instead of refusing them.
+        GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+            for (o, row) in out.iter_mut().zip(rows) {
+                *o = quant::dot_row(ty, row, xq);
             }
         }
         other => unreachable!("no AVX2 dot product for unsupported weight type {other}"),
@@ -351,7 +365,8 @@ fn dot_q8_0(w: &[[u8; Q8_0_BLOCK_BYTES]], x: &[[u8; Q8_0_BLOCK_BYTES]]) -> f32 {
 }
 
 /// `ggml_vec_dot_f32`: four 8-lane FMA accumulators over steps of 32, the
-/// `GGML_F32x8_REDUCE` reduction, then the leftovers in f32.
+/// `GGML_F32x8_REDUCE` reduction, then the leftovers in f32 (`sumf +=
+/// x[i]*y[i]`, which the compiler fuses on an FMA target).
 #[target_feature(enable = "avx2,fma,f16c")]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
@@ -365,7 +380,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     let mut sumf = reduce4(sum);
     for (&a, &b) in a_tail.iter().zip(b_tail) {
-        sumf += a * b;
+        sumf = a.mul_add(b, sumf);
     }
     sumf
 }
@@ -393,36 +408,74 @@ fn dot_f32_le(a: &[u8], b: &[u8]) -> f32 {
         .iter()
         .zip(b_tail.as_chunks::<4>().0)
     {
-        sumf += f32::from_le_bytes(*a) * f32::from_le_bytes(*b);
+        sumf = f32::from_le_bytes(*a).mul_add(f32::from_le_bytes(*b), sumf);
     }
     sumf
 }
 
-/// `ggml_vec_dot_f16`, F16C path: four 8-lane FMA accumulators over steps
-/// of 32, the `GGML_F32x8_REDUCE` reduction into f64, then the leftovers in f64.
+/// `ggml_vec_dot_f16_f32`, AVX + F16C path: `a` is f16, `b` f32. Four
+/// 8-lane FMA accumulators over steps of 32, then steps of 8 into the first,
+/// summed `(a0 + a1) + (a2 + a3)` and reduced as `hsum_float_8` into f64,
+/// then the leftovers (each product rounded to f32) in f64.
 #[target_feature(enable = "avx2,fma,f16c")]
-fn dot_f16(a: &[u8], b: &[u8]) -> f32 {
-    let n = a.len().min(b.len()) / 2 * 2;
-    let (a_steps, a_tail) = a[..n].as_chunks::<64>();
-    let (b_steps, b_tail) = b[..n].as_chunks::<64>();
-    let mut sum = [_mm256_setzero_ps(); 4];
+fn dot_f16_f32(a: &[u8], b: &[f32]) -> f32 {
+    let n = (a.len() / 2).min(b.len());
+    let (a_steps, a_rest) = a[..2 * n].as_chunks::<64>();
+    let (b_steps, b_rest) = b[..n].as_chunks::<32>();
+    let mut acc = [_mm256_setzero_ps(); 4];
     for (a, b) in a_steps.iter().zip(b_steps) {
-        for ((s, a), b) in sum
+        for ((s, a), b) in acc
             .iter_mut()
             .zip(split4::<_, 16>(a))
-            .zip(split4::<_, 16>(b))
+            .zip(split4::<_, 8>(b))
         {
-            *s = _mm256_fmadd_ps(load_f16(a), load_f16(b), *s);
+            *s = _mm256_fmadd_ps(load_f16(a), load_f32(b), *s);
         }
     }
-    let mut sumf = f64::from(reduce4(sum));
+    let (a8, a_tail) = a_rest.as_chunks::<16>();
+    let (b8, b_tail) = b_rest.as_chunks::<8>();
+    for (a, b) in a8.iter().zip(b8) {
+        acc[0] = _mm256_fmadd_ps(load_f16(a), load_f32(b), acc[0]);
+    }
+    let total = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+    let mut sumf = f64::from(hsum(total));
+    for (a, &b) in a_tail.as_chunks::<2>().0.iter().zip(b_tail) {
+        sumf += f64::from(f16_to_f32(*a) * b);
+    }
+    sumf as f32
+}
+
+/// [`dot_f16_f32`] for an F16 weight row and an activation of
+/// little-endian f32 bytes.
+#[target_feature(enable = "avx2,fma,f16c")]
+fn dot_f16_f32_le(a: &[u8], b: &[u8]) -> f32 {
+    let n = (a.len() / 2).min(b.len() / 4);
+    let (a_steps, a_rest) = a[..2 * n].as_chunks::<64>();
+    let (b_steps, b_rest) = b[..4 * n].as_chunks::<128>();
+    let mut acc = [_mm256_setzero_ps(); 4];
+    for (a, b) in a_steps.iter().zip(b_steps) {
+        for ((s, a), b) in acc
+            .iter_mut()
+            .zip(split4::<_, 16>(a))
+            .zip(split4::<_, 32>(b))
+        {
+            *s = _mm256_fmadd_ps(load_f16(a), load_f32_le(b), *s);
+        }
+    }
+    let (a8, a_tail) = a_rest.as_chunks::<16>();
+    let (b8, b_tail) = b_rest.as_chunks::<32>();
+    for (a, b) in a8.iter().zip(b8) {
+        acc[0] = _mm256_fmadd_ps(load_f16(a), load_f32_le(b), acc[0]);
+    }
+    let total = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+    let mut sumf = f64::from(hsum(total));
     for (a, b) in a_tail
         .as_chunks::<2>()
         .0
         .iter()
-        .zip(b_tail.as_chunks::<2>().0)
+        .zip(b_tail.as_chunks::<4>().0)
     {
-        sumf += f64::from(f16_to_f32(*a) * f16_to_f32(*b));
+        sumf += f64::from(f16_to_f32(*a) * f32::from_le_bytes(*b));
     }
     sumf as f32
 }
@@ -690,7 +743,7 @@ mod tests {
     #[test]
     fn encoders_match_the_scalar_reference_exactly() {
         let Some(k) = avx2() else { return };
-        for dt in [DotType::F32, DotType::F16, DotType::Bf16, DotType::Q8_0] {
+        for dt in [DotType::F32, DotType::Bf16, DotType::Q8_0] {
             for n in [32, 64, 96, 1024] {
                 for seed in 1..4 {
                     // Mixed magnitudes, including an all-zero Q8_0 block and
@@ -707,14 +760,12 @@ mod tests {
                 }
             }
         }
-        // Tails of the f16 and bf16 encoders.
-        for dt in [DotType::F16, DotType::Bf16] {
-            let x = values(13, 9);
-            let want = quant::encoded(dt, &x);
-            let mut got = vec![0; want.len()];
-            k.encode(dt, &x, &mut got);
-            assert_eq!(got, want, "{dt:?} tail");
-        }
+        // The tail of the bf16 encoder.
+        let x = values(13, 9);
+        let want = quant::encoded(DotType::Bf16, &x);
+        let mut got = vec![0; want.len()];
+        k.encode(DotType::Bf16, &x, &mut got);
+        assert_eq!(got, want, "bf16 tail");
         // NaN handling of the bf16 encoder.
         let x = [
             f32::NAN,
@@ -747,7 +798,18 @@ mod tests {
                 let rows = 5;
                 let w: Vec<f32> = (0..rows).flat_map(|r| values(n, 10 + r as u32)).collect();
                 let x = values(n, 3);
-                let rows_q: Vec<u8> = w.chunks(n).flat_map(|r| quant::encoded(dt, r)).collect();
+                // F16 rows are f16; every other type's rows use its dot
+                // type's encoding.
+                let rows_q: Vec<u8> = w
+                    .chunks(n)
+                    .flat_map(|r| {
+                        if ty == GgmlType::F16 {
+                            f16(r)
+                        } else {
+                            quant::encoded(dt, r)
+                        }
+                    })
+                    .collect();
                 let xq = quant::encoded(dt, &x);
                 let row_bytes = rows_q.len() / rows;
                 let mut got = vec![0.0; rows];
@@ -799,14 +861,16 @@ mod tests {
                 scale,
                 &format!("dot_f32 n = {n}"),
             );
-            let (a16, b16) = (f16(&a), f16(&b));
-            let got = k.dot_f16(&a16, &b16);
+            let a16 = f16(&a);
+            let mut got = [0.0];
+            k.dot_f16_f32_rows(&a16, a16.len(), &b, &mut got);
+            let got = got[0];
             assert_near(
                 got,
-                scalar::dot_f16(&a16, &b16),
+                scalar::dot_f16_f32(&a16, &b),
                 1e-6,
                 scale,
-                &format!("dot_f16 n = {n}"),
+                &format!("dot_f16_f32 n = {n}"),
             );
         }
     }

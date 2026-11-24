@@ -1,15 +1,17 @@
-//! The default thread count: one thread per physical core.
+//! The default thread count: the performance cores on Apple Silicon, else one
+//! thread per physical core.
 //!
 //! Decoding is limited by memory bandwidth, which the threads of one core
 //! share, so a second thread per core (SMT) adds no speed. It costs some:
 //! with a thread on every logical CPU, any other process preempts one of
 //! them, and an op cannot finish until a preempted task resumes. On a
 //! Ryzen 5 5600X, 12 threads decode about a third slower than 6. llama.cpp
-//! defaults to physical cores for the same reason.
+//! defaults to physical cores for the same reason. Apple Silicon is the
+//! exception: see the macOS `physical_cores`.
 
-/// Threads to use when the caller does not say: the physical cores (where
-/// the OS reports them) or else the logical CPUs available to this process,
-/// whichever is smaller.
+/// Threads to use when the caller does not say: the performance cores on
+/// Apple Silicon, else the physical cores (where the OS reports them), or else
+/// the logical CPUs available to this process, whichever is smaller.
 pub(crate) fn default_threads() -> usize {
     let available = std::thread::available_parallelism().map_or(1, |n| n.get());
     physical_cores().map_or(available, |cores| cores.clamp(1, available))
@@ -99,9 +101,68 @@ fn physical_cores() -> Option<usize> {
     (!cores.is_empty()).then_some(cores.len())
 }
 
-/// Elsewhere the logical CPU count stands in for the cores. Apple Silicon
-/// has no SMT, so there it is the core count.
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Performance cores on Apple Silicon, from `hw.perflevel0.physicalcpu`.
+///
+/// Decoding waits for the slowest task. A task that lands on an efficiency
+/// core holds the rest of the op, and those cores share a much smaller cache.
+/// On an M4 Max, 10 performance cores decode faster than all 14. llama.cpp
+/// defaults to the performance cores for the same reason. Machines without
+/// that sysctl (Intel Macs) use `hw.physicalcpu` instead.
+#[cfg(target_os = "macos")]
+fn physical_cores() -> Option<usize> {
+    sysctl_usize(c"hw.perflevel0.physicalcpu").or_else(|| sysctl_usize(c"hw.physicalcpu"))
+}
+
+/// `sysctlbyname` of an integer, or `None` when the name is missing or zero.
+#[cfg(target_os = "macos")]
+fn sysctl_usize(name: &std::ffi::CStr) -> Option<usize> {
+    let mut buf = [0u8; 8];
+    let mut len = buf.len();
+    // SAFETY: `name` is a NUL-terminated C string, `buf` has room for `len`
+    // bytes, and a failed call is reported by a non-zero return. Only the
+    // `len` bytes the call says it wrote are read afterwards.
+    let rc = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 || len > buf.len() {
+        return None;
+    }
+    let value = match len {
+        4 => u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize,
+        8 => usize::from_le_bytes(buf),
+        _ => return None,
+    };
+    (value > 0).then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// Reads a sysctl by name. `oldlenp` is in/out: the buffer size on entry,
+    /// the written size on success.
+    ///
+    /// # Safety
+    ///
+    /// `name` must be a valid NUL-terminated string. `oldp` must be either
+    /// null or valid for writes of `*oldlenp` bytes. `oldlenp` must be a
+    /// valid pointer. `newp` / `newlen` describe an optional new value; both
+    /// are null and zero when only reading.
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        oldp: *mut std::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut std::ffi::c_void,
+        newlen: usize,
+    ) -> i32;
+}
+
+/// Elsewhere the logical CPU count stands in for the cores.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn physical_cores() -> Option<usize> {
     None
 }

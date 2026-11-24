@@ -11,14 +11,15 @@ This is a living document: update it when a decision changes.
 | Area | State |
 |---|---|
 | GGUF reader, mmap, writer, `nibble inspect` | Done |
-| CPU engine | `qwen3` and `qwen35` on F32/F16/BF16/Q8_0 weights. AVX2 kernels transcribed from ggml (scalar fallback elsewhere), a persistent thread pool per session, grouped and fused matvecs, parallel DeltaNet and attention heads |
-| Correctness | Tokenizer ids identical to llama.cpp on 7 tricky strings for both models. Greedy output matches llama.cpp (`-fa off`) on 21 of 24 prompt/model pairs (6 prompts × Qwen3/Qwen3.5 × BF16/Q8_0, 64 tokens): 12/12 on BF16; the 3 Q8_0 divergences are near-ties (gaps 0.006–0.057) that also flip inside llama.cpp |
-| Speed (5600X, 6 threads, tg128) | Faster than llama.cpp b12675 on every local file: Qwen3-0.6B Q8_0 59.0 tok/s (llama.cpp 56.0), Qwen3.5-0.8B Q8_0 47.6 (41.0), Qwen3-0.6B BF16 34.6 (33.7), Qwen3.5-0.8B BF16 27.1 (25.2) |
+| CPU engine | `qwen3` and `qwen35` on F32/F16/BF16/Q8_0 and Q3_K/Q4_K/Q5_K/Q6_K. AVX2 kernels on x86 (K-quant dots still scalar there; Rosetta can check new ones for correctness, speed needs a real x86 machine), NEON kernels on AArch64 (`dotprod` and `fp16` when the CPU has them, ggml's `vmull` fallback otherwise), a persistent thread pool per session, grouped and fused matvecs, parallel DeltaNet and attention heads. On Apple Silicon the default thread count is the performance cores (`hw.perflevel0.physicalcpu`) |
+| Correctness | Tokenizer ids identical to llama.cpp on 7 tricky strings for both models. Greedy output identical to llama.cpp b12359 (release builds, CPU, `-fa off --no-repack -ub 1`) on 29 of 30 prompt/model pairs on an M4 Max (6 prompts × the 5 local files, 64 tokens); the other is a BF16 near-tie (logit gap 0.003) caused by nibble's faster bf16 dot. The x86 AVX2 path, run under Rosetta, is identical to the macOS x64 release on all 18 BF16/Q8_0 pairs. Kernels, RoPE and the activation encoders are checked bit for bit against ggml's own functions. The 5600X comparison (21/24 against b12675) predates the attention and fused-multiply-add fixes and has to be rerun |
+| Speed (5600X, 6 threads, tg128) | Faster than llama.cpp b12675 on every local file: Qwen3-0.6B Q8_0 59.0 tok/s (llama.cpp 56.0), Qwen3.5-0.8B Q8_0 47.6 (41.0), Qwen3-0.6B BF16 34.6 (33.7), Qwen3.5-0.8B BF16 27.1 (25.2). Measured before the attention and fused-multiply-add fixes; to be rerun |
+| Speed (M4 Max, 10 performance cores, tg128, 5 reps) | Against the b12359 release build on the CPU (`llama-bench -ngl 0 -dev none -fa 0`, repacking on as by default): Qwen3-0.6B BF16 172.4 tok/s (llama.cpp 28.9), Q8_0 240.4 (238.3 ± 7.8, a tie), Qwen3.5-0.8B Q8_0 192.1 (184.2), Q4_K_M 233.4 (212.5), Q3_K_M 250.6 (208.9). Making the numerics exactly ggml's left decode speed unchanged. Before NEON the scalar kernels were 23.5 / 63.7 / 54.2 on the three files that ran. 14 threads (P+E) is slower than 10 on both engines, so the default is the 10 performance cores |
 | CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench` |
 | OpenAI server | Complete for Phase 3: tools, logprobs, recurrent-state checkpoints. Verified with curl, socket tests, and the official OpenAI Python client (3.58) on both models. Open WebUI not tried |
-| Tests | 183 pass in `cargo test --workspace` (no model files needed); 6 llama.cpp reference tests on real models pass with `--ignored` |
-| Not started | NEON kernels, Q4_K/Q6_K, GPU backends, batched prompt processing |
-| Git | Two commits; Phase 4 and the end of Phase 3 are uncommitted |
+| Tests | 204 pass in `cargo test --workspace` (no model files needed), and 202 as x86_64 under Rosetta (the SIMD tests differ by architecture); 8 llama.cpp reference tests on real models (7 pass here with `--ignored`, natively and under Rosetta; `qwen35_bf16` needs a file that is not on this machine) |
+| Not started | AVX2 kernels for the K-quants (scalar on x86 until an x86 machine can test them), GPU backends, batched prompt processing |
+| Git | Three commits; Phase 4 and its review fixes are uncommitted |
 
 ## Decisions
 
@@ -43,7 +44,7 @@ Everything a typical engine pulls from crates.io is written here instead, and ke
 | Need | Usual crate | Our replacement |
 |---|---|---|
 | mmap | `memmap2` | `nibble-gguf::Mmap`: `mmap`/`MapViewOfFile` FFI (done) |
-| f16/bf16 | `half` | Bit conversions and F16C intrinsics (done); NEON next |
+| f16/bf16 | `half` | Bit conversions, F16C intrinsics, and NEON `fp16` conversions when the CPU has them (done) |
 | Threads | `rayon` | `cpu::ThreadPool` (done): persistent workers per session, dynamic task claiming, spin-then-park, panics propagated |
 | SIMD | `wide`, `pulp` | `std::arch` intrinsics behind `is_*_feature_detected!` dispatch |
 | Regex / Unicode | `regex`, `fancy-regex` | Hand-written pre-tokenizers plus committed `\p{L}`/`\p{M}`/`\p{N}` range tables (done) |
@@ -267,9 +268,10 @@ crates/
       mod.rs       Cpu (pool + kernels): single, grouped and fused SwiGLU matvecs; norms, RoPE
       pool.rs      persistent thread pool: dynamic task claiming, spin-then-park, panic propagation
       kernels.rs   kernel dispatch (the one place that lists instruction sets)
-      avx2.rs      AVX2/FMA/F16C kernels transcribed from ggml, behind a CPU-feature token
+      avx2.rs      AVX2/FMA/F16C kernels transcribed from ggml, behind a CPU-feature token. K-quant dots call the scalar reference until x86 kernels are tested
+      neon.rs      NEON kernels (dotprod and fp16 when detected; vmull / scalar f16 widening otherwise)
       scalar.rs    scalar references of the vector kernels
-      topology.rs  default thread count: one per physical core
+      topology.rs  default thread count: performance cores on Apple Silicon, else one per physical core
     model/
       mod.rs       Model, the architecture registry and dispatch (the only place that matches on architectures)
       config.rs    shared hyperparameters + typed `{arch}.*` metadata access
@@ -282,7 +284,7 @@ crates/
     sampler.rs     greedy, temperature, top-k/top-p/min-p, penalties, logprobs
     session.rs     Session: tokens, cache, recurrent-state checkpoints, generation loop
     backend.rs     (planned) the op-level Backend trait and backend selection
-    cpu/neon.rs    (planned) NEON kernels; simd128 for WASM
+    cpu/neon.rs    NEON kernels. simd128 for WASM is still planned
     cuda/          (planned) driver API loader + bindings, memory, graphs; kernels/*.cu + nibble.fatbin
     metal/         (planned) objc runtime bindings, device, buffers, pipelines; shaders/*.metal
   nibble-server/   http.rs, openai.rs, worker.rs, server.rs, text.rs (stop sequences, reasoning split)
@@ -312,11 +314,11 @@ Design rules:
 | **2a. CPU reference: Qwen3** ✅ | F32/F16/BF16/Q8_0 weights with ggml's activation formats, F16 KV cache; byte-level BPE with `qwen2` and `qwen35` pre-tokenizers; Qwen3 ChatML; sampler; `nibble run`, `chat`, `tokenize` | Tokenizer ids match llama.cpp on every test string (Qwen3 and Qwen3.5); greedy output matches llama.cpp (`-fa off`) except at near-ties that also flip inside llama.cpp |
 | **2b. CPU reference: Qwen3.5** ✅ | Gated DeltaNet layers (conv1d, recurrent state), gated attention with partial RoPE, Qwen3.5 chat template; architecture registry + shared layers so new models only touch `model/` | BF16 matches llama.cpp on 6/6 prompts, Q8_0 on 5/6 (the other is a tie that flips inside llama.cpp); synthetic model matches an independent f64 implementation over whole sequences |
 | **3. OpenAI server** ✅ | `nibble-server` (std-only HTTP/1.1 + SSE, JSON in `nibble-json`), chat/completions/models/health, streaming with usage, `reasoning_content`, stop sequences, API key, CORS, FIFO worker with prefix reuse, tool calling, logprobs, recurrent-state checkpoints; `nibble serve` | Verified with curl, socket tests and the official OpenAI Python client on Qwen3 and Qwen3.5 (chat, streaming, reasoning, logprobs, tool round trips streamed and not, completions, errors). Open WebUI not tried |
-| **4. CPU speed** (x86 done) | AVX2 kernels for all current formats (dot products, activation encoding, f16 attention, exp/SiLU/softmax, DeltaNet step), persistent thread pool, grouped and fused matvecs, parallel DeltaNet and attention heads, physical-core default; `nibble bench`. Still to do: NEON, Q4_K/Q6_K | Met: Q8_0 tg128 is 5–16% *faster* than llama.cpp on the 5600X (BF16 3–8% faster) |
+| **4. CPU speed** (x86 AVX2 and Apple Silicon NEON done) | AVX2 kernels for F32/F16/BF16/Q8_0, NEON kernels for those plus Q3_K/Q4_K/Q5_K/Q6_K (and `Q8_K` activations), persistent thread pool, grouped and fused matvecs, parallel DeltaNet and attention heads, performance-core default on Apple Silicon; `nibble bench`. Still to do: AVX2 K-quant kernels, measured on x86 | Met on the 5600X (Q8_0 tg128 5–16% faster than llama.cpp, BF16 3–8% faster, before the numerics fixes) and on an M4 Max (NEON tg128 faster than llama.cpp b12359 on the CPU on four of the five local files and tied on Qwen3-0.6B Q8_0, at 10 performance cores; output identical to it on 29 of 30 comparison runs) |
 | **5. CUDA backend** | Loader, bindings, memory, fatbin kernels, CUDA graphs, CPU fallback | Same greedy tokens as CPU; decode at least as fast as llama.cpp CUDA on the 3070 Ti |
 | **6. Metal backend** | objc bindings, zero-copy weights, MSL kernels, one command buffer per token | Same greedy tokens as CPU on Apple Silicon; decode at least as fast as llama.cpp Metal |
 | **7. Prompt processing** | Batched matmul on every backend (CPU tiles, CUDA tensor cores, Metal simdgroup matrices), chunked DeltaNet, parallel server slots | pp512 within 25% of llama.cpp on each backend |
-| **8. Breadth** | Qwen3.5 2B/4B/9B (check V-head/K-head grouping), Q4_K_M/Q5_K/IQ4_XS, `qwen3`/`llama` dense archs, MTP speculative decoding, tool calling, Vulkan for AMD/Intel | The local 4B/9B `qwen35` files run correctly on every backend |
+| **8. Breadth** | Qwen3.5 2B/4B/9B (check V-head/K-head grouping), IQ4_XS, `llama` and further dense archs, MTP speculative decoding, Vulkan for AMD/Intel. Q3_K/Q4_K/Q5_K/Q6_K already run on the CPU, including the local Q4_K_M and Q3_K_M files | The local 4B/9B `qwen35` files run correctly on every backend |
 | **9. Packaging** | Stable Rust API, C ABI (`cdylib` + header), WASM (simd128, in-memory weights), prebuilt release binaries | — |
 
 ## Validation
@@ -331,9 +333,15 @@ Design rules:
   (whole sequences for `qwen35`, including the recurrence, partial RoPE and an
   MTP block to skip). CPU vs GPU comparisons will run locally on the 3070 Ti
   and on a Mac.
-- **Comparing with llama.cpp:** use `llama-completion ... -fa off`, because
-  nibble's attention matches the non-flash path. llama.cpp's `-f` strips one
-  trailing newline from the prompt file. The commands are in `AGENTS.md`.
+- **Comparing with llama.cpp:** use `llama-completion ... -ngl 0 --device none
+  -fa off --no-repack -b 512 -ub 1`: nibble's attention matches the non-flash
+  path, its kernels are the non-repacked ones, and it evaluates prompts one
+  token at a time. llama.cpp's `-f` strips one trailing newline from the
+  prompt file. The commands are in `AGENTS.md`.
+- **Bit-level checks:** small C programs outside the repository, linked
+  against the release's `libggml-cpu` / `libllama`, run ggml's kernels on the
+  tests' inputs and dump llama.cpp's tensors per layer; the tests record
+  their results.
 - **Server:** end-to-end tests over real sockets on a tiny model, and the
   official OpenAI Python client against the real models (done). Open WebUI
   has not been tried.
@@ -374,6 +382,20 @@ Design rules:
   5600X (llama.cpp loses about 20% too).
 - BPE merge strings must be split at the first space by **byte** offset
   (llama.cpp's `find(' ', 1)`); splitting on chars dropped every merge with `Ġ`.
+- **ggml switched F16 matmuls to f32 activations** (#31854, 8 Nov 2026,
+  before b12359): F16 weights and the F16 KV cache meet unrounded f32
+  inputs through `ggml_vec_dot_f16_f32`, so the attention queries and
+  softmax probabilities are no longer rounded to f16.
+- **clang fuses `a * b + c` in one expression** (`-ffp-contract=on`): K-quant
+  block updates, `vmlaq_n_f32`, the Q4_K/Q5_K dequantizers, `ggml_ssm_conv`
+  and the RoPE rotation are fused multiply-adds in llama.cpp. Each unfused
+  rounding showed up as a different greedy token somewhere.
+- **llama.cpp's defaults hide its vec_dot kernels:** weights are repacked
+  (`--no-repack` to stop it), batched prompts use GEMM kernels (`-ub 1`),
+  and llama-completion stops when a `-b` chunk of the prompt ends with an
+  end-of-generation token (keep `-b` large). Its macOS arm64 release has
+  `dotprod` but no fp16 arithmetic and no i8mm; Homebrew or `-mcpu=native`
+  builds differ (f16 accumulation, i8mm kernels) and are not the reference.
 - **CUDA:** a fatbin built by a newer toolkit than the user's driver supports
   cannot JIT its PTX. Ship SASS for every supported arch, and fall back to CPU with a clear message.
 - **Metal:** `newBufferWithBytesNoCopy` needs a page-aligned pointer and a
@@ -385,5 +407,12 @@ Design rules:
 1. **AMD/Intel GPUs:** whether to schedule the Vulkan backend.
 2. **Open WebUI:** worth a manual check before calling the server done for
    UIs; it is a large install.
-3. **NEON before or after Metal?** Apple Silicon and ARM Linux run the scalar
-   kernels today; on x86 the scalar kernels decode about 3x slower than AVX2.
+3. **AVX2 K-quant kernels.** On x86 Q3_K/Q4_K/Q5_K/Q6_K use the scalar dots;
+   the reference tests pass that way under Rosetta, but the output is not
+   bit-identical to ggml's AVX2 kernels. Rosetta can check new AVX2 kernels
+   for correctness; speed needs a real x86 machine. NEON for those formats is
+   done and checked bit for bit.
+4. **BF16 on ARM.** ggml sums BF16 dots one product at a time in f64; nibble
+   uses f32 vector accumulators, which is the one remaining difference from
+   llama.cpp on the comparison prompts. An exact kernel (rows in f64 lanes,
+   each summed in order) is possible but costs a large part of the speedup.

@@ -6,8 +6,8 @@
 //!   products: single, grouped (several matrices that share an input, in one
 //!   parallel pass), and the fused SwiGLU feed-forward.
 //! - [`Kernels`] dispatches each vector kernel to its SIMD implementation
-//!   (`avx2`) or to the scalar reference ([`scalar`], and [`crate::quant`]
-//!   for the weight formats), which is also the correctness oracle.
+//!   (`avx2` or `neon`) or to the scalar reference ([`scalar`], and
+//!   [`crate::quant`] for the weight formats), which is also the correctness oracle.
 //! - Cheap element-wise ops (norms, RoPE, residual adds) are plain functions
 //!   here.
 //!
@@ -18,6 +18,8 @@
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 mod kernels;
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod neon;
 mod pool;
 pub(crate) mod scalar;
 mod topology;
@@ -296,8 +298,10 @@ pub(crate) fn rope_neox(x: &mut [f32], head_dim: usize, table: &[(f32, f32)]) {
         let (lo, hi) = head[..2 * half].split_at_mut(half);
         for ((a, b), &(cos, sin)) in lo.iter_mut().zip(hi.iter_mut()).zip(table) {
             let (x0, x1) = (*a, *b);
-            *a = x0 * cos - x1 * sin;
-            *b = x0 * sin + x1 * cos;
+            // ggml's `x0*cos - x1*sin` and `x0*sin + x1*cos`, with the first
+            // product fused into each, as clang compiles them.
+            *a = x0.mul_add(cos, -(x1 * sin));
+            *b = x0.mul_add(sin, x1 * cos);
         }
     }
 }
@@ -322,6 +326,33 @@ pub(crate) fn softplus(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::test_data::{f32_bytes, fnv1a, values};
+
+    /// `ggml_rope_ext` (NeoX, 128 rotated dims, base 1e6) in llama.cpp's
+    /// b12359 macOS arm64 release, on two heads of `values(256, 1)`: an FNV
+    /// hash of the output bits, and elements 0..4 and 64..68.
+    #[test]
+    fn rope_matches_ggml_bit_for_bit() {
+        #[rustfmt::skip]
+        let cases: [(usize, u64, [u32; 8]); 4] = [
+            (0, 0x3271_9F08_4C63_9EE9, [0xBEBB_4AE4, 0x3F00_58CA, 0x3F3B_B5DA, 0x3DF6_1680, 0x3EF4_EA8C, 0x3F03_20BE, 0x3D2F_EEA0, 0xBF58_4E7A]),
+            (1, 0xF6F4_D5CE_3B01_AB00, [0xBF19_A469, 0xBCB6_F03C, 0x3F0E_DAB5, 0x3F06_BDD5, 0xBD4A_2DFC, 0x3F37_65D6, 0x3EF4_87AB, 0xBF2B_FCA3]),
+            (7, 0xA4AF_E07E_0A6E_B439, [0xBF17_0DB0, 0x3F35_51FF, 0xBDA2_73F8, 0xBF06_6E98, 0x3DF6_6070, 0x3DE0_E8FC, 0xBF3A_EEB2, 0x3F2C_3A99]),
+            (300, 0xE9FD_71C1_E4E5_0857, [0x3EF8_FEB4, 0xBF12_7FB5, 0x3F3B_3295, 0x3D33_7723, 0x3EB5_D5C2, 0xBEDC_F50B, 0x3D8D_913A, 0xBF5A_31DB]),
+        ];
+        let mut table = Vec::new();
+        for (pos, hash, bits) in cases {
+            let mut x = values(256, 1);
+            rope_table(&mut table, pos, 128, 1e6);
+            rope_neox(&mut x, 128, &table);
+            let got: Vec<u32> = [0, 1, 2, 3, 64, 65, 66, 67]
+                .iter()
+                .map(|&i| x[i].to_bits())
+                .collect();
+            assert_eq!(got, bits, "pos {pos}");
+            assert_eq!(fnv1a(&f32_bytes(&x)), hash, "pos {pos}");
+        }
+    }
 
     #[test]
     fn rmsnorm_normalizes_to_unit_rms() {
@@ -372,7 +403,7 @@ mod tests {
                 let row: Vec<f32> = (0..cols)
                     .map(|c| ((r * 7919 + c * 104_729 + i * 31) % 97) as f32 / 97.0 - 0.5)
                     .collect();
-                bytes.extend(quant::encoded(DotType::of(ty), &row));
+                push_weight(&mut bytes, ty, &row);
             }
             weights.push(Weight {
                 ty,
@@ -389,6 +420,45 @@ mod tests {
         (0..cols).map(|i| (i as f32 * 0.37).sin()).collect()
     }
 
+    /// K-quant rows are not the activation dot type, so a deterministic block
+    /// with a finite f16 scale stands in for a quantized row.
+    fn push_weight(bytes: &mut Vec<u8>, ty: GgmlType, row: &[f32]) {
+        if matches!(
+            ty,
+            GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+        ) {
+            let n = ty.layout().unwrap().type_size as usize;
+            for b in 0..row.len() / 256 {
+                let mut block = vec![0u8; n];
+                for (i, slot) in block.iter_mut().enumerate() {
+                    let v = row[(b * 17 + i) % row.len()];
+                    *slot = (v.to_bits().wrapping_mul(i as u32 + 1) >> (i % 16)) as u8;
+                }
+                let scale = 0x3C00u16.to_le_bytes();
+                match ty {
+                    GgmlType::Q4K | GgmlType::Q5K => {
+                        block[..2].copy_from_slice(&scale);
+                        block[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+                    }
+                    GgmlType::Q6K => {
+                        block[208..210].copy_from_slice(&scale);
+                        for s in &mut block[192..208] {
+                            *s %= 9;
+                        }
+                    }
+                    GgmlType::Q3K => block[108..110].copy_from_slice(&scale),
+                    _ => {}
+                }
+                bytes.extend(block);
+            }
+        } else if ty == GgmlType::F16 {
+            // F16 weights are f16; their dot type is f32.
+            bytes.extend(row.iter().flat_map(|&v| quant::f32_to_f16(v).to_le_bytes()));
+        } else {
+            bytes.extend(quant::encoded(DotType::of(ty), row));
+        }
+    }
+
     /// Every output row computed one at a time with the scalar reference.
     fn reference(m: &Matrices, w: &Weight, x: &[f32]) -> Vec<f32> {
         let xq = quant::encoded(DotType::of(w.ty), x);
@@ -399,18 +469,27 @@ mod tests {
 
     #[test]
     fn products_do_not_depend_on_the_thread_count() {
-        let m = matrices(&[(GgmlType::Q8_0, 512, 1000)]);
-        let w = &m.weights[0];
-        let x = input(512);
-        let mut results = Vec::new();
-        for threads in [1, 2, 7] {
-            let cpu = Cpu::new(threads);
-            let mut out = vec![0.0; w.rows];
-            cpu.matvec(&m.bytes, w, &x, &mut out, &mut EncodedInput::new());
-            results.push(out);
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q4K,
+            GgmlType::Q3K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+        ] {
+            let cols = if ty == GgmlType::Q8_0 { 512 } else { 256 };
+            let m = matrices(&[(ty, cols, 1000)]);
+            let w = &m.weights[0];
+            let x = input(cols);
+            let mut results = Vec::new();
+            for threads in [1, 2, 7] {
+                let cpu = Cpu::new(threads);
+                let mut out = vec![0.0; w.rows];
+                cpu.matvec(&m.bytes, w, &x, &mut out, &mut EncodedInput::new());
+                results.push(out);
+            }
+            assert_eq!(results[0], results[1], "{ty}");
+            assert_eq!(results[0], results[2], "{ty}");
         }
-        assert_eq!(results[0], results[1]);
-        assert_eq!(results[0], results[2]);
     }
 
     /// A group with mixed weight types needs one encoding per dot type, and
@@ -421,26 +500,39 @@ mod tests {
         let m = matrices(&[
             (GgmlType::Q8_0, cols, 300),
             (GgmlType::F16, cols, 70),
-            (GgmlType::Q8_0, cols, 16),
+            (GgmlType::Q4K, cols, 80),
             (GgmlType::Bf16, cols, 129),
+            (GgmlType::Q6K, cols, 64),
+            (GgmlType::Q3K, cols, 48),
+            (GgmlType::Q5K, cols, 32),
         ]);
         let x = input(cols);
         for kernels in [Kernels::Scalar, Kernels::detect()] {
             let cpu = Cpu::with_kernels(4, kernels);
             let mut outs: Vec<Vec<f32>> = m.weights.iter().map(|w| vec![0.0; w.rows]).collect();
-            let [a, b, c, d] = &mut outs[..] else {
-                unreachable!("four matrices")
-            };
             let w = &m.weights;
+            let mut slots = outs.iter_mut();
+            let (s0, s1, s2, s3, s4, s5, s6) = (
+                slots.next().unwrap(),
+                slots.next().unwrap(),
+                slots.next().unwrap(),
+                slots.next().unwrap(),
+                slots.next().unwrap(),
+                slots.next().unwrap(),
+                slots.next().unwrap(),
+            );
             cpu.matvecs(
                 &m.bytes,
                 &x,
                 &mut EncodedInput::new(),
                 [
-                    (&w[0], &mut a[..]),
-                    (&w[1], &mut b[..]),
-                    (&w[2], &mut c[..]),
-                    (&w[3], &mut d[..]),
+                    (&w[0], s0.as_mut_slice()),
+                    (&w[1], s1.as_mut_slice()),
+                    (&w[2], s2.as_mut_slice()),
+                    (&w[3], s3.as_mut_slice()),
+                    (&w[4], s4.as_mut_slice()),
+                    (&w[5], s5.as_mut_slice()),
+                    (&w[6], s6.as_mut_slice()),
                 ],
             );
             for (w, out) in m.weights.iter().zip(&outs) {
@@ -459,22 +551,28 @@ mod tests {
 
     #[test]
     fn fused_swiglu_matches_separate_products() {
-        let (cols, rows) = (128, 200);
-        let m = matrices(&[(GgmlType::Q8_0, cols, rows), (GgmlType::F16, cols, rows)]);
-        let (gate, up) = (&m.weights[0], &m.weights[1]);
-        let x = input(cols);
-        for threads in [1, 3] {
-            let cpu = Cpu::new(threads);
-            let (mut out, mut up_out) = (vec![0.0; rows], vec![0.0; rows]);
-            let mut input = EncodedInput::new();
-            cpu.swiglu(&m.bytes, gate, up, &x, &mut input, &mut out, &mut up_out);
+        for (gate_ty, up_ty, cols) in [
+            (GgmlType::Q8_0, GgmlType::F16, 128),
+            (GgmlType::Q4K, GgmlType::Q6K, 256),
+            (GgmlType::Q3K, GgmlType::Q5K, 256),
+        ] {
+            let rows = 200;
+            let m = matrices(&[(gate_ty, cols, rows), (up_ty, cols, rows)]);
+            let (gate, up) = (&m.weights[0], &m.weights[1]);
+            let x = input(cols);
+            for threads in [1, 3] {
+                let cpu = Cpu::new(threads);
+                let (mut out, mut up_out) = (vec![0.0; rows], vec![0.0; rows]);
+                let mut input = EncodedInput::new();
+                cpu.swiglu(&m.bytes, gate, up, &x, &mut input, &mut out, &mut up_out);
 
-            let (mut g, mut u) = (vec![0.0; rows], vec![0.0; rows]);
-            cpu.matvec(&m.bytes, gate, &x, &mut g, &mut input);
-            cpu.matvec(&m.bytes, up, &x, &mut u, &mut input);
-            assert_eq!(up_out, u);
-            cpu.kernels().swiglu(&mut g, &u);
-            assert_eq!(out, g, "{threads} threads");
+                let (mut g, mut u) = (vec![0.0; rows], vec![0.0; rows]);
+                cpu.matvec(&m.bytes, gate, &x, &mut g, &mut input);
+                cpu.matvec(&m.bytes, up, &x, &mut u, &mut input);
+                assert_eq!(up_out, u, "{gate_ty} {up_ty}");
+                cpu.kernels().swiglu(&mut g, &u);
+                assert_eq!(out, g, "{gate_ty} {up_ty}, {threads} threads");
+            }
         }
     }
 }

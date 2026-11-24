@@ -6,6 +6,7 @@ mod chat;
 mod inspect;
 mod run;
 mod serve;
+mod style;
 mod tokenize;
 
 use std::error::Error;

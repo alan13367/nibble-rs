@@ -12,8 +12,9 @@ pub struct SessionOptions {
     /// Larger values are capped at the training context.
     pub n_ctx: usize,
     /// Threads that run the forward pass, the calling thread included. `0`
-    /// uses one per physical core (where the OS reports cores, else one per
-    /// logical CPU): a second thread per core does not make decoding faster.
+    /// uses the performance cores on Apple Silicon and one per physical core
+    /// elsewhere (one per logical CPU where the OS does not report cores): a
+    /// second thread per core does not make decoding faster.
     /// The threads live as long as the session.
     pub threads: usize,
 }
@@ -115,6 +116,12 @@ impl<'m> Session<'m> {
     #[must_use]
     pub const fn n_ctx(&self) -> usize {
         self.n_ctx
+    }
+
+    /// CPU kernel set this session runs: `scalar`, `avx2` or `neon`.
+    #[must_use]
+    pub fn kernel(&self) -> &'static str {
+        self.cpu.kernels().name()
     }
 
     /// Threads that run the forward pass, the calling thread included.

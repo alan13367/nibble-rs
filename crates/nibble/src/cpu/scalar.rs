@@ -25,19 +25,16 @@ pub(crate) fn mad_f32(y: &mut [f32], x: &[f32], v: f32) {
     }
 }
 
-/// `a · b` for f16 vectors, accumulated in f32 with eight accumulators.
-pub(crate) fn dot_f16(a: &[u8], b: &[u8]) -> f32 {
-    let mut acc = [0.0f32; 8];
-    for (i, (x, y)) in a
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(b.as_chunks::<2>().0)
-        .enumerate()
-    {
-        acc[i % 8] += f16_to_f32(u16::from_le_bytes(*x)) * f16_to_f32(u16::from_le_bytes(*y));
+/// `a · b` for an f16 vector `a` and an f32 vector `b`, as ggml's portable
+/// `ggml_vec_dot_f16_f32`: each product rounded to f32, the sum in f64.
+/// This is how ggml multiplies F16 weights and the F16 KV cache with f32
+/// activations, which it no longer rounds to f16.
+pub(crate) fn dot_f16_f32(a: &[u8], b: &[f32]) -> f32 {
+    let mut sum = 0.0f64;
+    for (x, &y) in a.as_chunks::<2>().0.iter().zip(b) {
+        sum += f64::from(f16_to_f32(u16::from_le_bytes(*x)) * y);
     }
-    sum8(acc)
+    sum as f32
 }
 
 /// Writes `x` as f16 (round to nearest even) to `out`, two bytes per value.

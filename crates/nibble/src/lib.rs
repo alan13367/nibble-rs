@@ -20,8 +20,10 @@
 //! # Ok::<(), nibble::Error>(())
 //! ```
 //!
-//! Status: CPU reference implementation of Qwen3 (`qwen3`) and Qwen3.5
-//! (`qwen35`) on F32, F16, BF16 and Q8_0 weights.
+//! Status: CPU engine for Qwen3 (`qwen3`) and Qwen3.5 (`qwen35`) on F32, F16,
+//! BF16, Q8_0 and the K-quants Q3_K, Q4_K, Q5_K and Q6_K, with AVX2 and NEON
+//! kernels. On x86 the K-quant dot products still use the scalar reference:
+//! their AVX2 kernels are not written yet.
 
 pub mod chat;
 mod cpu;

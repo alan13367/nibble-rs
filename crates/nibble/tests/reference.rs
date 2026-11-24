@@ -6,10 +6,22 @@
 //! cargo test --release -p nibble --test reference -- --ignored
 //! ```
 //!
-//! Expected values were produced by llama.cpp b12675 (`llama-tokenize --ids`,
-//! and `llama-completion --temp 0 -fa off`). Generation cases were chosen to
-//! agree with llama.cpp with flash attention both on and off, so they are not
-//! near-ties.
+//! Expected values were produced by llama.cpp's b12359 release builds
+//! (`tools/llama.cpp/b12359`): `llama-tokenize --ids`, and
+//!
+//! ```sh
+//! llama-completion -m MODEL -f PROMPT -n 64 --temp 0 -no-cnv --no-display-prompt \
+//!     -ngl 0 --device none -c 512 -fa off --no-repack -b 512 -ub 1
+//! ```
+//!
+//! on an M4 Max (the macOS arm64 build). `--no-repack` keeps the kernels
+//! nibble transcribes (repacked weights use others), and `-ub 1` evaluates
+//! the prompt one token at a time, as nibble does. The macOS x64 build (AVX2)
+//! gives the same text for the BF16 and Q8_0 cases. The Qwen3.5 BF16 case is
+//! from b12675 on x86 and was not rerun here.
+//!
+//! Every generation case also agrees with llama.cpp with flash attention on
+//! and with weight repacking on, so none is a near-tie.
 
 use std::path::PathBuf;
 
@@ -151,6 +163,13 @@ fn qwen35_tokenizer_matches_llama_cpp() {
 #[ignore = "needs models/Qwen3-0.6B-BF16.gguf"]
 fn qwen3_bf16_greedy_matches_llama_cpp() {
     let model = load_model("Qwen3-0.6B-BF16.gguf");
+
+    let chat = "<|im_start|>user\nWrite a haiku about the Rust programming language.<|im_end|>\n\
+                <|im_start|>assistant\n<think>\n\n</think>\n";
+    let (text, stop) = greedy(&model, chat, 64);
+    assert_eq!(text, "A rust program  \nA rust program  \nA rust program.");
+    assert!(matches!(stop, StopReason::EndOfGeneration(_)));
+
     let (text, stop) = greedy(&model, "The capital of France is", 64);
     assert_eq!(
         text,
@@ -171,12 +190,6 @@ fn qwen3_q8_0_greedy_matches_llama_cpp() {
         text,
         " 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,"
     );
-
-    let chat = "<|im_start|>user\nWrite a haiku about the Rust programming language.<|im_end|>\n\
-                <|im_start|>assistant\n<think>\n\n</think>\n";
-    let (text, stop) = greedy(&model, chat, 64);
-    assert_eq!(text, "A rust program  \nA rust program  \nA rust program.");
-    assert!(matches!(stop, StopReason::EndOfGeneration(_)));
 }
 
 #[test]
@@ -213,4 +226,52 @@ fn qwen35_q8_0_greedy_matches_llama_cpp() {
         "Red code, green eyes,\nSwift code, blue eyes,\nRust code, green eyes."
     );
     assert!(matches!(stop, StopReason::EndOfGeneration(_)));
+
+    let (text, stop) = greedy(&model, "The capital of France is", 64);
+    assert_eq!(
+        text,
+        format!(
+            " Paris.{}\nThe capital of France is",
+            "\nThe capital of France is Paris.".repeat(7)
+        )
+    );
+    assert_eq!(stop, StopReason::MaxTokens);
+}
+
+#[test]
+#[ignore = "needs models/Qwen3.5-0.8B-Q4_K_M.gguf"]
+fn qwen35_q4_k_m_greedy_matches_llama_cpp() {
+    let model = load_model("Qwen3.5-0.8B-Q4_K_M.gguf");
+
+    let (text, stop) = greedy(&model, "The capital of France is", 64);
+    assert_eq!(
+        text,
+        " the capital of the country.\n\
+         The capital of France is the capital of the country.\n\
+         The capital of France is the capital of the country.\n\
+         The capital of France is the capital of the country.\n\
+         The capital of France is the capital of the country.\n\
+         The capital of France is the capital of the"
+    );
+    assert_eq!(stop, StopReason::MaxTokens);
+
+    let (text, _) = greedy(&model, "List of prime numbers: 2, 3, 5, 7,", 64);
+    assert_eq!(
+        text,
+        " 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,"
+    );
+}
+
+#[test]
+#[ignore = "needs models/Qwen3.5-0.8B-Q3_K_M.gguf"]
+fn qwen35_q3_k_m_greedy_matches_llama_cpp() {
+    let model = load_model("Qwen3.5-0.8B-Q3_K_M.gguf");
+
+    // The other comparison prompts are near-ties on this file: llama.cpp
+    // itself changes its answer with flash attention or weight repacking.
+    let (text, _) = greedy(&model, "List of prime numbers: 2, 3, 5, 7,", 64);
+    assert_eq!(
+        text,
+        " 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,"
+    );
 }

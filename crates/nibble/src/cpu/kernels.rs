@@ -11,6 +11,8 @@ use nibble_gguf::GgmlType;
 
 #[cfg(target_arch = "x86_64")]
 use super::avx2::Avx2;
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+use super::neon::Neon;
 use super::scalar::{self, DeltaStep};
 use crate::quant::{self, DotType};
 
@@ -26,6 +28,11 @@ pub(crate) enum Kernels {
     /// AVX2 + FMA + F16C.
     #[cfg(target_arch = "x86_64")]
     Avx2(Avx2),
+    /// AArch64 NEON. `dotprod` and `fp16` are used when the CPU has them.
+    /// Little-endian only: GGUF data is little-endian and the NEON loads are
+    /// native-endian, so big-endian AArch64 uses the scalar kernels.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    Neon(Neon),
 }
 
 impl Kernels {
@@ -42,17 +49,23 @@ impl Kernels {
             if let Some(k) = Avx2::detect() {
                 return Self::Avx2(k);
             }
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            if let Some(k) = Neon::detect() {
+                return Self::Neon(k);
+            }
             Self::Scalar
         })
     }
 
-    /// Short name for logs: `scalar` or `avx2`.
+    /// Short name for logs: `scalar`, `avx2` or `neon`.
     #[must_use]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Scalar => "scalar",
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(_) => "avx2",
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(_) => "neon",
         }
     }
 
@@ -64,6 +77,8 @@ impl Kernels {
             Self::Scalar => quant::encode_activation(dt, x, out),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.encode(dt, x, out),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.encode(dt, x, out),
         }
     }
 
@@ -87,16 +102,30 @@ impl Kernels {
             }
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.dot_rows(ty, rows, row_bytes, xq, out),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.dot_rows(ty, rows, row_bytes, xq, out),
         }
     }
 
-    /// `a · b` for f16 vectors stored as little-endian bytes.
-    #[must_use]
-    pub(crate) fn dot_f16(self, a: &[u8], b: &[u8]) -> f32 {
+    /// `out[r] = a_r · b`, where `a_r` is the f16 vector of `b.len()`
+    /// little-endian values at byte `r * stride` of `a` (the cached keys of
+    /// a head, or its rows of transposed values) and `b` is f32. Each result
+    /// is that of one ggml `ggml_vec_dot_f16_f32` call.
+    ///
+    /// # Panics
+    ///
+    /// If a row extends past the end of `a` (an internal invariant).
+    pub(crate) fn dot_f16_f32_rows(self, a: &[u8], stride: usize, b: &[f32], out: &mut [f32]) {
         match self {
-            Self::Scalar => scalar::dot_f16(a, b),
+            Self::Scalar => {
+                for (r, o) in out.iter_mut().enumerate() {
+                    *o = scalar::dot_f16_f32(&a[r * stride..r * stride + 2 * b.len()], b);
+                }
+            }
             #[cfg(target_arch = "x86_64")]
-            Self::Avx2(k) => k.dot_f16(a, b),
+            Self::Avx2(k) => k.dot_f16_f32_rows(a, stride, b, out),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.dot_f16_f32_rows(a, stride, b, out),
         }
     }
 
@@ -108,6 +137,8 @@ impl Kernels {
             Self::Scalar => scalar::to_f16(x, out),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.to_f16(x, out),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.to_f16(x, out),
         }
     }
 
@@ -117,6 +148,8 @@ impl Kernels {
             Self::Scalar => scalar::silu_in_place(x),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.silu(x),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.silu(x),
         }
     }
 
@@ -126,6 +159,8 @@ impl Kernels {
             Self::Scalar => scalar::swiglu(g, u),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.swiglu(g, u),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.swiglu(g, u),
         }
     }
 
@@ -135,6 +170,8 @@ impl Kernels {
             Self::Scalar => scalar::softmax(x),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.softmax(x),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.softmax(x),
         }
     }
 
@@ -145,6 +182,8 @@ impl Kernels {
             Self::Scalar => scalar::delta_net_head(state, step, out),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2(k) => k.delta_net_head(state, step, out),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.delta_net_head(state, step, out),
         }
     }
 }

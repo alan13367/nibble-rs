@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nibble::sampler::SamplerConfig;
 use nibble::{Model, SessionOptions};
@@ -86,10 +86,10 @@ pub(crate) struct ModelOptions {
     pub(crate) mmap: bool,
 }
 
-pub(crate) const MODEL_HELP: &str = "\
-  -m, --model FILE         GGUF model file (required)
+pub(crate) const MODEL_HELP: &str = "  -m, --model FILE         GGUF model file (required)
   -c, --ctx N              Context size in tokens (default 4096, 0 = model maximum)
-  -t, --threads N          Threads (default: one per physical core)
+  -t, --threads N          Threads (default: performance cores on Apple Silicon,
+                           else one per physical core)
       --read               Read the model into memory instead of memory-mapping it
 ";
 
@@ -115,7 +115,28 @@ impl ModelOptions {
         Ok(true)
     }
 
+    /// Loads the model and reports it on stderr.
     pub(crate) fn load(&self) -> CliResult<Model> {
+        let (model, elapsed) = self.load_quietly()?;
+        let c = model.config();
+        eprintln!(
+            "nibble: loaded {} ({}, {}, {} layers) in {:.0} ms{}",
+            c.name.as_deref().unwrap_or("model"),
+            c.architecture.name(),
+            c.weight_type,
+            c.n_layer,
+            elapsed.as_secs_f64() * 1e3,
+            if model.is_mapped() {
+                ", memory-mapped"
+            } else {
+                ""
+            },
+        );
+        Ok(model)
+    }
+
+    /// Loads the model without printing, and says how long it took.
+    pub(crate) fn load_quietly(&self) -> CliResult<(Model, Duration)> {
         let path = self
             .path
             .as_ref()
@@ -129,21 +150,7 @@ impl ModelOptions {
             Model::load(path)
         }
         .map_err(|e| format!("{}: {e}", path.display()))?;
-        let c = model.config();
-        eprintln!(
-            "nibble: loaded {} ({}, {}, {} layers) in {:.0} ms{}",
-            c.name.as_deref().unwrap_or("model"),
-            c.architecture.name(),
-            c.weight_type,
-            c.n_layer,
-            start.elapsed().as_secs_f64() * 1e3,
-            if model.is_mapped() {
-                ", memory-mapped"
-            } else {
-                ""
-            },
-        );
-        Ok(model)
+        Ok((model, start.elapsed()))
     }
 
     pub(crate) fn session_options(&self) -> SessionOptions {
@@ -160,8 +167,8 @@ pub(crate) struct SamplingOptions {
     seed: Option<u64>,
 }
 
-pub(crate) const SAMPLING_HELP: &str = "\
-      --temp T             Temperature (default 0.8; 0 = greedy)
+pub(crate) const SAMPLING_HELP: &str =
+    "      --temp T             Temperature (default 0.8; 0 = greedy)
       --top-k K            Top-k (default 40; 0 = off)
       --top-p P            Top-p (default 0.95; 1 = off)
       --min-p P            Min-p (default 0.05; 0 = off)

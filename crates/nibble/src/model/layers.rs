@@ -70,15 +70,18 @@ impl Scratch {
     }
 }
 
-/// Positions are processed in blocks of this many: the step of ggml's f16
-/// dot product, which llama.cpp's padding of the cache (to 256 positions)
-/// always fills.
+/// The attention row is padded to a multiple of this many positions, with
+/// masked (zero-weight) entries, as llama.cpp pads it to 256. 32 is the
+/// largest step of the kernels involved (ggml's softmax and f16 dot), so the
+/// real positions are computed in the same groups as in llama.cpp, and the
+/// further padding there adds only exact zeros.
 const KV_BLOCK: usize = 32;
 
 /// Keys and values of one attention layer for up to `capacity` positions, in
 /// f16 (llama.cpp's default cache type), laid out as llama.cpp lays them out
 /// without flash attention: keys by position, values transposed. Both
-/// attention products are then contiguous f16 dot products.
+/// attention products are then contiguous dot products of f16 cache entries
+/// with f32 vectors.
 ///
 /// The buffers are allocated for the whole context up front, as llama.cpp
 /// does, so the forward pass never reallocates them. The OS backs their
@@ -157,46 +160,31 @@ impl KvCache {
         self.len = n_pos;
     }
 
-    /// The keys of KV head `g` at position `t`.
-    fn key(&self, t: usize, g: usize) -> &[u8] {
-        let start = t * self.kv_dim + g * self.head_dim;
-        &self.k[2 * start..2 * (start + self.head_dim)]
+    /// The keys of KV head `g`: one row of `head_dim` values per position,
+    /// rows `stride` bytes apart, as `(bytes from the first row, stride)`.
+    fn keys(&self, g: usize) -> (&[u8], usize) {
+        (&self.k[2 * g * self.head_dim..], 2 * self.kv_dim)
     }
 
-    /// Element `i` of the value of every position, through the end of the
-    /// block that holds the last position.
-    fn values(&self, i: usize) -> &[u8] {
-        let start = i * self.stride;
-        &self.vt[2 * start..2 * (start + self.len.next_multiple_of(KV_BLOCK))]
+    /// The value rows from element `i` on: row `i + r` holds that element of
+    /// every position, rows `stride` bytes apart, as `(bytes, stride)`.
+    fn value_rows(&self, i: usize) -> (&[u8], usize) {
+        (&self.vt[2 * i * self.stride..], 2 * self.stride)
     }
-}
-
-/// Per-head buffers for [`attend`].
-struct HeadScratch {
-    /// Attention scores, then probabilities, for every position.
-    scores: Vec<f32>,
-    /// The probabilities as f16, zero-padded to a whole block.
-    probs: Vec<u8>,
 }
 
 /// Buffers for [`attend`].
 pub(crate) struct AttentionScratch {
-    /// The queries as f16.
-    q16: Vec<u8>,
-    heads: Vec<HeadScratch>,
+    /// Per head: the attention scores, then the probabilities, of every
+    /// position, padded to a whole block.
+    heads: Vec<Vec<f32>>,
 }
 
 impl AttentionScratch {
     pub(crate) fn new(c: &ModelConfig, n_ctx: usize) -> Self {
         let padded = n_ctx.next_multiple_of(KV_BLOCK);
         Self {
-            q16: vec![0; 2 * c.n_head * c.head_dim],
-            heads: (0..c.n_head)
-                .map(|_| HeadScratch {
-                    scores: vec![0.0; n_ctx],
-                    probs: vec![0; 2 * padded],
-                })
-                .collect(),
+            heads: vec![vec![0.0; padded]; c.n_head],
         }
     }
 }
@@ -205,10 +193,10 @@ impl AttentionScratch {
 /// with grouped-query sharing (query head `h` reads KV head `h / (n_head / n_head_kv)`).
 /// Writes `n_head * head_dim` values to `out`.
 ///
-/// As llama.cpp without flash attention: queries meet the f16 keys in f16,
-/// the softmax probabilities are rounded to f16, and each output value is
-/// the f16 dot product of the probabilities with a row of transposed values.
-/// Heads run in parallel.
+/// As llama.cpp without flash attention (b12359 and later): the f32 queries
+/// meet the f16 keys, the softmax runs over the padded row with the padding
+/// masked to `-inf`, and each output value is the dot product of the f32
+/// probabilities with a row of transposed f16 values. Heads run in parallel.
 pub(crate) fn attend(
     ctx: &Ctx<'_>,
     q: &[f32],
@@ -221,28 +209,24 @@ pub(crate) fn attend(
     let group = c.n_head / c.n_head_kv;
     let scale = 1.0 / (hd as f32).sqrt();
     let kernels = ctx.cpu.kernels();
-    kernels.to_f16(q, &mut s.q16);
-    let q16 = &s.q16;
     let n_pos = cache.len();
     let padded = n_pos.next_multiple_of(KV_BLOCK);
     ctx.cpu
         .pool()
         .for_each_chunk_pair(out, hd, &mut s.heads, 1, |h, out, head| {
-            let head = &mut head[0];
             let kv_head = h / group;
-            let q = &q16[2 * h * hd..2 * (h + 1) * hd];
-            let scores = &mut head.scores[..n_pos];
-            for (t, score) in scores.iter_mut().enumerate() {
-                *score = kernels.dot_f16(q, cache.key(t, kv_head)) * scale;
+            let q = &q[h * hd..(h + 1) * hd];
+            let probs = &mut head[0][..padded];
+            let (scores, masked) = probs.split_at_mut(n_pos);
+            let (keys, key_stride) = cache.keys(kv_head);
+            kernels.dot_f16_f32_rows(keys, key_stride, q, scores);
+            for score in scores.iter_mut() {
+                *score *= scale;
             }
-            kernels.softmax(scores);
-            let probs = &mut head.probs[..2 * padded];
-            let (p, padding) = probs.split_at_mut(2 * n_pos);
-            kernels.to_f16(scores, p);
-            padding.fill(0);
-            for (i, o) in out.iter_mut().enumerate() {
-                *o = kernels.dot_f16(probs, cache.values(kv_head * hd + i));
-            }
+            masked.fill(f32::NEG_INFINITY);
+            kernels.softmax(probs);
+            let (values, value_stride) = cache.value_rows(kv_head * hd);
+            kernels.dot_f16_f32_rows(values, value_stride, probs, out);
         });
 }
 

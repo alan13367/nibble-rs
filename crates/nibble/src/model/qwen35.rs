@@ -373,8 +373,9 @@ impl ConvState {
 
     /// Writes the causal depthwise convolution of `[history..., x]` with
     /// `taps` (by time, oldest first) to `out`, then appends `x` to the
-    /// history. Each channel sums from zero, oldest input first, as
-    /// `ggml_ssm_conv` does; the loops run across channels so they vectorize
+    /// history. Each channel sums from zero, oldest input first, with one
+    /// fused multiply-add per tap, as clang compiles `ggml_ssm_conv`'s
+    /// `sumf += s*c`; the loops run across channels so they vectorize
     /// without changing that order.
     fn step(&mut self, taps: &[f32], x: &[f32], out: &mut [f32]) {
         let dim = self.dim;
@@ -383,11 +384,11 @@ impl ConvState {
             let row = (self.oldest + t) % self.len;
             let history = &self.rows[row * dim..(row + 1) * dim];
             for ((o, &h), &w) in out.iter_mut().zip(history).zip(&taps[t * dim..]) {
-                *o += h * w;
+                *o = h.mul_add(w, *o);
             }
         }
         for ((o, &x), &w) in out.iter_mut().zip(x).zip(&taps[self.len * dim..]) {
-            *o += x * w;
+            *o = x.mul_add(w, *o);
         }
         if self.len > 0 {
             self.rows[self.oldest * dim..(self.oldest + 1) * dim].copy_from_slice(x);

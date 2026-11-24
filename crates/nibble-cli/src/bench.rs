@@ -86,11 +86,12 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
 
     let c = model.config();
     eprintln!(
-        "nibble bench: {} ({}, {}), {} threads, {reps} repetitions, seed {seed}",
+        "nibble bench: {} ({}, {}), {} threads, {}, {reps} repetitions, seed {seed}",
         c.name.as_deref().unwrap_or("model"),
         c.architecture,
         c.weight_type,
         session.threads(),
+        session.kernel(),
     );
     if pp > 0 {
         eprintln!(

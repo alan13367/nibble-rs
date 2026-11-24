@@ -4,10 +4,12 @@ A tiny, fast, cross-platform inference engine for GGUF models, written in Rust
 with **zero external dependencies**.
 
 > Early development. Today: a CPU engine for Qwen3 (`qwen3`) and Qwen3.5
-> (`qwen35`, hybrid Gated DeltaNet) on F32, F16, BF16 and Q8_0 weights,
-> checked against llama.cpp and as fast as it on AVX2 CPUs, with an
-> OpenAI-compatible server and `run`, `chat`, `bench`, `tokenize` and
-> `inspect` commands.
+> (`qwen35`, hybrid Gated DeltaNet) on F32, F16, BF16, Q8_0 and Q3_K–Q6_K
+> weights, with AVX2 and NEON kernels that reproduce llama.cpp's results
+> bit for bit. The exceptions are BF16 on ARM, where nibble is about six
+> times faster instead, and the K-quants on x86, which still use the scalar
+> dot products. It comes with an OpenAI-compatible server and `run`, `chat`,
+> `serve`, `bench`, `tokenize` and `inspect` commands.
 
 ## Build
 
@@ -22,8 +24,8 @@ cargo build --release
 ```
 
 `nibble <command> --help` lists each command's options: sampling, context
-size, threads (one per physical core by default), and `--probs N` to show
-the top candidates at each step.
+size, threads (by default the performance cores on Apple Silicon, else one per
+physical core), and `--probs N` to show the top candidates at each step.
 
 `nibble bench -m <model.gguf>` measures prompt and decode speed the way
 `llama-bench` does (`pp512`, `tg128`), so the numbers compare directly.
