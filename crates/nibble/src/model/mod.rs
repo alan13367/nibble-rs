@@ -23,6 +23,7 @@ use nibble_gguf::{Gguf, Storage};
 pub use config::ModelConfig;
 
 use crate::chat::ChatTemplate;
+use crate::cpu::Cpu;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionOptions};
 use crate::tokenizer::Tokenizer;
@@ -69,7 +70,8 @@ pub(crate) struct Ctx<'a> {
     /// The model bytes that weight offsets point into.
     pub(crate) bytes: &'a [u8],
     pub(crate) config: &'a ModelConfig,
-    pub(crate) threads: usize,
+    /// The session's threads and kernels.
+    pub(crate) cpu: &'a Cpu,
 }
 
 /// The architecture-specific weights and forward pass.
@@ -208,19 +210,20 @@ impl Model {
         }
     }
 
-    /// Runs `token` at position `pos`, writing the next-token logits when asked.
+    /// Runs `token` at position `pos` on `cpu`, writing the next-token logits
+    /// when asked.
     pub(crate) fn forward(
         &self,
+        cpu: &Cpu,
         state: &mut State,
         token: u32,
         pos: usize,
         logits: Option<&mut [f32]>,
-        threads: usize,
     ) {
         let ctx = Ctx {
             bytes: &self.storage,
             config: &self.config,
-            threads,
+            cpu,
         };
         match (&self.arch, state) {
             (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(&ctx, s, token, pos, logits),
@@ -231,7 +234,8 @@ impl Model {
 
     /// Rewinds `state` to its first `n_pos` positions. Returns false when the
     /// architecture cannot rewind (recurrent state), in which case the caller
-    /// must rebuild the state by evaluating the kept tokens again.
+    /// must rebuild the state from a [`Snapshot`] or by evaluating the kept
+    /// tokens again.
     pub(crate) fn truncate_state(&self, state: &mut State, n_pos: usize) -> bool {
         match state {
             State::Qwen3(s) => {
@@ -242,4 +246,38 @@ impl Model {
             State::Qwen35(_) => false,
         }
     }
+
+    /// Copies the parts of `state` that cannot be rewound into `snapshot`,
+    /// reusing its buffers. Returns false, leaving `snapshot` as it is, for
+    /// architectures whose state rewinds without one.
+    pub(crate) fn save_state(&self, state: &State, snapshot: &mut Option<Snapshot>) -> bool {
+        match state {
+            State::Qwen3(_) => false,
+            State::Qwen35(s) => {
+                if let Some(Snapshot::Qwen35(target)) = snapshot {
+                    s.save(target);
+                } else {
+                    let mut target = qwen35::Snapshot::default();
+                    s.save(&mut target);
+                    *snapshot = Some(Snapshot::Qwen35(target));
+                }
+                true
+            }
+        }
+    }
+
+    /// Returns `state` to the moment `snapshot` was taken, `n_pos` tokens
+    /// in: the saved parts are copied back and the caches truncated.
+    pub(crate) fn restore_state(&self, state: &mut State, snapshot: &Snapshot, n_pos: usize) {
+        match (state, snapshot) {
+            (State::Qwen35(s), Snapshot::Qwen35(saved)) => s.restore(saved, n_pos),
+            _ => unreachable!("snapshot belongs to a different architecture"),
+        }
+    }
+}
+
+/// The parts of a [`State`] that cannot be rewound (recurrent layers), as
+/// they were at some position.
+pub(crate) enum Snapshot {
+    Qwen35(qwen35::Snapshot),
 }

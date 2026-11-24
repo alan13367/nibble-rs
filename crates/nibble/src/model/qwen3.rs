@@ -58,7 +58,7 @@ impl Qwen3 {
 
     pub(crate) fn new_state(c: &ModelConfig, n_ctx: usize) -> State {
         State {
-            caches: (0..c.n_layer).map(|_| KvCache::new(c)).collect(),
+            caches: (0..c.n_layer).map(|_| KvCache::new(c, n_ctx)).collect(),
             x: vec![0.0; c.n_embd],
             attn: AttentionBuffers::new(c, n_ctx),
             ffn: FfnBuffers::new(c),

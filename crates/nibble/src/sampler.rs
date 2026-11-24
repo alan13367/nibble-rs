@@ -199,6 +199,48 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// Log-probabilities of the model's distribution over the next token, as
+/// [`logprobs`] computes them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Logprobs {
+    /// Log-probability of the chosen token.
+    pub token: f32,
+    /// The most likely tokens and their log-probabilities, most likely
+    /// first (lowest id first on ties).
+    pub top: Vec<(u32, f32)>,
+}
+
+/// The log-probability of `token` and of the `n` most likely tokens under
+/// the softmax of `logits` (the raw model distribution, before any sampling
+/// setting, as llama.cpp's server reports it).
+///
+/// # Panics
+///
+/// If `token` is not an index of `logits`.
+#[must_use]
+pub fn logprobs(logits: &[f32], token: u32, n: usize) -> Logprobs {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = logits.iter().map(|&l| f64::from(l - max).exp()).sum();
+    let log_sum = f64::from(max) + sum.ln();
+    let logprob = |l: f32| (f64::from(l) - log_sum) as f32;
+    // One pass keeping the best `n` in order; `n` is small.
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(n + 1);
+    if n > 0 {
+        for (i, &l) in logits.iter().enumerate() {
+            if top.len() == n && l <= top[n - 1].1 {
+                continue;
+            }
+            let at = top.partition_point(|&(_, t)| t >= l);
+            top.insert(at, (i as u32, l));
+            top.truncate(n);
+        }
+    }
+    Logprobs {
+        token: logprob(logits[token as usize]),
+        top: top.into_iter().map(|(i, l)| (i, logprob(l))).collect(),
+    }
+}
+
 fn softmax_of(cand: &[(u32, f32)]) -> Vec<f32> {
     let max = cand.first().map_or(0.0, |c| c.1);
     let mut probs: Vec<f32> = cand.iter().map(|&(_, l)| (l - max).exp()).collect();
@@ -246,6 +288,23 @@ impl Pcg32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logprobs_are_the_log_softmax() {
+        let logits = [1.0f32, 3.0, 2.0, 3.0, -1.0];
+        let total: f64 = logits.iter().map(|&l| f64::from(l).exp()).sum();
+        let want = |i: usize| (f64::from(logits[i]).exp() / total).ln() as f32;
+        let lp = logprobs(&logits, 2, 3);
+        assert!((lp.token - want(2)).abs() < 1e-6);
+        // Ties keep the lower id first.
+        let ids: Vec<u32> = lp.top.iter().map(|&(i, _)| i).collect();
+        assert_eq!(ids, [1, 3, 2]);
+        for &(i, l) in &lp.top {
+            assert!((l - want(i as usize)).abs() < 1e-6);
+        }
+        assert!(logprobs(&logits, 0, 0).top.is_empty());
+        assert_eq!(logprobs(&logits, 0, 10).top.len(), logits.len());
+    }
 
     #[test]
     fn greedy_picks_the_maximum() {

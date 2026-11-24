@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 nibble-gguf.workspace = true
+nibble-json.workspace = true
 
 [lints]
 workspace = true

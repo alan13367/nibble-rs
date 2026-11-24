@@ -3,8 +3,8 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 
-use nibble::sampler::{Sampler, SamplerConfig};
-use nibble::tokenizer::StreamDecoder;
+use nibble::sampler::{self, Sampler, SamplerConfig};
+use nibble::tokenizer::{StreamDecoder, Tokenizer};
 use nibble::{Model, Session, SessionOptions, StopReason};
 
 use crate::text::StopMatcher;
@@ -15,6 +15,8 @@ pub(crate) struct Job {
     pub(crate) sampler: SamplerConfig,
     pub(crate) max_tokens: usize,
     pub(crate) stop: Vec<String>,
+    /// Report each token's log-probability, with this many alternatives.
+    pub(crate) logprobs: Option<usize>,
     pub(crate) events: Sender<Event>,
 }
 
@@ -25,6 +27,8 @@ pub(crate) enum Finish {
     Stop,
     /// `max_tokens` or the context size was reached.
     Length,
+    /// The reply ended with tool calls (decided by the chat endpoint).
+    ToolCalls,
 }
 
 impl Finish {
@@ -32,14 +36,42 @@ impl Finish {
         match self {
             Self::Stop => "stop",
             Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+        }
+    }
+}
+
+/// A generated token's log-probability and the most likely alternatives,
+/// under the model's raw distribution.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TokenLogprob {
+    /// The token's bytes (special tokens as their text).
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) logprob: f32,
+    pub(crate) top: Vec<(Vec<u8>, f32)>,
+}
+
+impl TokenLogprob {
+    fn new(tokenizer: &Tokenizer, token: u32, logits: &[f32], n_top: usize) -> Self {
+        let lp = sampler::logprobs(logits, token, n_top);
+        let bytes = |id: u32| tokenizer.token_bytes(id, true).to_vec();
+        Self {
+            bytes: bytes(token),
+            logprob: lp.token,
+            top: lp.top.into_iter().map(|(id, l)| (bytes(id), l)).collect(),
         }
     }
 }
 
 /// What the worker reports for a job, in order: text pieces, then `Done` or `Error`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Event {
-    Text(String),
+    /// Generated text, with the log-probabilities of the tokens it completes
+    /// (when requested). Tokens of a stop sequence are not reported.
+    Text {
+        text: String,
+        logprobs: Vec<TokenLogprob>,
+    },
     Done {
         finish: Finish,
         prompt_tokens: usize,
@@ -85,6 +117,8 @@ fn serve(session: &mut Session<'_>, job: Job) {
     let mut sampler = Sampler::new(job.sampler);
     let mut decoder = StreamDecoder::new();
     let mut stops = StopMatcher::new(job.stop);
+    // Log-probabilities of tokens whose text is not released yet.
+    let mut pending = Vec::new();
     let mut completion_tokens = 0;
     let mut hit_stop = false;
     let mut client_gone = false;
@@ -92,12 +126,18 @@ fn serve(session: &mut Session<'_>, job: Job) {
         &job.prompt[keep..],
         &mut sampler,
         job.max_tokens,
-        |token, _| {
+        |token, logits| {
             completion_tokens += 1;
+            if let Some(n_top) = job.logprobs {
+                pending.push(TokenLogprob::new(tokenizer, token, logits, n_top));
+            }
             let (text, stopped) = stops.push(&decoder.push(tokenizer, token, false));
-            if !text.is_empty() && job.events.send(Event::Text(text)).is_err() {
-                client_gone = true;
-                return false;
+            if !text.is_empty() {
+                let logprobs = std::mem::take(&mut pending);
+                if job.events.send(Event::Text { text, logprobs }).is_err() {
+                    client_gone = true;
+                    return false;
+                }
             }
             hit_stop = stopped;
             !stopped
@@ -117,9 +157,12 @@ fn serve(session: &mut Session<'_>, job: Job) {
     };
     if !hit_stop {
         let (tail, _) = stops.push(&decoder.finish());
-        let tail = tail + &stops.finish();
-        if !tail.is_empty() {
-            let _ = job.events.send(Event::Text(tail));
+        let text = tail + &stops.finish();
+        if !text.is_empty() || !pending.is_empty() {
+            let _ = job.events.send(Event::Text {
+                text,
+                logprobs: pending,
+            });
         }
     }
     let _ = job.events.send(Event::Done {

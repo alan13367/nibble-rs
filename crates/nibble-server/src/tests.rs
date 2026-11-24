@@ -6,13 +6,13 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use nibble::gguf::{GgmlType, GgufWriter, OwnedValue, Storage, ValueType};
 use nibble::{Model, SessionOptions};
 
-use crate::json::{self, Json};
 use crate::{ServerOptions, serve};
+use nibble::json::{self, Json};
 
 const N_EMBD: u64 = 16;
 
 /// A one-layer Qwen3 with a byte-level vocabulary and a ChatML template.
-fn tiny_model() -> Model {
+fn tiny_model(chat_template: &str) -> Model {
     let mut seed = 0x2545_F491u32;
     let mut next = move || {
         seed ^= seed << 13;
@@ -46,7 +46,7 @@ fn tiny_model() -> Model {
     let mut w = GgufWriter::new();
     w.add("general.architecture", "qwen3")
         .add("qwen3.block_count", 1u32)
-        .add("qwen3.context_length", 256u32)
+        .add("qwen3.context_length", 2048u32)
         .add("qwen3.embedding_length", N_EMBD as u32)
         .add("qwen3.feed_forward_length", 32u32)
         .add("qwen3.attention.head_count", 2u32)
@@ -68,10 +68,7 @@ fn tiny_model() -> Model {
             OwnedValue::array(ValueType::String, Vec::<String>::new()),
         )
         .add("tokenizer.ggml.eos_token_id", 257u32)
-        .add(
-            "tokenizer.chat_template",
-            "{{ '<|im_start|>' + message.role }}",
-        );
+        .add("tokenizer.chat_template", chat_template);
     let e = N_EMBD;
     tensor(&mut w, "token_embd.weight", &[e, vocab.len() as u64]);
     tensor(&mut w, "output_norm.weight", &[e]);
@@ -94,15 +91,25 @@ fn tiny_model() -> Model {
 }
 
 fn start(api_key: Option<&str>) -> SocketAddr {
+    start_with(CHATML, api_key)
+}
+
+/// A plain ChatML template, which has no tool calls.
+const CHATML: &str = "{{ '<|im_start|>' + message.role }}";
+
+/// Enough of Qwen3's template for nibble to recognize it.
+const QWEN3: &str = "{{ '<|im_start|>' }} {%- if '</think>' in content %}";
+
+fn start_with(chat_template: &str, api_key: Option<&str>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mut options = ServerOptions::new("tiny");
     options.api_key = api_key.map(str::to_owned);
     options.session = SessionOptions {
-        n_ctx: 256,
+        n_ctx: 2048,
         threads: 1,
     };
-    let model = tiny_model();
+    let model = tiny_model(chat_template);
     std::thread::spawn(move || serve(listener, model, options));
     addr
 }
@@ -368,4 +375,117 @@ fn api_key_is_required_when_set() {
     assert_eq!(ok.status, 200);
     // Health checks stay open for load balancers.
     assert_eq!(request(addr, "GET", "/health", &[], "").status, 200);
+}
+
+/// The first choice of a response body.
+fn choice(v: &Json) -> Json {
+    v.get("choices").and_then(Json::as_array).unwrap()[0].clone()
+}
+
+/// Checks one logprobs entry of a greedy generation: a valid log-probability
+/// with `n_top` alternatives, the best of which is the chosen token.
+fn check_greedy_entry(entry: &Json, n_top: usize) {
+    let logprob = entry.get("logprob").and_then(Json::as_f64).unwrap();
+    assert!(logprob <= 0.0, "{entry}");
+    let bytes = entry.get("bytes").and_then(Json::as_array).unwrap();
+    assert!(!bytes.is_empty(), "{entry}");
+    let top = entry.get("top_logprobs").and_then(Json::as_array).unwrap();
+    assert_eq!(top.len(), n_top, "{entry}");
+    if let Some(best) = top.first() {
+        assert_eq!(best.get("token"), entry.get("token"), "{entry}");
+        assert_eq!(best.get("logprob").and_then(Json::as_f64), Some(logprob));
+    }
+}
+
+#[test]
+fn chat_logprobs_cover_every_generated_token() {
+    let addr = start(None);
+    let body = r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_tokens":6,
+                  "logprobs":true,"top_logprobs":3}"#;
+    let r = request(addr, "POST", "/v1/chat/completions", &[], body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = parse(&r.body);
+    let entries = choice(&v)
+        .get("logprobs")
+        .and_then(|l| l.get("content"))
+        .and_then(Json::as_array)
+        .unwrap()
+        .to_vec();
+    let generated = v
+        .get("usage")
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(Json::as_u64)
+        .unwrap();
+    assert_eq!(entries.len() as u64, generated);
+    for entry in &entries {
+        check_greedy_entry(entry, 3);
+    }
+
+    // Streamed, the same entries arrive spread over the chunks.
+    let stream = body.replace("\"logprobs\"", "\"stream\":true,\"logprobs\"");
+    let r = request(addr, "POST", "/v1/chat/completions", &[], &stream);
+    let streamed: Vec<Json> = r
+        .body
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|e| *e != "[DONE]")
+        .map(parse)
+        .filter_map(|chunk| {
+            choice(&chunk)
+                .get("logprobs")
+                .and_then(|l| l.get("content"))
+                .and_then(Json::as_array)
+                .map(<[Json]>::to_vec)
+        })
+        .flatten()
+        .collect();
+    assert_eq!(streamed, entries);
+}
+
+#[test]
+fn completion_logprobs_use_the_legacy_shape() {
+    let addr = start(None);
+    let body = r#"{"prompt":"abc","temperature":0,"max_tokens":4,"logprobs":2}"#;
+    let r = request(addr, "POST", "/v1/completions", &[], body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let logprobs = choice(&parse(&r.body)).get("logprobs").cloned().unwrap();
+    let field = |k: &str| logprobs.get(k).and_then(Json::as_array).unwrap().to_vec();
+    let (tokens, values, tops, offsets) = (
+        field("tokens"),
+        field("token_logprobs"),
+        field("top_logprobs"),
+        field("text_offset"),
+    );
+    assert!(!tokens.is_empty());
+    assert!(values.len() == tokens.len() && tops.len() == tokens.len());
+    assert_eq!(offsets[0], Json::from(0));
+    for (top, value) in tops.iter().zip(&values) {
+        let pairs = top.as_object().unwrap();
+        assert!(!pairs.is_empty() && pairs.len() <= 2, "{top}");
+        assert!(value.as_f64().unwrap() <= 0.0);
+    }
+}
+
+#[test]
+fn tools_need_a_template_with_tool_calls() {
+    let tools =
+        r#""tools":[{"type":"function","function":{"name":"now","parameters":{"type":"object"}}}]"#;
+    let body =
+        format!(r#"{{"messages":[{{"role":"user","content":"time?"}}],"max_tokens":3,{tools}}}"#);
+    let r = request(start(None), "POST", "/v1/chat/completions", &[], &body);
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("no tool calls"), "{}", r.body);
+
+    // With a Qwen3 template, tool definitions and a full tool round trip render.
+    let addr = start_with(QWEN3, None);
+    let r = request(addr, "POST", "/v1/chat/completions", &[], &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let round_trip = format!(
+        r#"{{"messages":[{{"role":"user","content":"time?"}},
+            {{"role":"assistant","content":null,"tool_calls":[{{"id":"call_1","type":"function",
+              "function":{{"name":"now","arguments":"{{}}"}}}}]}},
+            {{"role":"tool","tool_call_id":"call_1","content":"12:00"}}],"max_tokens":3,{tools}}}"#
+    );
+    let r = request(addr, "POST", "/v1/chat/completions", &[], &round_trip);
+    assert_eq!(r.status, 200, "{}", r.body);
 }

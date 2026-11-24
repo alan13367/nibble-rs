@@ -16,7 +16,7 @@
 //! ```
 
 mod http;
-mod json;
+
 mod openai;
 mod server;
 mod text;

@@ -67,6 +67,9 @@ const THINK_CLOSE: &str = "</think>";
 enum Phase {
     /// Nothing emitted yet; the output may open a think block.
     Start,
+    /// After `<think>`: leading whitespace is dropped, as llama.cpp does,
+    /// also when it arrives in a later piece.
+    ReasoningStart,
     Reasoning,
     /// After `</think>`: leading whitespace is dropped.
     ContentStart,
@@ -93,7 +96,7 @@ impl ReasoningSplitter {
     pub(crate) fn new(in_reasoning: bool) -> Self {
         Self {
             phase: if in_reasoning {
-                Phase::Reasoning
+                Phase::ReasoningStart
             } else {
                 Phase::Start
             },
@@ -109,13 +112,22 @@ impl ReasoningSplitter {
                 Phase::Start => {
                     let trimmed = self.pending.trim_start();
                     if let Some(rest) = trimmed.strip_prefix(THINK_OPEN) {
-                        self.pending = rest.trim_start_matches('\n').to_owned();
-                        self.phase = Phase::Reasoning;
+                        self.pending = rest.to_owned();
+                        self.phase = Phase::ReasoningStart;
                     } else if THINK_OPEN.starts_with(trimmed) {
                         return out; // still possibly "<think>"
                     } else {
                         self.phase = Phase::Content;
                     }
+                }
+                Phase::ReasoningStart => {
+                    let trimmed = self.pending.trim_start();
+                    if trimmed.is_empty() {
+                        self.pending.clear();
+                        return out;
+                    }
+                    self.pending = trimmed.to_owned();
+                    self.phase = Phase::Reasoning;
                 }
                 Phase::Reasoning => {
                     if let Some(at) = self.pending.find(THINK_CLOSE) {
@@ -160,7 +172,7 @@ impl ReasoningSplitter {
                 reasoning: pending,
                 content: String::new(),
             },
-            Phase::ContentStart => Split::default(),
+            Phase::ReasoningStart | Phase::ContentStart => Split::default(),
             Phase::Start | Phase::Content => Split {
                 reasoning: String::new(),
                 content: pending,
@@ -244,6 +256,23 @@ mod tests {
                 content: "The answer is 4.".into()
             }
         );
+    }
+
+    /// Qwen3 writes `<think>` and the newline after it as separate tokens.
+    #[test]
+    fn whitespace_after_think_is_dropped_across_pieces() {
+        let s = run_split(
+            false,
+            &["<think>", "\n", "Okay", ".\n</think>", "\n\n", "Hi"],
+        );
+        assert_eq!(
+            s,
+            Split {
+                reasoning: "Okay.".into(),
+                content: "Hi".into()
+            }
+        );
+        assert_eq!(run_split(true, &["\n", " ", "Fine"]).reasoning, "Fine");
     }
 
     #[test]

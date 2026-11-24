@@ -89,7 +89,7 @@ pub(crate) struct ModelOptions {
 pub(crate) const MODEL_HELP: &str = "\
   -m, --model FILE         GGUF model file (required)
   -c, --ctx N              Context size in tokens (default 4096, 0 = model maximum)
-  -t, --threads N          Threads (default: all cores)
+  -t, --threads N          Threads (default: one per physical core)
       --read               Read the model into memory instead of memory-mapping it
 ";
 

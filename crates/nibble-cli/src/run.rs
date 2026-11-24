@@ -174,10 +174,10 @@ fn prompt_tokens(
         template.render(
             &messages,
             ChatOptions {
-                add_generation_prompt: true,
                 enable_thinking: think,
+                ..ChatOptions::default()
             },
-        )
+        )?
     } else {
         prompt.to_owned()
     };

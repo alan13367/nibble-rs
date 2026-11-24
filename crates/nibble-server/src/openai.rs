@@ -1,14 +1,14 @@
 //! OpenAI API request parsing and response bodies.
 //!
-//! Requests are validated strictly: an unsupported feature (tools, images,
-//! `n > 1`, logprobs) is a 400 with a clear message rather than being
+//! Requests are validated strictly: an unsupported feature (images, `n > 1`,
+//! forced tool calls) is a 400 with a clear message rather than being
 //! silently ignored. Unknown fields are ignored, as OpenAI does.
 
-use nibble::chat::{Message, Role};
+use nibble::chat::{Message, Tool, ToolCall};
+use nibble::json::{self, Json};
 use nibble::sampler::SamplerConfig;
 
-use crate::json::{self, Json};
-use crate::worker::Finish;
+use crate::worker::{Finish, TokenLogprob};
 
 /// An error answered in OpenAI's `{"error": {...}}` shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,9 @@ impl ApiError {
     }
 }
 
+/// The most alternatives per token a request may ask log-probabilities for.
+const MAX_TOP_LOGPROBS: u64 = 20;
+
 /// Sampling and length options shared by both completion endpoints.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Generation {
@@ -78,6 +81,8 @@ pub(crate) struct Generation {
     pub(crate) stop: Vec<String>,
     pub(crate) stream: bool,
     pub(crate) include_usage: bool,
+    /// Report log-probabilities, with this many alternatives per token.
+    pub(crate) logprobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +90,11 @@ pub(crate) struct ChatRequest {
     pub(crate) messages: Vec<Message>,
     /// `chat_template_kwargs.enable_thinking`, if the client set it.
     pub(crate) enable_thinking: Option<bool>,
+    pub(crate) tools: Vec<Tool>,
+    /// Whether tool calls in the output are returned as calls
+    /// (`tool_choice` is `auto`) rather than left in the content (`none`).
+    pub(crate) parse_tool_calls: bool,
+    pub(crate) parallel_tool_calls: bool,
     pub(crate) generation: Generation,
 }
 
@@ -120,18 +130,10 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatRequest, ApiError> {
             Some("messages"),
         ));
     }
-    let mut messages = Vec::with_capacity(list.len());
-    for m in list {
-        messages.push(parse_message(m)?);
-    }
-    if let Some(tools) = v.get("tools").and_then(Json::as_array)
-        && !tools.is_empty()
-    {
-        return Err(ApiError::invalid(
-            "tools are not supported yet",
-            Some("tools"),
-        ));
-    }
+    let messages = list
+        .iter()
+        .map(parse_message)
+        .collect::<Result<Vec<_>, _>>()?;
     if let Some(format) = v.get("response_format")
         && format.get("type").and_then(Json::as_str) != Some("text")
     {
@@ -153,10 +155,41 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatRequest, ApiError> {
             ));
         }
     };
+    let tools = parse_tools(&v)?;
+    let parse_tool_calls = parse_tool_choice(&v)? && !tools.is_empty();
+    let parallel_tool_calls = match v.get("parallel_tool_calls") {
+        None | Some(Json::Null) => true,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ApiError::invalid(
+                "`parallel_tool_calls` must be a boolean",
+                Some("parallel_tool_calls"),
+            ));
+        }
+    };
+    let logprobs = match v.get("logprobs") {
+        None | Some(Json::Null | Json::Bool(false)) => None,
+        Some(Json::Bool(true)) => Some(top_logprobs(&v, "top_logprobs")?.unwrap_or(0)),
+        Some(_) => {
+            return Err(ApiError::invalid(
+                "`logprobs` must be a boolean",
+                Some("logprobs"),
+            ));
+        }
+    };
+    if logprobs.is_none() && top_logprobs(&v, "top_logprobs")?.is_some_and(|n| n > 0) {
+        return Err(ApiError::invalid(
+            "`top_logprobs` needs `logprobs: true`",
+            Some("top_logprobs"),
+        ));
+    }
     Ok(ChatRequest {
         messages,
         enable_thinking,
-        generation: parse_generation(&v)?,
+        tools,
+        parse_tool_calls,
+        parallel_tool_calls,
+        generation: parse_generation(&v, logprobs)?,
     })
 }
 
@@ -189,36 +222,118 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<CompletionRequest, ApiErro
             Some("suffix"),
         ));
     }
+    // The legacy API asks for logprobs with the number of alternatives.
+    let logprobs = top_logprobs(&v, "logprobs")?;
     Ok(CompletionRequest {
         prompt,
-        generation: parse_generation(&v)?,
+        generation: parse_generation(&v, logprobs)?,
     })
+}
+
+/// An optional count of alternatives per token, `0..=MAX_TOP_LOGPROBS`.
+fn top_logprobs(v: &Json, key: &'static str) -> Result<Option<usize>, ApiError> {
+    match v.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(n) => match n.as_u64() {
+            Some(n) if n <= MAX_TOP_LOGPROBS => Ok(Some(n as usize)),
+            _ => Err(ApiError::invalid(
+                format!("`{key}` must be an integer from 0 to {MAX_TOP_LOGPROBS}"),
+                Some(key),
+            )),
+        },
+    }
+}
+
+/// `tools`: function definitions, normalized as llama.cpp does (a missing
+/// description is empty, missing parameters are `{}`).
+fn parse_tools(v: &Json) -> Result<Vec<Tool>, ApiError> {
+    let invalid = |msg: String| ApiError::invalid(msg, Some("tools"));
+    let list = match v.get("tools") {
+        None | Some(Json::Null) => return Ok(Vec::new()),
+        Some(Json::Array(list)) => list,
+        Some(_) => return Err(invalid("`tools` must be an array".into())),
+    };
+    list.iter()
+        .enumerate()
+        .map(|(i, tool)| {
+            if tool.get("type").and_then(Json::as_str) != Some("function") {
+                return Err(invalid(format!(
+                    "tools[{i}]: only tools of type `function` are supported"
+                )));
+            }
+            let function = tool
+                .get("function")
+                .ok_or_else(|| invalid(format!("tools[{i}] has no `function`")))?;
+            let name = function
+                .get("name")
+                .and_then(Json::as_str)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| invalid(format!("tools[{i}].function needs a `name`")))?;
+            let description = match function.get("description") {
+                None | Some(Json::Null) => String::new(),
+                Some(Json::String(d)) => d.clone(),
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "tools[{i}].function.description must be a string"
+                    )));
+                }
+            };
+            let parameters = match function.get("parameters") {
+                None | Some(Json::Null) => Json::Object(Vec::new()),
+                Some(p @ Json::Object(_)) => p.clone(),
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "tools[{i}].function.parameters must be a JSON Schema object"
+                    )));
+                }
+            };
+            Ok(Tool {
+                name: name.to_owned(),
+                description,
+                parameters,
+            })
+        })
+        .collect()
+}
+
+/// `tool_choice`: whether tool calls are parsed (`auto`) or not (`none`;
+/// the tools are still shown to the model, as llama.cpp does).
+fn parse_tool_choice(v: &Json) -> Result<bool, ApiError> {
+    let unsupported = || {
+        ApiError::invalid(
+            "forcing a tool call needs constrained decoding, which nibble does not have yet; \
+             use `tool_choice: \"auto\"`",
+            Some("tool_choice"),
+        )
+    };
+    match v.get("tool_choice") {
+        None | Some(Json::Null) => Ok(true),
+        Some(Json::String(s)) => match s.as_str() {
+            "auto" => Ok(true),
+            "none" => Ok(false),
+            "required" => Err(unsupported()),
+            other => Err(ApiError::invalid(
+                format!("unknown `tool_choice` `{other}`"),
+                Some("tool_choice"),
+            )),
+        },
+        Some(Json::Object(_)) => Err(unsupported()),
+        Some(_) => Err(ApiError::invalid(
+            "`tool_choice` must be a string or an object",
+            Some("tool_choice"),
+        )),
+    }
 }
 
 fn parse_message(m: &Json) -> Result<Message, ApiError> {
     let invalid = |msg: &str| ApiError::invalid(msg, Some("messages"));
-    let role = match m.get("role").and_then(Json::as_str) {
-        Some("system" | "developer") => Role::System,
-        Some("user") => Role::User,
-        Some("assistant") => Role::Assistant,
-        Some("tool" | "function") => return Err(invalid("tool messages are not supported yet")),
-        Some(other) => {
-            return Err(ApiError::invalid(
-                format!("unknown message role `{other}`"),
-                Some("messages"),
-            ));
-        }
-        None => return Err(invalid("every message needs a `role`")),
-    };
-    if m.get("tool_calls")
-        .and_then(Json::as_array)
-        .is_some_and(|c| !c.is_empty())
-    {
-        return Err(invalid("tool calls are not supported yet"));
-    }
-    let mut content = match m.get("content") {
+    let role = m
+        .get("role")
+        .and_then(Json::as_str)
+        .ok_or_else(|| invalid("every message needs a `role`"))?;
+    let content = match m.get("content") {
         Some(Json::String(s)) => s.clone(),
-        None | Some(Json::Null) if role == Role::Assistant => String::new(),
+        None | Some(Json::Null) if role == "assistant" => String::new(),
         Some(Json::Array(parts)) => {
             let mut text = String::new();
             for part in parts {
@@ -243,17 +358,70 @@ fn parse_message(m: &Json) -> Result<Message, ApiError> {
             ));
         }
     };
-    // A prior turn's reasoning, as returned by this server.
-    if role == Role::Assistant
-        && let Some(reasoning) = m.get("reasoning_content").and_then(Json::as_str)
-        && !reasoning.is_empty()
-    {
-        content = format!("<think>\n{reasoning}\n</think>\n\n{content}");
-    }
-    Ok(Message { role, content })
+    let message = match role {
+        "system" | "developer" => Message::system(content),
+        "user" => Message::user(content),
+        "tool" => Message::tool(content),
+        "assistant" => {
+            // A prior turn's reasoning, as returned by this server, goes
+            // back where the templates look for it.
+            let content = match m.get("reasoning_content").and_then(Json::as_str) {
+                Some(reasoning) if !reasoning.is_empty() => {
+                    format!("<think>\n{reasoning}\n</think>\n\n{content}")
+                }
+                _ => content,
+            };
+            Message::assistant(content).with_tool_calls(parse_tool_calls(m)?)
+        }
+        other => {
+            return Err(ApiError::invalid(
+                format!("unknown message role `{other}`"),
+                Some("messages"),
+            ));
+        }
+    };
+    Ok(message)
 }
 
-fn parse_generation(v: &Json) -> Result<Generation, ApiError> {
+/// The `tool_calls` of an assistant message. Arguments arrive as a JSON
+/// string (or an object) and must hold an object.
+fn parse_tool_calls(m: &Json) -> Result<Vec<ToolCall>, ApiError> {
+    let invalid = |msg: String| ApiError::invalid(msg, Some("messages"));
+    let calls = match m.get("tool_calls") {
+        None | Some(Json::Null) => return Ok(Vec::new()),
+        Some(Json::Array(calls)) => calls,
+        Some(_) => return Err(invalid("`tool_calls` must be an array".into())),
+    };
+    calls
+        .iter()
+        .map(|call| {
+            let function = call
+                .get("function")
+                .ok_or_else(|| invalid("every tool call needs a `function`".into()))?;
+            let name = function
+                .get("name")
+                .and_then(Json::as_str)
+                .ok_or_else(|| invalid("every tool call needs a function `name`".into()))?;
+            let arguments = match function.get("arguments") {
+                None | Some(Json::Null) => Json::Object(Vec::new()),
+                Some(Json::String(text)) => json::parse(text).map_err(|e| {
+                    invalid(format!(
+                        "the arguments of tool call `{name}` are not valid JSON: {e}"
+                    ))
+                })?,
+                Some(other) => other.clone(),
+            };
+            if arguments.as_object().is_none() {
+                return Err(invalid(format!(
+                    "the arguments of tool call `{name}` must be a JSON object"
+                )));
+            }
+            Ok(ToolCall::new(name, arguments))
+        })
+        .collect()
+}
+
+fn parse_generation(v: &Json, logprobs: Option<usize>) -> Result<Generation, ApiError> {
     let mut sampler = SamplerConfig::default();
     if let Some(t) = number(v, "temperature", 0.0, 2.0)? {
         sampler.temperature = t as f32;
@@ -299,16 +467,6 @@ fn parse_generation(v: &Json) -> Result<Generation, ApiError> {
         && n != 1
     {
         return Err(ApiError::invalid("only `n = 1` is supported", Some("n")));
-    }
-    if v.get("logprobs").and_then(Json::as_bool) == Some(true)
-        || v.get("logprobs")
-            .and_then(Json::as_u64)
-            .is_some_and(|n| n > 0)
-    {
-        return Err(ApiError::invalid(
-            "`logprobs` are not supported yet",
-            Some("logprobs"),
-        ));
     }
 
     let stop = match v.get("stop") {
@@ -358,6 +516,7 @@ fn parse_generation(v: &Json) -> Result<Generation, ApiError> {
         stop,
         stream,
         include_usage,
+        logprobs,
     })
 }
 
@@ -429,40 +588,166 @@ fn envelope(meta: &ResponseMeta<'_>, object: &str, choices: Json, usage: Option<
     Json::object(fields)
 }
 
+/// A tool call made by the model, with the id it is answered by.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CallMade {
+    pub(crate) index: usize,
+    pub(crate) id: String,
+    pub(crate) call: ToolCall,
+}
+
+impl CallMade {
+    /// The call as OpenAI writes it: arguments are a JSON string.
+    fn to_json(&self, with_index: bool) -> Json {
+        let mut fields = Vec::new();
+        if with_index {
+            fields.push(("index", Json::from(self.index)));
+        }
+        fields.extend([
+            ("id", Json::from(self.id.as_str())),
+            ("type", Json::from("function")),
+            (
+                "function",
+                Json::object([
+                    ("name", Json::from(self.call.name.as_str())),
+                    ("arguments", Json::from(self.call.arguments.to_string())),
+                ]),
+            ),
+        ]);
+        Json::object(fields)
+    }
+}
+
+/// The text and bytes of a token, as the logprobs entries show them.
+fn token_text(bytes: &[u8]) -> (Json, Json) {
+    (
+        Json::from(String::from_utf8_lossy(bytes).into_owned()),
+        Json::array(bytes.iter().map(|&b| Json::from(u32::from(b)))),
+    )
+}
+
+/// The chat `logprobs` object: `{"content": [...], "refusal": null}`, one
+/// entry per generated token (reasoning tokens included).
+pub(crate) fn chat_logprobs(tokens: &[TokenLogprob]) -> Json {
+    let entry = |bytes: &[u8], logprob: f32| {
+        let (token, bytes) = token_text(bytes);
+        vec![
+            ("token", token),
+            ("logprob", Json::from(logprob)),
+            ("bytes", bytes),
+        ]
+    };
+    let content = tokens.iter().map(|t| {
+        let mut fields = entry(&t.bytes, t.logprob);
+        let top = t
+            .top
+            .iter()
+            .map(|(bytes, logprob)| Json::object(entry(bytes, *logprob)));
+        fields.push(("top_logprobs", Json::array(top)));
+        Json::object(fields)
+    });
+    Json::object([("content", Json::array(content)), ("refusal", Json::Null)])
+}
+
+/// The legacy completions `logprobs` object. `text_offset` counts the
+/// characters of the tokens before each one, starting at `offset`.
+pub(crate) fn completion_logprobs(tokens: &[TokenLogprob], mut offset: usize) -> Json {
+    let mut texts = Vec::new();
+    let mut logprobs = Vec::new();
+    let mut tops = Vec::new();
+    let mut offsets = Vec::new();
+    for t in tokens {
+        let text = String::from_utf8_lossy(&t.bytes).into_owned();
+        offsets.push(Json::from(offset));
+        offset += text.chars().count();
+        texts.push(Json::from(text));
+        logprobs.push(Json::from(t.logprob));
+        tops.push(Json::object(t.top.iter().map(|(bytes, logprob)| {
+            (
+                String::from_utf8_lossy(bytes).into_owned(),
+                Json::from(*logprob),
+            )
+        })));
+    }
+    Json::object([
+        ("tokens", Json::Array(texts)),
+        ("token_logprobs", Json::Array(logprobs)),
+        ("top_logprobs", Json::Array(tops)),
+        ("text_offset", Json::Array(offsets)),
+    ])
+}
+
+/// The assistant message of a non-streamed chat completion.
+pub(crate) struct Reply<'a> {
+    pub(crate) content: &'a str,
+    pub(crate) reasoning: &'a str,
+    pub(crate) tool_calls: &'a [CallMade],
+    /// `Some` when the request asked for logprobs.
+    pub(crate) logprobs: Option<&'a [TokenLogprob]>,
+}
+
 /// The body of a non-streamed chat completion.
 pub(crate) fn chat_completion(
     meta: &ResponseMeta<'_>,
-    content: &str,
-    reasoning: &str,
+    reply: &Reply<'_>,
     finish: Finish,
     usage: Json,
 ) -> Json {
-    let mut message = vec![
-        ("role", Json::from("assistant")),
-        ("content", Json::from(content)),
-    ];
-    if !reasoning.is_empty() {
-        message.push(("reasoning_content", Json::from(reasoning)));
+    // A reply that only calls tools has no content.
+    let content = if reply.content.is_empty() && !reply.tool_calls.is_empty() {
+        Json::Null
+    } else {
+        Json::from(reply.content)
+    };
+    let mut message = vec![("role", Json::from("assistant")), ("content", content)];
+    if !reply.reasoning.is_empty() {
+        message.push(("reasoning_content", Json::from(reply.reasoning)));
+    }
+    if !reply.tool_calls.is_empty() {
+        let calls = reply.tool_calls.iter().map(|c| c.to_json(false));
+        message.push(("tool_calls", Json::array(calls)));
     }
     let choice = Json::object([
         ("index", Json::from(0)),
         ("message", Json::object(message)),
-        ("logprobs", Json::Null),
+        ("logprobs", Json::from(reply.logprobs.map(chat_logprobs))),
         ("finish_reason", Json::from(finish.as_str())),
     ]);
     envelope(meta, "chat.completion", Json::array([choice]), Some(usage))
 }
 
-/// One streamed chat chunk: `delta` fields, and the finish reason on the last one.
+/// What one streamed chat chunk adds to the reply.
+pub(crate) enum Delta<'a> {
+    /// The first chunk: the role, and empty content.
+    Start,
+    Reasoning(&'a str),
+    Content(&'a str),
+    ToolCall(&'a CallMade),
+    /// No new text; only logprobs or the finish reason.
+    Empty,
+}
+
+/// One streamed chat chunk.
 pub(crate) fn chat_chunk(
     meta: &ResponseMeta<'_>,
-    delta: Vec<(&str, Json)>,
+    delta: &Delta<'_>,
+    logprobs: Option<&[TokenLogprob]>,
     finish: Option<Finish>,
 ) -> Json {
+    let delta = match delta {
+        Delta::Start => vec![
+            ("role", Json::from("assistant")),
+            ("content", Json::from("")),
+        ],
+        Delta::Reasoning(text) => vec![("reasoning_content", Json::from(*text))],
+        Delta::Content(text) => vec![("content", Json::from(*text))],
+        Delta::ToolCall(call) => vec![("tool_calls", Json::array([call.to_json(true)]))],
+        Delta::Empty => Vec::new(),
+    };
     let choice = Json::object([
         ("index", Json::from(0)),
         ("delta", Json::object(delta)),
-        ("logprobs", Json::Null),
+        ("logprobs", Json::from(logprobs.map(chat_logprobs))),
         ("finish_reason", Json::from(finish.map(Finish::as_str))),
     ]);
     envelope(meta, "chat.completion.chunk", Json::array([choice]), None)
@@ -477,13 +762,14 @@ pub(crate) fn usage_chunk(meta: &ResponseMeta<'_>, object: &str, usage: Json) ->
 pub(crate) fn text_completion(
     meta: &ResponseMeta<'_>,
     text: &str,
+    logprobs: Option<Json>,
     finish: Option<Finish>,
     usage: Option<Json>,
 ) -> Json {
     let choice = Json::object([
         ("text", Json::from(text)),
         ("index", Json::from(0)),
-        ("logprobs", Json::Null),
+        ("logprobs", Json::from(logprobs)),
         ("finish_reason", Json::from(finish.map(Finish::as_str))),
     ]);
     envelope(meta, "text_completion", Json::array([choice]), usage)
@@ -504,6 +790,8 @@ pub(crate) fn models(id: &str, created: u64) -> Json {
 
 #[cfg(test)]
 mod tests {
+    use nibble::chat::Role;
+
     use super::*;
 
     #[test]
@@ -524,15 +812,85 @@ mod tests {
             Message::assistant("<think>\ngreet\n</think>\n\nHello")
         );
         assert_eq!(r.enable_thinking, Some(false));
+        assert!(r.tools.is_empty() && !r.parse_tool_calls);
         let g = r.generation;
         assert_eq!(
             (g.sampler.temperature, g.sampler.top_p, g.sampler.seed),
             (0.2, 0.9, 7)
         );
         assert_eq!(
-            (g.max_tokens, g.stop, g.stream, g.include_usage),
-            (Some(32), vec!["\n\n".to_owned()], true, true)
+            (g.max_tokens, g.stop, g.stream, g.include_usage, g.logprobs),
+            (Some(32), vec!["\n\n".to_owned()], true, true, None)
         );
+    }
+
+    #[test]
+    fn parses_tools_and_tool_messages() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"Weather?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function",
+                "function":{"name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"18 C"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","strict":true,
+                "parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"now"}}],
+            "parallel_tool_calls":false}"#;
+        let r = parse_chat(body).unwrap();
+        assert_eq!(r.messages[1].role, Role::Assistant);
+        assert_eq!(r.messages[1].content, "");
+        assert_eq!(
+            r.messages[1].tool_calls,
+            [ToolCall::new(
+                "get_weather",
+                json::parse(r#"{"location":"Paris"}"#).unwrap()
+            )]
+        );
+        assert_eq!(r.messages[2], Message::tool("18 C"));
+        assert_eq!(r.tools.len(), 2);
+        assert_eq!(
+            (r.tools[1].name.as_str(), r.tools[1].description.as_str()),
+            ("now", "")
+        );
+        assert_eq!(r.tools[1].parameters, Json::Object(Vec::new()));
+        assert!(r.parse_tool_calls && !r.parallel_tool_calls);
+
+        let none = br#"{"messages":[{"role":"user","content":"x"}],"tool_choice":"none",
+            "tools":[{"type":"function","function":{"name":"f"}}]}"#;
+        let r = parse_chat(none).unwrap();
+        assert!(r.tools.len() == 1 && !r.parse_tool_calls);
+    }
+
+    #[test]
+    fn parses_logprobs_options() {
+        let chat = |extra: &str| {
+            parse_chat(
+                format!(r#"{{"messages":[{{"role":"user","content":"x"}}]{extra}}}"#).as_bytes(),
+            )
+        };
+        assert_eq!(chat("").unwrap().generation.logprobs, None);
+        assert_eq!(
+            chat(r#","logprobs":true"#).unwrap().generation.logprobs,
+            Some(0)
+        );
+        assert_eq!(
+            chat(r#","logprobs":true,"top_logprobs":5"#)
+                .unwrap()
+                .generation
+                .logprobs,
+            Some(5)
+        );
+        assert_eq!(
+            chat(r#","top_logprobs":2"#).unwrap_err().param,
+            Some("top_logprobs")
+        );
+        assert_eq!(
+            chat(r#","logprobs":true,"top_logprobs":21"#)
+                .unwrap_err()
+                .param,
+            Some("top_logprobs")
+        );
+        let completion = parse_completion(br#"{"prompt":"x","logprobs":3}"#).unwrap();
+        assert_eq!(completion.generation.logprobs, Some(3));
     }
 
     #[test]
@@ -549,11 +907,19 @@ mod tests {
             (br#"{"messages":[]}"#, Some("messages")),
             (br#"{"messages":[{"content":"x"}]}"#, Some("messages")),
             (
-                br#"{"messages":[{"role":"tool","content":"x"}]}"#,
+                br#"{"messages":[{"role":"tool"}]}"#,
                 Some("messages"),
             ),
             (
                 br#"{"messages":[{"role":"user","content":[{"type":"image_url"}]}]}"#,
+                Some("messages"),
+            ),
+            (
+                br#"{"messages":[{"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{oops"}}]}]}"#,
+                Some("messages"),
+            ),
+            (
+                br#"{"messages":[{"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"[1]"}}]}]}"#,
                 Some("messages"),
             ),
             (
@@ -573,12 +939,20 @@ mod tests {
                 Some("stop"),
             ),
             (
-                br#"{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function"}]}"#,
+                br#"{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"retrieval"}]}"#,
                 Some("tools"),
             ),
             (
-                br#"{"messages":[{"role":"user","content":"x"}],"logprobs":true}"#,
-                Some("logprobs"),
+                br#"{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{}}]}"#,
+                Some("tools"),
+            ),
+            (
+                br#"{"messages":[{"role":"user","content":"x"}],"tool_choice":"required"}"#,
+                Some("tool_choice"),
+            ),
+            (
+                br#"{"messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"function","function":{"name":"f"}}}"#,
+                Some("tool_choice"),
             ),
             (
                 br#"{"messages":[{"role":"user","content":"x"}],"stream":"yes"}"#,
@@ -623,12 +997,18 @@ mod tests {
             created: 5,
             model: "m",
         };
-        let body = chat_completion(&meta, "4", "", Finish::Stop, usage(3, 1)).to_string();
+        let reply = Reply {
+            content: "4",
+            reasoning: "",
+            tool_calls: &[],
+            logprobs: None,
+        };
+        let body = chat_completion(&meta, &reply, Finish::Stop, usage(3, 1)).to_string();
         assert_eq!(
             body,
             r#"{"id":"chatcmpl-1","object":"chat.completion","created":5,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#
         );
-        let chunk = chat_chunk(&meta, vec![("content", Json::from("hi"))], None).to_string();
+        let chunk = chat_chunk(&meta, &Delta::Content("hi"), None, None).to_string();
         assert!(
             chunk.contains(r#""object":"chat.completion.chunk""#)
                 && chunk
@@ -638,6 +1018,44 @@ mod tests {
         assert_eq!(
             err,
             r#"{"error":{"message":"bad","type":"invalid_request_error","param":"n","code":null}}"#
+        );
+    }
+
+    #[test]
+    fn tool_calls_and_logprobs_have_the_openai_shape() {
+        let meta = ResponseMeta {
+            id: "chatcmpl-1",
+            created: 5,
+            model: "m",
+        };
+        let call = CallMade {
+            index: 0,
+            id: "call_1".into(),
+            call: ToolCall::new("f", json::parse(r#"{"a": 1}"#).unwrap()),
+        };
+        let logprobs = [TokenLogprob {
+            bytes: b"Hi".to_vec(),
+            logprob: -0.5,
+            top: vec![(b"Hi".to_vec(), -0.5), (b" Hey".to_vec(), -1.5)],
+        }];
+        let reply = Reply {
+            content: "",
+            reasoning: "",
+            tool_calls: std::slice::from_ref(&call),
+            logprobs: Some(&logprobs),
+        };
+        let body = chat_completion(&meta, &reply, Finish::ToolCalls, usage(1, 1)).to_string();
+        assert!(body.contains(r#""message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}"#), "{body}");
+        assert!(body.contains(r#""logprobs":{"content":[{"token":"Hi","logprob":-0.5,"bytes":[72,105],"top_logprobs":[{"token":"Hi","logprob":-0.5,"bytes":[72,105]},{"token":" Hey","logprob":-1.5,"bytes":[32,72,101,121]}]}],"refusal":null}"#), "{body}");
+        assert!(body.contains(r#""finish_reason":"tool_calls""#));
+
+        let chunk = chat_chunk(&meta, &Delta::ToolCall(&call), None, None).to_string();
+        assert!(chunk.contains(r#""delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}"#), "{chunk}");
+
+        let legacy = completion_logprobs(&logprobs, 3).to_string();
+        assert_eq!(
+            legacy,
+            r#"{"tokens":["Hi"],"token_logprobs":[-0.5],"top_logprobs":[{"Hi":-0.5," Hey":-1.5}],"text_offset":[3]}"#
         );
     }
 }

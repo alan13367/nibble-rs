@@ -1,0 +1,389 @@
+# nibble-rs plan
+
+A tiny, fast, cross-platform GGUF inference engine in Rust with **zero external
+dependencies**: CUDA on NVIDIA, Metal on Apple Silicon, a CPU fallback
+everywhere, an OpenAI-compatible server, and a library + CLI.
+
+This is a living document: update it when a decision changes.
+
+## Status (2026-11-24)
+
+| Area | State |
+|---|---|
+| GGUF reader, mmap, writer, `nibble inspect` | Done |
+| CPU engine | `qwen3` and `qwen35` on F32/F16/BF16/Q8_0 weights. AVX2 kernels transcribed from ggml (scalar fallback elsewhere), a persistent thread pool per session, grouped and fused matvecs, parallel DeltaNet and attention heads |
+| Correctness | Tokenizer ids identical to llama.cpp on 7 tricky strings for both models. Greedy output matches llama.cpp (`-fa off`) on 21 of 24 prompt/model pairs (6 prompts × Qwen3/Qwen3.5 × BF16/Q8_0, 64 tokens): 12/12 on BF16; the 3 Q8_0 divergences are near-ties (gaps 0.006–0.057) that also flip inside llama.cpp |
+| Speed (5600X, 6 threads, tg128) | Faster than llama.cpp b12675 on every local file: Qwen3-0.6B Q8_0 59.0 tok/s (llama.cpp 56.0), Qwen3.5-0.8B Q8_0 47.6 (41.0), Qwen3-0.6B BF16 34.6 (33.7), Qwen3.5-0.8B BF16 27.1 (25.2) |
+| CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench` |
+| OpenAI server | Complete for Phase 3: tools, logprobs, recurrent-state checkpoints. Verified with curl, socket tests, and the official OpenAI Python client (3.58) on both models. Open WebUI not tried |
+| Tests | 183 pass in `cargo test --workspace` (no model files needed); 6 llama.cpp reference tests on real models pass with `--ignored` |
+| Not started | NEON kernels, Q4_K/Q6_K, GPU backends, batched prompt processing |
+| Git | Two commits; Phase 4 and the end of Phase 3 are uncommitted |
+
+## Decisions
+
+| Topic | Decision |
+|---|---|
+| Name | `nibble-rs`. Crates `nibble-gguf` (format), `nibble-json` (JSON, shared by chat templates and the server), `nibble` (engine), `nibble-server` (HTTP API), `nibble-cli` (binary `nibble`) |
+| Product | Library first. The CLI and the server are thin layers over the public API |
+| Dependencies | None. Only path dependencies between workspace crates, including dev-dependencies |
+| Backends | **CUDA** for NVIDIA, **Metal** for Apple Silicon, **CPU** fallback everywhere |
+| Server | **OpenAI-compatible** (`/v1/chat/completions`, `/v1/completions`, `/v1/models`) with streaming |
+| First models | **Qwen3-0.6B** (`qwen3`, a standard dense transformer) first, then **Qwen3.5-0.8B** (`qwen35`, hybrid DeltaNet). BF16 files are the reference, Q8_0 the first quantized path, Q4_K_M after that |
+| Rust | Latest stable: edition 2024, MSRV **1.100** (checked in CI) |
+| CI | GitHub Actions on pull requests and manual dispatch only, not on every push |
+| Repository | No helper or generator scripts; only their output is committed |
+| Delegation | Simple, well-specified tasks go to GLM-5.3 through opencode (`opencode-go/glm-5.3#max`) in an isolated directory; the result is reviewed before it is integrated |
+| Correctness oracle | llama.cpp on the same GGUF file: greedy tokens, logits, and per-layer tensor dumps |
+
+## Dependency policy
+
+Everything a typical engine pulls from crates.io is written here instead, and kept small:
+
+| Need | Usual crate | Our replacement |
+|---|---|---|
+| mmap | `memmap2` | `nibble-gguf::Mmap`: `mmap`/`MapViewOfFile` FFI (done) |
+| f16/bf16 | `half` | Bit conversions and F16C intrinsics (done); NEON next |
+| Threads | `rayon` | `cpu::ThreadPool` (done): persistent workers per session, dynamic task claiming, spin-then-park, panics propagated |
+| SIMD | `wide`, `pulp` | `std::arch` intrinsics behind `is_*_feature_detected!` dispatch |
+| Regex / Unicode | `regex`, `fancy-regex` | Hand-written pre-tokenizers plus committed `\p{L}`/`\p{M}`/`\p{N}` range tables (done) |
+| Chat templates | `minijinja` | Built-in ChatML, Qwen3 and Qwen3.5 formatters; family detected from `tokenizer.chat_template` (done) |
+| CLI args | `clap` | Hand-rolled parser (done) |
+| CUDA | `cudarc` | Driver API bindings, library loaded at runtime |
+| Metal | `metal`, `objc2` | Objective-C runtime FFI (`objc_msgSend`) against the system frameworks |
+| HTTP / JSON | `hyper`, `axum`, `serde_json` | `std::net` HTTP/1.1, Server-Sent Events, own JSON parser and writer (done) |
+| Property tests | `proptest` | Small xorshift/PCG generators and loops in tests (done) |
+
+GPU code needs a compiler only at development time, never in `cargo build`:
+
+- **CUDA kernels** are compiled offline with nvcc into a fatbin. The exact
+  nvcc command is documented next to the kernels; there is no build script.
+  The fatbin is committed and embedded with `include_bytes!`. Building nibble
+  needs no CUDA toolkit; only editing kernels does.
+- **Metal shaders** are embedded as MSL source and compiled by the OS at startup.
+  No build tool at all.
+
+## Backends
+
+The forward pass is written once against an op-level `Backend` trait
+(`matvec`, `rmsnorm`, `rope`, `attention`, `conv1d_step`, `gated_delta_step`,
+`logits`, ...). Each backend implements the ops on its own buffers. The CPU
+backend is both the fallback and the correctness oracle for the GPU backends.
+
+`Backend::Auto` picks, in order:
+
+1. **Metal** on Apple Silicon.
+2. **CUDA** if the NVIDIA driver library loads and a device of compute capability 7.5+ exists.
+3. **CPU** otherwise. It logs why each GPU backend was skipped.
+
+`--backend cpu|cuda|metal` forces a choice. A binary built anywhere starts on
+any machine: GPU libraries are opened at runtime, never linked.
+
+### CUDA (Windows, Linux)
+
+- **Driver API only**, loaded at runtime from `nvcuda.dll` / `libcuda.so.1`,
+  which ship with the NVIDIA driver. Entry points are resolved through
+  `cuGetProcAddress`, which avoids the `_v2` symbol-name traps.
+- **Kernels in CUDA C++** (`crates/nibble/src/cuda/kernels/*.cu`), built into
+  one fatbin. It contains SASS for sm_75, 80, 86, 89, 90, 100 and 120, plus
+  PTX for compute_120 so future GPUs can JIT-compile it.
+- **GPU coverage:** CUDA 13 supports Turing (RTX 20 / GTX 16) and newer.
+  Pascal and older use the CPU backend.
+- **No cuBLAS:** all kernels are hand-written.
+  - `dp4a` int8 matvec for Q8_0/Q4_K/Q6_K, plus a BF16 matvec
+  - fused norm/RoPE kernels and decode attention
+  - conv1d + DeltaNet step, with the state kept in VRAM
+  - logits and argmax/top-k on the GPU
+  - tensor-core (`mma.sync`) GEMM for prompt processing
+- **One CUDA graph per token:** capture the per-token sequence once and replay it.
+  At 0.8B, about 24 layers × ~15 kernel launches would otherwise dominate the time.
+- **Weights live in VRAM:** they are copied once at load (0.8B Q8_0 is 0.8 GB of the 3070 Ti's 8 GB).
+  Partial offload for models larger than VRAM comes later.
+- **Testing:** done locally on the RTX 3070 Ti (CUDA 13.4 toolkit, driver 621.24).
+  GitHub-hosted runners have no GPU.
+
+### Metal (macOS, iOS)
+
+- **Objective-C runtime FFI:** `objc_getClass`, `sel_registerName`, and `objc_msgSend`
+  called with the exact function type of each call (required on arm64). Links
+  only the system Metal and Foundation frameworks.
+- **MSL shaders compiled at startup** with `newLibraryWithSource`. Precompiled
+  `.metallib` files only if startup time matters.
+- **Zero-copy weights:** with unified memory, `newBufferWithBytesNoCopy` wraps
+  the memory-mapped file directly. There is no upload and no second copy.
+- simdgroup reductions for matvec, `simdgroup_matrix` for prompt GEMM, one command buffer per token.
+- **Testing:** the Metal backend is written without being run, because the dev
+  machine is Windows and GitHub macOS runners may not expose a usable GPU. CI
+  compiles it and runs the CPU tests on macOS. Correctness and speed runs happen
+  later on an Apple Silicon Mac, before the phase counts as done.
+
+### Later: Vulkan
+
+Neither CUDA nor Metal covers AMD and Intel GPUs or Android. A Vulkan compute
+backend (same `Backend` trait, loader opened at runtime) would cover them.
+Not scheduled yet.
+
+## Server: OpenAI-compatible API
+
+`crates/nibble-server` is a library; `nibble serve -m model.gguf [--host 127.0.0.1] [--port 8080] [--api-key KEY]` runs it.
+
+Implemented: everything below except items marked *later*. Also done beyond
+the original list: `top_k`, `min_p` and `repeat_penalty` request fields, CORS
+and `OPTIONS` preflight, SSE keep-alive comments while a request waits,
+generation stopping as soon as the client disconnects, and 400 errors for
+unsupported features (images, `n > 1`, forced tool calls).
+
+- **Transport:** `std::net` HTTP/1.1 with keep-alive and Content-Length/chunked
+  bodies. Streaming uses Server-Sent Events. Our own JSON parser and writer
+  enforce size and depth limits.
+- **Endpoints:**
+  - `POST /v1/chat/completions`: messages, `stream`, `stream_options.include_usage`,
+    `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `stop`, `seed`,
+    `presence_penalty`, `frequency_penalty`. Qwen's thinking text is returned as
+    `reasoning_content` (the llama.cpp / DeepSeek convention), and
+    `chat_template_kwargs.enable_thinking` toggles it.
+  - `POST /v1/completions`: raw prompt completion.
+  - `GET /v1/models` and `GET /health`.
+  - Errors use OpenAI's `{"error": {...}}` shape.
+- **Scheduling:** one generation at a time from a FIFO queue (done).
+  *Later:* N parallel slots with batched decode. Each Qwen3.5 slot costs about
+  19 MiB of DeltaNet state plus its KV cache.
+- **Prompt cache:** the longest common prefix with the previous request is
+  reused (done). DeltaNet state cannot be rewound, so the session keeps up
+  to 4 checkpoints of it, taken 4 tokens before the end of each prompt as
+  llama.cpp does; a new turn restores the latest one and evaluates only the
+  tokens after it (done). Turn 2 of a 459-token Qwen3.5 chat went from
+  13.9 s to 0.67 s. *Later:* checkpoints at the start of the last user
+  message (llama.cpp's other rule), for edited messages.
+- **Tool calling** (done): `tools`, `tool_choice` `auto`/`none`,
+  `parallel_tool_calls`, assistant `tool_calls` and `tool` messages,
+  streamed calls, `finish_reason: "tool_calls"`. The library renders tools
+  and calls in each template's format (Qwen3 JSON, Qwen3.5 XML; tested
+  against llama.cpp's renderings) and parses the model's calls back
+  (`ChatTemplate::tool_call_parser`; Qwen3.5 arguments typed by the JSON
+  Schema, as llama.cpp does). *Later:* `tool_choice: "required"` and named
+  functions, which need constrained decoding.
+- **Logprobs** (done): `logprobs`/`top_logprobs` (chat) and `logprobs: N`
+  (completions), from the raw model distribution as llama.cpp reports them,
+  up to 20 alternatives; reasoning tokens are included.
+- **Safe defaults:** binds to localhost; `--api-key` enables bearer-token auth.
+
+## Target model: Qwen3.5-0.8B
+
+Verified with `nibble inspect` on `ggml-org/Qwen3.5-0.8B-GGUF` (Q8_0) and the
+unsloth BF16 file, and checked against llama.cpp `src/models/qwen35.cpp` and
+the CPU op `ggml_compute_forward_gated_delta_net`.
+
+- **Hybrid 3:1 layout:** 24 trunk layers. Layers with `(i + 1) % 4 != 0` are
+  **Gated DeltaNet** (linear attention, 18 layers); every 4th layer is **gated
+  full attention** (6 layers).
+- **MTP layer:** the Q8_0 file has `block_count = 25`. Layer 24 is the MTP
+  (`nextn`) draft head and is skipped in normal decoding. The BF16 file has no MTP layer.
+- **Dimensions:** `n_embd` 1024, FFN 3584 (SwiGLU), RMSNorm eps 1e-6.
+- **Tied embeddings:** vocabulary 248,320. There is no `output.weight`, so
+  `token_embd` is also the LM head.
+- **Conversion already applied:** norm weights include Qwen's `1 + w` offset
+  (values around 1.0), so plain RMSNorm is correct.
+- **Context and RoPE:** context 262,144. RoPE base 1e7 over 64 of the 256 head dimensions (`rope.dimension_count`).
+
+Per token, for one sequence:
+
+```
+x = token_embd[token]
+for il in 0..24:
+    h = rmsnorm(x) * attn_norm
+    if il % 4 != 3:                                   # Gated DeltaNet
+        qkv = attn_qkv · h        -> q[16×128] k[16×128] v[16×128]   (6144)
+        z   = attn_gate · h       -> [16×128]
+        b   = ssm_beta · h ; a = ssm_alpha · h        -> [16] each
+        qkv = silu(causal_conv1d(conv_state ++ qkv, ssm_conv1d[4×6144]))
+        q, k = l2_norm(q), l2_norm(k)                 per head, eps 1e-6
+        beta = sigmoid(b) ; g = softplus(a + ssm_dt.bias) * ssm_a   # ssm_a = -exp(A_log)
+        per head:  S *= exp(g)                        # S is 128×128 f32
+                   d  = (v - Sᵀk) * beta
+                   S += k ⊗ d
+                   o  = Sᵀq / sqrt(128)
+        o   = rmsnorm(o) * ssm_norm[128] * silu(z)    per head
+        out = ssm_out · o
+    else:                                             # gated full attention
+        qg   = attn_q · h         -> per head [q(256) | gate(256)], 8 heads
+        k, v = attn_k · h, attn_v · h                 2 KV heads (GQA 4:1)
+        q, k = rmsnorm(q)*attn_q_norm, rmsnorm(k)*attn_k_norm   per head
+        q, k = rope(q, k)         NeoX pairs on the first 64 dims, base 1e7
+        o    = softmax(q·Kᵀ / 16) · V
+        out  = attn_output · (o * sigmoid(gate))
+    x = x + out
+    n = rmsnorm(x) * post_attention_norm
+    x = x + ffn_down · (silu(ffn_gate · n) * (ffn_up · n))
+logits = token_embd · (rmsnorm(x) * output_norm)
+```
+
+What this means for the engine:
+
+- **Recurrent state instead of a full KV cache.** Each DeltaNet layer keeps a
+  16×128×128 f32 state plus a 3×6144 conv state: about 19 MiB in total, the
+  same at any context length. Only 6 layers keep a KV cache: 2 heads × 256 ×
+  (K+V) × 6 layers is 12 KiB per token in f16 (384 MiB at 32k context).
+- **The LM head is a third of the weights** (254M of 773M parameters), so it
+  is the largest single matmul per token, and the scan of 248k logits has to be fast.
+- **The DeltaNet update touches 18 MiB of state per token.** That fits in the
+  5600X's 32 MiB L3. Prompt processing needs the chunked (parallel) form later;
+  decode is a sequential update.
+- **RoPE:** the file uses interleaved M-RoPE (`rope.dimension_sections` = [11, 11, 10, 0]).
+  For text-only input all position components are equal, so it reduces to
+  ordinary NeoX RoPE on 64 dims (confirmed in ggml's `ggml_mrope_cache_init`
+  and by matching llama.cpp's output).
+- **Tokenizer:** GPT-2 byte-level BPE with 247,587 merges and
+  `tokenizer.ggml.pre = "qwen35"`. `add_bos_token = false`, eos is 248046.
+  The pre-tokenizer regex (from llama.cpp):
+  `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+- **Decode ceilings:** decode reads every weight once per token, so speed is
+  capped by memory bandwidth.
+  - Dev machine: Ryzen 5 5600X (AVX2+FMA, no AVX-512) with dual-channel
+    DDR4-3600 (about 40–45 GB/s usable), and an RTX 3070 Ti (608 GB/s).
+  - Apple Silicon ranges from about 68 to 800 GB/s depending on the chip.
+
+  | File | Bytes per token | CPU (5600X) | CUDA (3070 Ti) |
+  |---|---|---|---|
+  | BF16 | ~1.5 GB | ~28 tok/s | ~400 tok/s |
+  | Q8_0 | ~0.80 GB | ~50–55 tok/s | ~750 tok/s |
+  | Q4_K_M | ~0.53 GB | ~80 tok/s | ~1100 tok/s |
+
+  On GPUs, kernel launches and synchronization will cap speed long before
+  bandwidth does at this size. That is why CUDA graphs and one Metal command
+  buffer per token are design requirements.
+
+## Architecture
+
+Current layout; `(planned)` entries do not exist yet.
+
+```
+crates/
+  nibble-gguf/     GGUF parser (zero-copy), Storage (mmap / aligned buffer), writer
+  nibble-json/     JSON parser and writer, plus Python-style output for Jinja's `tojson`
+  nibble/          the engine
+    quant.rs       weight formats: f16/bf16, dequantize, dot types and activation encoding, dot products (scalar reference)
+    cpu/
+      mod.rs       Cpu (pool + kernels): single, grouped and fused SwiGLU matvecs; norms, RoPE
+      pool.rs      persistent thread pool: dynamic task claiming, spin-then-park, panic propagation
+      kernels.rs   kernel dispatch (the one place that lists instruction sets)
+      avx2.rs      AVX2/FMA/F16C kernels transcribed from ggml, behind a CPU-feature token
+      scalar.rs    scalar references of the vector kernels
+      topology.rs  default thread count: one per physical core
+    model/
+      mod.rs       Model, the architecture registry and dispatch (the only place that matches on architectures)
+      config.rs    shared hyperparameters + typed `{arch}.*` metadata access
+      bind.rs      tensor binding with shape and type checks
+      layers.rs    shared blocks: embedding/output head, GQA attention, KV cache, SwiGLU
+      qwen3.rs     Qwen3
+      qwen35.rs    Qwen3.5 (Gated DeltaNet + gated attention)
+    tokenizer/     facade (vocab, specials, decoding) + bpe.rs, pretokenize.rs, unicode tables
+    chat/          ChatML / Qwen3 / Qwen3.5 templates with tools (qwen.rs), tool-call parser (tool_calls.rs)
+    sampler.rs     greedy, temperature, top-k/top-p/min-p, penalties, logprobs
+    session.rs     Session: tokens, cache, recurrent-state checkpoints, generation loop
+    backend.rs     (planned) the op-level Backend trait and backend selection
+    cpu/neon.rs    (planned) NEON kernels; simd128 for WASM
+    cuda/          (planned) driver API loader + bindings, memory, graphs; kernels/*.cu + nibble.fatbin
+    metal/         (planned) objc runtime bindings, device, buffers, pipelines; shaders/*.metal
+  nibble-server/   http.rs, openai.rs, worker.rs, server.rs, text.rs (stop sequences, reasoning split)
+  nibble-cli/      inspect, tokenize, run, chat, serve, bench
+```
+
+Design rules:
+
+1. **No compute graph.** The forward pass is plain Rust calling backend ops on
+   preallocated buffers: nothing is allocated per token, and there is no scheduler.
+2. **Weights stay quantized.** On CPU and Metal they are views into the memory
+   map, never copied. Block structs have alignment 1, so byte casts are always valid.
+3. **Quantized dot products, the llama.cpp way.** Quantize the activation once
+   (Q8_0/Q8_K), then integer dot products: `maddubs`/`madd` on AVX2, `sdot` on
+   NEON, `dp4a` on CUDA, `simd_sum` reductions on Metal.
+4. **`unsafe` is confined** to `nibble-gguf::storage`, `cpu/` SIMD and the
+   thread pool, the default thread count's OS calls, and the `cuda/` and
+   `metal/` FFI. Every block gets a `// SAFETY:` comment, and every kernel is
+   tested against the scalar version.
+
+## Roadmap
+
+| Phase | Deliverable | Done when |
+|---|---|---|
+| **0. Scaffold** ✅ | Workspace, profiles, lints, CI (Windows/Linux x64+arm64/macOS, MSRV, wasm32, Miri) | All CI checks pass locally; the GitHub workflow has not run yet (it triggers on PRs and manual dispatch) |
+| **1. GGUF + `inspect`** ✅ | Zero-copy parser, mmap, writer, `nibble inspect` | Every local GGUF (0.8B–40B, 12 quant types, unknown types) parses; 0.8B in ~70 ms |
+| **2a. CPU reference: Qwen3** ✅ | F32/F16/BF16/Q8_0 weights with ggml's activation formats, F16 KV cache; byte-level BPE with `qwen2` and `qwen35` pre-tokenizers; Qwen3 ChatML; sampler; `nibble run`, `chat`, `tokenize` | Tokenizer ids match llama.cpp on every test string (Qwen3 and Qwen3.5); greedy output matches llama.cpp (`-fa off`) except at near-ties that also flip inside llama.cpp |
+| **2b. CPU reference: Qwen3.5** ✅ | Gated DeltaNet layers (conv1d, recurrent state), gated attention with partial RoPE, Qwen3.5 chat template; architecture registry + shared layers so new models only touch `model/` | BF16 matches llama.cpp on 6/6 prompts, Q8_0 on 5/6 (the other is a tie that flips inside llama.cpp); synthetic model matches an independent f64 implementation over whole sequences |
+| **3. OpenAI server** ✅ | `nibble-server` (std-only HTTP/1.1 + SSE, JSON in `nibble-json`), chat/completions/models/health, streaming with usage, `reasoning_content`, stop sequences, API key, CORS, FIFO worker with prefix reuse, tool calling, logprobs, recurrent-state checkpoints; `nibble serve` | Verified with curl, socket tests and the official OpenAI Python client on Qwen3 and Qwen3.5 (chat, streaming, reasoning, logprobs, tool round trips streamed and not, completions, errors). Open WebUI not tried |
+| **4. CPU speed** (x86 done) | AVX2 kernels for all current formats (dot products, activation encoding, f16 attention, exp/SiLU/softmax, DeltaNet step), persistent thread pool, grouped and fused matvecs, parallel DeltaNet and attention heads, physical-core default; `nibble bench`. Still to do: NEON, Q4_K/Q6_K | Met: Q8_0 tg128 is 5–16% *faster* than llama.cpp on the 5600X (BF16 3–8% faster) |
+| **5. CUDA backend** | Loader, bindings, memory, fatbin kernels, CUDA graphs, CPU fallback | Same greedy tokens as CPU; decode at least as fast as llama.cpp CUDA on the 3070 Ti |
+| **6. Metal backend** | objc bindings, zero-copy weights, MSL kernels, one command buffer per token | Same greedy tokens as CPU on Apple Silicon; decode at least as fast as llama.cpp Metal |
+| **7. Prompt processing** | Batched matmul on every backend (CPU tiles, CUDA tensor cores, Metal simdgroup matrices), chunked DeltaNet, parallel server slots | pp512 within 25% of llama.cpp on each backend |
+| **8. Breadth** | Qwen3.5 2B/4B/9B (check V-head/K-head grouping), Q4_K_M/Q5_K/IQ4_XS, `qwen3`/`llama` dense archs, MTP speculative decoding, tool calling, Vulkan for AMD/Intel | The local 4B/9B `qwen35` files run correctly on every backend |
+| **9. Packaging** | Stable Rust API, C ABI (`cdylib` + header), WASM (simd128, in-memory weights), prebuilt release binaries | — |
+
+## Validation
+
+- **Reference runs:** install a llama.cpp release build (CPU and CUDA) for logits,
+  `llama-eval-callback` tensor dumps (compare per layer to find the first
+  mismatch), `llama-perplexity`, `llama-bench` and `llama-server` (to compare API behavior).
+- **Unit level:** each kernel against the scalar reference on random inputs; each
+  quant format's dequantization against gguf-py reference outputs.
+- **Tiny synthetic models in CI** (done): `GgufWriter` builds random tiny
+  `qwen3` and `qwen35` models, checked against independent f64 implementations
+  (whole sequences for `qwen35`, including the recurrence, partial RoPE and an
+  MTP block to skip). CPU vs GPU comparisons will run locally on the 3070 Ti
+  and on a Mac.
+- **Comparing with llama.cpp:** use `llama-completion ... -fa off`, because
+  nibble's attention matches the non-flash path. llama.cpp's `-f` strips one
+  trailing newline from the prompt file. The commands are in `AGENTS.md`.
+- **Server:** end-to-end tests over real sockets on a tiny model, and the
+  official OpenAI Python client against the real models (done). Open WebUI
+  has not been tried.
+- **Real models locally:** 0.8B BF16 and Q8_0 in every phase; the 4B and 9B files from Phase 8.
+
+## Known pitfalls
+
+- GGUF dimensions are innermost first: `attn_qkv` is `[1024, 6144]`, i.e. 6144 rows of 1024.
+- `attn_q` interleaves query and gate **per head** (`[q0 | g0 | q1 | g1 | ...]`), not as two halves.
+- The conv kernel is `[4, 6144]`: the 4 taps of a channel are contiguous, oldest first.
+- llama.cpp stores the DeltaNet state transposed (`M[j][i] = S[i][j]`) so rows are contiguous. Match that layout.
+- The q/k head for value head `h` is `h % n_k_heads` in ggml. This is irrelevant
+  at 0.8B (16/16) but matters for sizes with more V heads than K heads.
+- `ssm_a` is already `-exp(A_log)`, and norm weights already include `+1`. Apply neither again.
+- Skip the MTP layer (`nextn_predict_layers`) in the trunk loop.
+- Qwen's tokenizer.json applies NFC normalization, but llama.cpp does not.
+  Match llama.cpp first and note the difference.
+- Qwen3's template thinks unless `enable_thinking` is false. Qwen3.5's adds
+  `<think>\n` only when it is true, and an empty think block otherwise. Both
+  are handled by `ChatOptions::enable_thinking` and `--no-think`.
+- Qwen3.5 history drops the empty think block of earlier turns, so each chat
+  turn diverges from the cached prompt right after `<|im_start|>assistant\n`.
+  The checkpoint 4 tokens before the end of each prompt lands exactly there.
+- llama.cpp passes tool-call arguments to templates as parsed objects, even
+  to Qwen3's (which would accept a string), and normalizes tools to
+  `{type, function: {name, description, parameters}}`; `tojson` is Python's
+  `json.dumps` (`", "`, `": "`), and Qwen3.5 writes argument values with
+  Python's `str` (`True`, `None`).
+- ggml's AVX2 kernels reduce differently per file: `vec.cpp` uses four
+  accumulators and `hadd`, `quants.c` one accumulator and `hsum_float_8`.
+  Transcribe the exact one.
+- llama.cpp without flash attention stores V transposed, rounds the softmax
+  probabilities to f16 before the V product, and pads the cache to 256
+  positions (masked to zero weight).
+- Threads: on SMT CPUs use one thread per physical core. With a thread on
+  every logical CPU, any other process preempts a worker mid-task and the
+  op waits for it: 12 threads decode about a third slower than 6 on the
+  5600X (llama.cpp loses about 20% too).
+- BPE merge strings must be split at the first space by **byte** offset
+  (llama.cpp's `find(' ', 1)`); splitting on chars dropped every merge with `Ġ`.
+- **CUDA:** a fatbin built by a newer toolkit than the user's driver supports
+  cannot JIT its PTX. Ship SASS for every supported arch, and fall back to CPU with a clear message.
+- **Metal:** `newBufferWithBytesNoCopy` needs a page-aligned pointer and a
+  page-multiple length (16 KiB pages on Apple Silicon). Map the whole file and
+  round the length up.
+
+## Open questions
+
+1. **AMD/Intel GPUs:** whether to schedule the Vulkan backend.
+2. **Open WebUI:** worth a manual check before calling the server done for
+   UIs; it is a large install.
+3. **NEON before or after Metal?** Apple Silicon and ARM Linux run the scalar
+   kernels today; on x86 the scalar kernels decode about 3x slower than AVX2.

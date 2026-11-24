@@ -103,7 +103,16 @@ impl<'g, 'a> Meta<'g, 'a> {
 pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConfig> {
     let m = Meta::new(g, architecture);
 
-    let n_embd = m.usize("embedding_length")?;
+    // Zero sizes would make every per-row and per-head loop degenerate.
+    let non_zero = |key: &str, value: usize| {
+        if value == 0 {
+            Err(m.invalid(key, "must be non-zero"))
+        } else {
+            Ok(value)
+        }
+    };
+    let n_embd = non_zero("embedding_length", m.usize("embedding_length")?)?;
+    let n_ff = non_zero("feed_forward_length", m.usize("feed_forward_length")?)?;
     let n_head = m.usize("attention.head_count")?;
     let n_head_kv = m.usize_opt("attention.head_count_kv")?.unwrap_or(n_head);
     if n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 {
@@ -112,9 +121,11 @@ pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConf
             "must be non-zero and divide attention.head_count",
         ));
     }
-    let head_dim = m
-        .usize_opt("attention.key_length")?
-        .unwrap_or(n_embd / n_head);
+    let head_dim = non_zero(
+        "attention.key_length",
+        m.usize_opt("attention.key_length")?
+            .unwrap_or(n_embd / n_head),
+    )?;
     if m.usize_opt("attention.value_length")?
         .is_some_and(|v| v != head_dim)
     {
@@ -141,6 +152,12 @@ pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConf
             key: "token_embd.weight".into(),
             reason: "too many rows".into(),
         })?;
+    if n_vocab == 0 {
+        return Err(Error::InvalidMetadata {
+            key: "token_embd.weight".into(),
+            reason: "has no rows".into(),
+        });
+    }
     let weight_type = g
         .tensors()
         .iter()
@@ -160,7 +177,7 @@ pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConf
         n_head,
         n_head_kv,
         head_dim,
-        n_ff: m.usize("feed_forward_length")?,
+        n_ff,
         n_ctx_train: m.usize_opt("context_length")?.unwrap_or(4096),
         rope_base: m.f32_or("rope.freq_base", 10_000.0)?,
         rope_dims,

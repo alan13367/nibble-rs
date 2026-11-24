@@ -8,14 +8,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nibble::chat::ChatOptions;
+use nibble::chat::{ChatOptions, ToolCallParser, ToolEvent};
+use nibble::json::Json;
 use nibble::{Model, SessionOptions};
 
 use crate::http::{self, Limits, RequestHead, Response, SseWriter};
-use crate::json::Json;
-use crate::openai::{self, ApiError, Generation, ResponseMeta};
-use crate::text::ReasoningSplitter;
-use crate::worker::{self, Event, Finish, Job};
+use crate::openai::{self, ApiError, CallMade, Delta, Generation, ResponseMeta};
+use crate::text::{ReasoningSplitter, Split};
+use crate::worker::{self, Event, Finish, Job, TokenLogprob};
 
 /// Server settings.
 #[derive(Clone, Debug)]
@@ -314,6 +314,7 @@ fn submit(
         sampler: g.sampler,
         max_tokens: g.max_tokens.unwrap_or(usize::MAX),
         stop: g.stop.clone(),
+        logprobs: g.logprobs,
         events,
     };
     shared
@@ -328,54 +329,76 @@ fn new_id(shared: &Shared, prefix: &str) -> String {
     format!("{prefix}-{:x}{n:04x}", unix_time())
 }
 
-/// Collected output of a non-streamed generation.
-struct Collected {
-    reasoning: String,
-    content: String,
-    finish: Finish,
-    prompt_tokens: usize,
-    completion_tokens: usize,
+/// A part of a chat reply, in the order it was generated.
+enum Part {
+    Reasoning(String),
+    Content(String),
+    Call(CallMade),
 }
 
-fn collect(
-    rx: &mpsc::Receiver<Event>,
-    mut splitter: Option<ReasoningSplitter>,
-) -> Result<Collected, ApiError> {
-    let (mut reasoning, mut content) = (String::new(), String::new());
-    for event in rx {
-        match event {
-            Event::Text(text) => match &mut splitter {
-                Some(s) => {
-                    let part = s.push(&text);
-                    reasoning.push_str(&part.reasoning);
-                    content.push_str(&part.content);
-                }
-                None => content.push_str(&text),
-            },
-            Event::Done {
-                finish,
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                if let Some(s) = &mut splitter {
-                    let part = s.finish();
-                    reasoning.push_str(&part.reasoning);
-                    content.push_str(&part.content);
-                }
-                return Ok(Collected {
-                    reasoning,
-                    content,
-                    finish,
-                    prompt_tokens,
-                    completion_tokens,
-                });
+/// Turns generated text into the parts of a chat reply: reasoning (when
+/// the model thinks), content, and tool calls (when the request has tools).
+struct ChatOutput {
+    reasoning: ReasoningSplitter,
+    tools: Option<ToolCallParser>,
+    parallel_tool_calls: bool,
+    /// Prefix of the ids of this reply's tool calls.
+    call_id: String,
+    calls: usize,
+}
+
+impl ChatOutput {
+    fn push(&mut self, text: &str) -> Vec<Part> {
+        let split = self.reasoning.push(text);
+        self.parts(split, false)
+    }
+
+    fn finish(&mut self) -> Vec<Part> {
+        let split = self.reasoning.finish();
+        self.parts(split, true)
+    }
+
+    fn parts(&mut self, split: Split, last: bool) -> Vec<Part> {
+        let mut parts = Vec::new();
+        if !split.reasoning.is_empty() {
+            parts.push(Part::Reasoning(split.reasoning));
+        }
+        let Some(tools) = &mut self.tools else {
+            if !split.content.is_empty() {
+                parts.push(Part::Content(split.content));
             }
-            Event::Error(message) => return Err(ApiError::invalid(message, None)),
+            return parts;
+        };
+        let mut events = tools.push(&split.content);
+        if last {
+            events.extend(tools.finish());
+        }
+        for event in events {
+            match event {
+                ToolEvent::Content(text) => parts.push(Part::Content(text)),
+                // Without parallel calls, the first call is the reply.
+                ToolEvent::Call(_) if !self.parallel_tool_calls && self.calls > 0 => {}
+                ToolEvent::Call(call) => {
+                    parts.push(Part::Call(CallMade {
+                        index: self.calls,
+                        id: format!("{}_{}", self.call_id, self.calls),
+                        call,
+                    }));
+                    self.calls += 1;
+                }
+            }
+        }
+        parts
+    }
+
+    /// The finish reason of the reply: tool calls end it when it stopped normally.
+    fn finish_reason(&self, finish: Finish) -> Finish {
+        if self.calls > 0 && finish == Finish::Stop {
+            Finish::ToolCalls
+        } else {
+            finish
         }
     }
-    Err(ApiError::server(
-        "the generation worker stopped unexpectedly",
-    ))
 }
 
 fn chat(
@@ -391,8 +414,11 @@ fn chat(
     let options = ChatOptions {
         add_generation_prompt: true,
         enable_thinking: req.enable_thinking.unwrap_or(true),
+        tools: &req.tools,
     };
-    let prompt_text = template.render(&req.messages, options);
+    let prompt_text = template
+        .render(&req.messages, options)
+        .map_err(|e| ApiError::invalid(e.to_string(), Some("messages")))?;
     let in_reasoning = prompt_text.ends_with("<think>\n");
     let rx = submit(shared, tokenize(model, &prompt_text), &req.generation)?;
     let id = new_id(shared, "chatcmpl");
@@ -401,61 +427,127 @@ fn chat(
         created: unix_time(),
         model: &shared.options.model_id,
     };
-    let splitter = ReasoningSplitter::new(in_reasoning);
-
+    let output = ChatOutput {
+        reasoning: ReasoningSplitter::new(in_reasoning),
+        tools: if req.parse_tool_calls {
+            template.tool_call_parser(&req.tools)
+        } else {
+            None
+        },
+        parallel_tool_calls: req.parallel_tool_calls,
+        call_id: id.replacen("chatcmpl-", "call_", 1),
+        calls: 0,
+    };
+    let logprobs = req.generation.logprobs.is_some();
     if !req.generation.stream {
-        let out = collect(&rx, Some(splitter))?;
-        let usage = openai::usage(out.prompt_tokens, out.completion_tokens);
-        let body = openai::chat_completion(&meta, &out.content, &out.reasoning, out.finish, usage);
+        let body = collect_chat(&rx, output, logprobs, &meta)?;
         return Ok(send_json(w, 200, &body, keep_alive).is_ok());
     }
-    Ok(stream_chat(
+    let streamed = stream_chat(
         w,
         &rx,
-        splitter,
+        output,
         &meta,
+        logprobs,
         req.generation.include_usage,
         keep_alive,
-    )
-    .is_ok())
+    );
+    Ok(streamed.is_ok())
 }
 
-fn stream_chat(
-    w: &mut TcpStream,
+/// Runs a non-streamed chat generation to the end and returns its body.
+fn collect_chat(
     rx: &mpsc::Receiver<Event>,
-    mut splitter: ReasoningSplitter,
+    mut output: ChatOutput,
+    logprobs: bool,
     meta: &ResponseMeta<'_>,
-    include_usage: bool,
-    keep_alive: bool,
-) -> io::Result<()> {
-    let mut sse = SseWriter::start(w, &cors_headers(), keep_alive)?;
-    let first = vec![
-        ("role", Json::from("assistant")),
-        ("content", Json::from("")),
-    ];
-    sse.send(&openai::chat_chunk(meta, first, None).to_string())?;
-    let send_split =
-        |sse: &mut SseWriter<&mut TcpStream>, part: crate::text::Split| -> io::Result<()> {
-            if !part.reasoning.is_empty() {
-                let delta = vec![("reasoning_content", Json::from(part.reasoning))];
-                sse.send(&openai::chat_chunk(meta, delta, None).to_string())?;
+) -> Result<Json, ApiError> {
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    let mut calls = Vec::new();
+    let mut tokens = Vec::new();
+    let mut add = |parts: Vec<Part>| {
+        for part in parts {
+            match part {
+                Part::Reasoning(text) => reasoning.push_str(&text),
+                Part::Content(text) => content.push_str(&text),
+                Part::Call(call) => calls.push(call),
             }
-            if !part.content.is_empty() {
-                let delta = vec![("content", Json::from(part.content))];
-                sse.send(&openai::chat_chunk(meta, delta, None).to_string())?;
-            }
-            Ok(())
-        };
-    while let Some(event) = next_event(rx, &mut sse)? {
+        }
+    };
+    for event in rx {
         match event {
-            Event::Text(text) => send_split(&mut sse, splitter.push(&text))?,
+            Event::Text { text, logprobs } => {
+                add(output.push(&text));
+                tokens.extend(logprobs);
+            }
             Event::Done {
                 finish,
                 prompt_tokens,
                 completion_tokens,
             } => {
-                send_split(&mut sse, splitter.finish())?;
-                sse.send(&openai::chat_chunk(meta, Vec::new(), Some(finish)).to_string())?;
+                add(output.finish());
+                let reply = openai::Reply {
+                    content: &content,
+                    reasoning: &reasoning,
+                    tool_calls: &calls,
+                    logprobs: logprobs.then_some(&tokens[..]),
+                };
+                let usage = openai::usage(prompt_tokens, completion_tokens);
+                let finish = output.finish_reason(finish);
+                return Ok(openai::chat_completion(meta, &reply, finish, usage));
+            }
+            Event::Error(message) => return Err(ApiError::invalid(message, None)),
+        }
+    }
+    Err(ApiError::server(
+        "the generation worker stopped unexpectedly",
+    ))
+}
+
+fn stream_chat(
+    w: &mut TcpStream,
+    rx: &mpsc::Receiver<Event>,
+    mut output: ChatOutput,
+    meta: &ResponseMeta<'_>,
+    logprobs: bool,
+    include_usage: bool,
+    keep_alive: bool,
+) -> io::Result<()> {
+    let mut sse = SseWriter::start(w, &cors_headers(), keep_alive)?;
+    let chunk = |delta: &Delta<'_>, tokens: Option<&[TokenLogprob]>, finish: Option<Finish>| {
+        openai::chat_chunk(meta, delta, tokens, finish).to_string()
+    };
+    sse.send(&chunk(&Delta::Start, None, None))?;
+    // Sends `parts`; the tokens they complete ride on the first chunk.
+    let send = |sse: &mut SseWriter<&mut TcpStream>,
+                parts: Vec<Part>,
+                tokens: &[TokenLogprob]|
+     -> io::Result<()> {
+        let mut tokens = (logprobs && !tokens.is_empty()).then_some(tokens);
+        for part in &parts {
+            let delta = match part {
+                Part::Reasoning(text) => Delta::Reasoning(text),
+                Part::Content(text) => Delta::Content(text),
+                Part::Call(call) => Delta::ToolCall(call),
+            };
+            sse.send(&chunk(&delta, tokens.take(), None))?;
+        }
+        if let Some(tokens) = tokens {
+            sse.send(&chunk(&Delta::Empty, Some(tokens), None))?;
+        }
+        Ok(())
+    };
+    while let Some(event) = next_event(rx, &mut sse)? {
+        match event {
+            Event::Text { text, logprobs } => send(&mut sse, output.push(&text), &logprobs)?,
+            Event::Done {
+                finish,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                send(&mut sse, output.finish(), &[])?;
+                let finish = output.finish_reason(finish);
+                sse.send(&chunk(&Delta::Empty, None, Some(finish)))?;
                 if include_usage {
                     let usage = openai::usage(prompt_tokens, completion_tokens);
                     sse.send(
@@ -496,26 +588,56 @@ fn complete(
         created: unix_time(),
         model: &shared.options.model_id,
     };
+    let want_logprobs = req.generation.logprobs.is_some();
 
     if !req.generation.stream {
-        let out = collect(&rx, None)?;
-        let usage = openai::usage(out.prompt_tokens, out.completion_tokens);
-        let body = openai::text_completion(&meta, &out.content, Some(out.finish), Some(usage));
-        return Ok(send_json(w, 200, &body, keep_alive).is_ok());
-    }
-    let streamed = (|| -> io::Result<()> {
-        let mut sse = SseWriter::start(&mut *w, &cors_headers(), keep_alive)?;
-        while let Some(event) = next_event(&rx, &mut sse)? {
+        let (mut text, mut tokens) = (String::new(), Vec::new());
+        for event in &rx {
             match event {
-                Event::Text(text) => {
-                    sse.send(&openai::text_completion(&meta, &text, None, None).to_string())?
+                Event::Text { text: t, logprobs } => {
+                    text.push_str(&t);
+                    tokens.extend(logprobs);
                 }
                 Event::Done {
                     finish,
                     prompt_tokens,
                     completion_tokens,
                 } => {
-                    sse.send(&openai::text_completion(&meta, "", Some(finish), None).to_string())?;
+                    let logprobs = want_logprobs.then(|| openai::completion_logprobs(&tokens, 0));
+                    let usage = openai::usage(prompt_tokens, completion_tokens);
+                    let body =
+                        openai::text_completion(&meta, &text, logprobs, Some(finish), Some(usage));
+                    return Ok(send_json(w, 200, &body, keep_alive).is_ok());
+                }
+                Event::Error(message) => return Err(ApiError::invalid(message, None)),
+            }
+        }
+        return Err(ApiError::server(
+            "the generation worker stopped unexpectedly",
+        ));
+    }
+    let streamed = (|| -> io::Result<()> {
+        let mut sse = SseWriter::start(&mut *w, &cors_headers(), keep_alive)?;
+        // Characters of the tokens sent so far, for `text_offset`.
+        let mut offset = 0;
+        while let Some(event) = next_event(&rx, &mut sse)? {
+            match event {
+                Event::Text { text, logprobs } => {
+                    let lp = want_logprobs.then(|| openai::completion_logprobs(&logprobs, offset));
+                    offset += logprobs
+                        .iter()
+                        .map(|t| String::from_utf8_lossy(&t.bytes).chars().count())
+                        .sum::<usize>();
+                    sse.send(&openai::text_completion(&meta, &text, lp, None, None).to_string())?
+                }
+                Event::Done {
+                    finish,
+                    prompt_tokens,
+                    completion_tokens,
+                } => {
+                    sse.send(
+                        &openai::text_completion(&meta, "", None, Some(finish), None).to_string(),
+                    )?;
                     if req.generation.include_usage {
                         let usage = openai::usage(prompt_tokens, completion_tokens);
                         sse.send(
@@ -539,4 +661,77 @@ fn complete(
         ))
     })();
     Ok(streamed.is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use nibble::chat::{ChatTemplate, Tool};
+
+    use super::*;
+
+    fn output(template: ChatTemplate, in_reasoning: bool, parallel: bool) -> ChatOutput {
+        let tools = [Tool {
+            name: "f".into(),
+            description: String::new(),
+            parameters: Json::Object(Vec::new()),
+        }];
+        ChatOutput {
+            reasoning: ReasoningSplitter::new(in_reasoning),
+            tools: template.tool_call_parser(&tools),
+            parallel_tool_calls: parallel,
+            call_id: "call".into(),
+            calls: 0,
+        }
+    }
+
+    /// Reasoning, content and call names of `text` fed in pieces of `step` bytes.
+    fn run(mut out: ChatOutput, text: &str, step: usize) -> (String, String, Vec<String>) {
+        let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+        let mut parts = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut cut = step.min(rest.len());
+            while !rest.is_char_boundary(cut) {
+                cut += 1;
+            }
+            parts.extend(out.push(&rest[..cut]));
+            rest = &rest[cut..];
+        }
+        parts.extend(out.finish());
+        for part in parts {
+            match part {
+                Part::Reasoning(t) => reasoning.push_str(&t),
+                Part::Content(t) => content.push_str(&t),
+                Part::Call(c) => calls.push(format!("{}:{}", c.id, c.call.name)),
+            }
+        }
+        (reasoning, content, calls)
+    }
+
+    #[test]
+    fn chat_output_splits_reasoning_content_and_calls() {
+        let text = "Need the time.\n</think>\n\nChecking.\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"f\"}\n</tool_call>";
+        for step in [1, 3, 7, text.len()] {
+            let (reasoning, content, calls) =
+                run(output(ChatTemplate::Qwen3, true, true), text, step);
+            assert_eq!(reasoning, "Need the time.", "step {step}");
+            assert_eq!(content, "Checking.", "step {step}");
+            assert_eq!(calls, ["call_0:f", "call_1:f"], "step {step}");
+        }
+        let (_, _, calls) = run(output(ChatTemplate::Qwen3, true, false), text, 5);
+        assert_eq!(
+            calls,
+            ["call_0:f"],
+            "only the first call without parallel calls"
+        );
+    }
+
+    #[test]
+    fn tool_calls_change_the_finish_reason_only_on_a_normal_stop() {
+        let mut out = output(ChatTemplate::Qwen35, false, true);
+        assert_eq!(out.finish_reason(Finish::Stop), Finish::Stop);
+        out.push("<tool_call>\n<function=f>\n</function>\n</tool_call>");
+        assert_eq!(out.finish_reason(Finish::Stop), Finish::ToolCalls);
+        assert_eq!(out.finish_reason(Finish::Length), Finish::Length);
+    }
 }

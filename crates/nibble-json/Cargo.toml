@@ -1,0 +1,10 @@
+[package]
+name = "nibble-json"
+description = "Strict, dependency-free JSON parser and writer for nibble"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

@@ -464,4 +464,26 @@ fn load_errors_name_the_problem() {
         matches!(err, Error::UnsupportedArchitecture(ref a) if a == "llamx"),
         "{err}"
     );
+
+    // A zero size is reported by its key instead of breaking the forward pass.
+    for name in [
+        "qwen3.embedding_length",
+        "qwen3.feed_forward_length",
+        "qwen3.attention.key_length",
+    ] {
+        let mut bytes = Weights::new().gguf(|_| {});
+        // The u32 value follows the key and its 4-byte type tag.
+        let at = bytes
+            .windows(name.len())
+            .position(|w| w == name.as_bytes())
+            .unwrap()
+            + name.len()
+            + 4;
+        bytes[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+        let err = load(bytes);
+        assert!(
+            matches!(err, Error::InvalidMetadata { ref key, .. } if key == name),
+            "{name}: {err}"
+        );
+    }
 }

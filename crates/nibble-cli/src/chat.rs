@@ -61,6 +61,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     let options = ChatOptions {
         add_generation_prompt: true,
         enable_thinking: think,
+        ..ChatOptions::default()
     };
     let start_messages: Vec<Message> = system.into_iter().map(Message::system).collect();
     let mut messages = start_messages.clone();
@@ -89,7 +90,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
             _ => {}
         }
         messages.push(Message::user(input));
-        let prompt = tok.encode(&template.render(&messages, options), true);
+        let prompt = tok.encode(&template.render(&messages, options)?, true);
         let new_tokens = reuse_prefix(&mut session, &prompt);
 
         let start = Instant::now();

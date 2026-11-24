@@ -506,6 +506,39 @@ fn truncate_replays_recurrent_state() {
     assert_eq!(s.eval(&[1, 2, 9]).unwrap(), &after[..]);
 }
 
+/// A chat turn diverges from the cached prompt a few tokens before its end;
+/// the checkpoint taken there spares the replay of everything before it.
+#[test]
+fn checkpoints_spare_most_of_the_replay() {
+    use nibble::CHECKPOINT_TAIL;
+
+    let model = Weights::new().model();
+    let prompt = [17u32, 99, 258, 3, 200, 65, 66, 5, 9];
+    let checkpoint = prompt.len() - CHECKPOINT_TAIL;
+    let mut s = session(&model);
+    s.eval(&prompt).unwrap();
+
+    // Diverging after the checkpoint replays only the tokens past it.
+    let keep = checkpoint + 2;
+    assert_eq!(s.truncate(keep), keep - checkpoint);
+    let after = s.eval(&[1, 2]).unwrap().to_vec();
+    let mut fresh = session(&model);
+    let expected: Vec<u32> = prompt[..keep].iter().copied().chain([1, 2]).collect();
+    assert_eq!(fresh.eval(&expected).unwrap(), &after[..]);
+
+    // Exactly at the checkpoint nothing is replayed.
+    assert_eq!(s.truncate(checkpoint), 0);
+    let at = s.eval(&[7]).unwrap().to_vec();
+    let mut fresh = session(&model);
+    let expected: Vec<u32> = prompt[..checkpoint].iter().copied().chain([7]).collect();
+    assert_eq!(fresh.eval(&expected).unwrap(), &at[..]);
+
+    // Before every checkpoint, the whole prefix is replayed.
+    assert_eq!(s.truncate(3), 3);
+    let early = s.eval(&[4]).unwrap().to_vec();
+    assert_eq!(session(&model).eval(&[17, 99, 258, 4]).unwrap(), &early[..]);
+}
+
 #[test]
 fn generation_is_deterministic() {
     let model = Weights::new().model();

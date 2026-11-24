@@ -20,7 +20,7 @@ use std::mem;
 /// read them with the `as_*` accessors and [`Json::get`]; serialize with
 /// `Display` (`value.to_string()` writes compact JSON).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Json {
+pub enum Json {
     /// The `null` value.
     Null,
     /// `true` or `false`.
@@ -41,7 +41,7 @@ pub(crate) enum Json {
 /// Floating-point values are always finite; non-finite floats can only be
 /// introduced by constructing them in Rust, and serialize as `null`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Number {
+pub enum Number {
     /// Integer literal that fits i64 (no fraction, no exponent).
     I64(i64),
     /// Integer literal above i64::MAX that fits u64.
@@ -55,7 +55,7 @@ pub(crate) enum Number {
 /// This enum is `#[non_exhaustive]`: new variants may be added.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) enum ErrorKind {
+pub enum ErrorKind {
     /// The document ended while a value was still required.
     UnexpectedEof,
     /// A byte that cannot start (or continue) the expected token.
@@ -98,16 +98,16 @@ impl fmt::Display for ErrorKind {
 /// `line` and `column` are 1-based; the column counts characters since the
 /// last line break (lines break at `\n`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ParseError {
+pub struct ParseError {
     /// 1-based line of the offending byte.
-    pub(crate) line: usize,
+    pub line: usize,
     /// 1-based column (in characters) of the offending byte.
-    pub(crate) column: usize,
+    pub column: usize,
     /// 0-based byte offset of the offending byte, or `input.len()` when the
     /// input ended too early.
-    pub(crate) offset: usize,
+    pub offset: usize,
     /// What went wrong.
-    pub(crate) kind: ErrorKind,
+    pub kind: ErrorKind,
 }
 
 impl fmt::Display for ParseError {
@@ -124,7 +124,7 @@ impl std::error::Error for ParseError {}
 
 /// The maximum array/object nesting depth accepted by [`parse`]: 128
 /// levels. Deeper documents fail with [`ErrorKind::DepthLimitExceeded`].
-pub(crate) const DEFAULT_MAX_DEPTH: usize = 128;
+pub const DEFAULT_MAX_DEPTH: usize = 128;
 
 /// Parses a complete JSON document from `input`.
 ///
@@ -147,15 +147,15 @@ pub(crate) const DEFAULT_MAX_DEPTH: usize = 128;
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use nibble_json::json::{self, Json};
+/// ```
+/// use nibble_json::{self as json, Json};
 ///
 /// let value = json::parse(r#"{"a": [1, 2.5], "b": null}"#).unwrap();
 /// assert_eq!(value.get("a").unwrap().as_array().unwrap().len(), 2);
 /// assert_eq!(value.get("b"), Some(&Json::Null));
 /// assert_eq!(value.to_string(), r#"{"a":[1,2.5],"b":null}"#);
 /// ```
-pub(crate) fn parse(input: &str) -> Result<Json, ParseError> {
+pub fn parse(input: &str) -> Result<Json, ParseError> {
     parse_with_depth(input, DEFAULT_MAX_DEPTH)
 }
 
@@ -175,8 +175,8 @@ pub(crate) fn parse(input: &str) -> Result<Json, ParseError> {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use nibble_json::json::{self, ErrorKind};
+/// ```
+/// use nibble_json::{self as json, ErrorKind};
 ///
 /// // 999 nested arrays fit within a limit of 1000.
 /// let deep = format!("{}{}", "[".repeat(999), "]".repeat(999));
@@ -187,7 +187,7 @@ pub(crate) fn parse(input: &str) -> Result<Json, ParseError> {
 /// let err = json::parse_with_depth(&too_deep, 1000).unwrap_err();
 /// assert_eq!(err.kind, ErrorKind::DepthLimitExceeded);
 /// ```
-pub(crate) fn parse_with_depth(input: &str, max_depth: usize) -> Result<Json, ParseError> {
+pub fn parse_with_depth(input: &str, max_depth: usize) -> Result<Json, ParseError> {
     let mut p = Parser::new(input);
     let mut stack: Vec<Frame> = Vec::new();
     let mut state = State::Value;
@@ -690,8 +690,8 @@ impl Json {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// use nibble_json::json::Json;
+    /// ```
+    /// use nibble_json::Json;
     ///
     /// let value = Json::object([
     ///     ("id", Json::from(7)),
@@ -699,7 +699,7 @@ impl Json {
     /// ]);
     /// assert_eq!(value.to_string(), r#"{"id":7,"ids":[1,2]}"#);
     /// ```
-    pub(crate) fn object<K: Into<String>>(pairs: impl IntoIterator<Item = (K, Json)>) -> Json {
+    pub fn object<K: Into<String>>(pairs: impl IntoIterator<Item = (K, Json)>) -> Json {
         Json::Object(
             pairs
                 .into_iter()
@@ -709,14 +709,14 @@ impl Json {
     }
 
     /// Builds an array from `items`, in iteration order.
-    pub(crate) fn array(items: impl IntoIterator<Item = Json>) -> Json {
+    pub fn array(items: impl IntoIterator<Item = Json>) -> Json {
         Json::Array(items.into_iter().collect())
     }
 
     /// Looks up `key` in an object and returns the value. With duplicate
     /// keys, the last one wins; any other kind of value, or a missing key,
     /// gives `None`.
-    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
+    pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(pairs) => pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
@@ -724,7 +724,7 @@ impl Json {
     }
 
     /// The string contents, if this is a string.
-    pub(crate) fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
             Json::String(s) => Some(s),
             _ => None,
@@ -732,7 +732,7 @@ impl Json {
     }
 
     /// The boolean, if this is a bool.
-    pub(crate) fn as_bool(&self) -> Option<bool> {
+    pub fn as_bool(&self) -> Option<bool> {
         match self {
             Json::Bool(b) => Some(*b),
             _ => None,
@@ -741,7 +741,7 @@ impl Json {
 
     /// Any number as `f64` (integers outside f64's exact range lose
     /// precision); `None` for values that are not numbers.
-    pub(crate) fn as_f64(&self) -> Option<f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Number(n) => match *n {
                 Number::I64(v) => Some(v as f64),
@@ -754,7 +754,7 @@ impl Json {
 
     /// The number as `i64`, if it is an `I64`, a `U64` that fits, or an
     /// integral `F64` that fits.
-    pub(crate) fn as_i64(&self) -> Option<i64> {
+    pub fn as_i64(&self) -> Option<i64> {
         match self {
             Json::Number(n) => match *n {
                 Number::I64(v) => Some(v),
@@ -767,7 +767,7 @@ impl Json {
 
     /// The number as `u64`, if it is a `U64`, an `I64` that fits, or an
     /// integral `F64` that fits.
-    pub(crate) fn as_u64(&self) -> Option<u64> {
+    pub fn as_u64(&self) -> Option<u64> {
         match self {
             Json::Number(n) => match *n {
                 Number::I64(v) => u64::try_from(v).ok(),
@@ -779,7 +779,7 @@ impl Json {
     }
 
     /// The array elements, if this is an array.
-    pub(crate) fn as_array(&self) -> Option<&[Json]> {
+    pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Array(items) => Some(items),
             _ => None,
@@ -787,7 +787,7 @@ impl Json {
     }
 
     /// The object's key/value pairs in document order, if this is an object.
-    pub(crate) fn as_object(&self) -> Option<&[(String, Json)]> {
+    pub fn as_object(&self) -> Option<&[(String, Json)]> {
         match self {
             Json::Object(pairs) => Some(pairs),
             _ => None,
@@ -795,7 +795,7 @@ impl Json {
     }
 
     /// Whether this is `null`.
-    pub(crate) fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         matches!(self, Json::Null)
     }
 }
@@ -884,6 +884,105 @@ impl fmt::Display for Json {
             }
         }
     }
+}
+
+impl Json {
+    /// This value as Python's `json.dumps(value, ensure_ascii=False)` writes
+    /// it, which is what the `tojson` filter of Jinja chat templates
+    /// produces: `", "` between items, `": "` after keys, non-ASCII text
+    /// unescaped, and floats in Python's `repr` form (`1.0`, `0.0001`,
+    /// `1e-05`, `1e+16`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nibble_json::Json;
+    ///
+    /// let value = nibble_json::parse(r#"{"a":[1,2.0],"b":"é","c":1e-7}"#).unwrap();
+    /// assert_eq!(value.to_python_json(), r#"{"a": [1, 2.0], "b": "é", "c": 1e-07}"#);
+    /// ```
+    #[must_use]
+    pub fn to_python_json(&self) -> String {
+        let mut out = String::new();
+        write_python(&mut out, self);
+        out
+    }
+}
+
+fn write_python(out: &mut String, value: &Json) {
+    match value {
+        Json::Number(Number::F64(v)) if v.is_finite() => out.push_str(&python_float(*v)),
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_python(out, item);
+            }
+            out.push(']');
+        }
+        Json::Object(pairs) => {
+            out.push('{');
+            for (i, (key, value)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push('"');
+                // Writing to a `String` cannot fail.
+                let _ = escape_into(out, key);
+                out.push_str("\": ");
+                write_python(out, value);
+            }
+            out.push('}');
+        }
+        // Scalars are written as in compact JSON, which Python matches.
+        other => {
+            let _ = write!(out, "{other}");
+        }
+    }
+}
+
+/// `repr(v)` in Python: the shortest digits that round-trip, positional
+/// for exponents from -4 to 15 (with at least one decimal), scientific
+/// otherwise with a signed exponent of at least two digits.
+fn python_float(v: f64) -> String {
+    // `{:e}` writes the shortest round-trip digits: "1.5e-7", "-1e300", "0e0".
+    let sci = format!("{v:e}");
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(m) => ("-", m),
+        None => ("", mantissa),
+    };
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let mut out = String::from(sign);
+    if (-4..16).contains(&exp) {
+        if exp < 0 {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+            out.push_str(&digits);
+        } else {
+            let int_len = exp as usize + 1;
+            if digits.len() > int_len {
+                out.push_str(&digits[..int_len]);
+                out.push('.');
+                out.push_str(&digits[int_len..]);
+            } else {
+                out.push_str(&digits);
+                out.extend(std::iter::repeat_n('0', int_len - digits.len()));
+                out.push_str(".0");
+            }
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
+    }
+    out
 }
 
 /// The short JSON escape for `c`, if it has one.
@@ -1745,6 +1844,39 @@ mod tests {
             // Any outcome is fine; the point is that parsing never panics.
             let _ = parse(&text);
         }
+    }
+
+    /// Expected strings are Python 3's `repr` and `json.dumps(..., ensure_ascii=False)`.
+    #[test]
+    fn python_style_matches_python() {
+        let cases = [
+            (0.1, "0.1"),
+            (1.0, "1.0"),
+            (100.0, "100.0"),
+            (2.5, "2.5"),
+            (123.456, "123.456"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1.2345e-5, "1.2345e-05"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.5e16, "1.5e+16"),
+            (12_345_678_901_234_567.0, "1.2345678901234568e+16"),
+            (1e22, "1e+22"),
+            (1e300, "1e+300"),
+            (5e-324, "5e-324"),
+            (-0.0, "-0.0"),
+            (-2.75, "-2.75"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(python_float(v), want, "{v:e}");
+        }
+        let value =
+            ok(r#"{"a": [1, 2.0, -3], "b": "é\n\u0001\"", "c": {}, "d": [], "e": [true, null]}"#);
+        assert_eq!(
+            value.to_python_json(),
+            r#"{"a": [1, 2.0, -3], "b": "é\n\u0001\"", "c": {}, "d": [], "e": [true, null]}"#
+        );
     }
 
     #[test]

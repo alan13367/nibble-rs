@@ -8,7 +8,7 @@
 //! // SAFETY: the model file is not modified while it is mapped.
 //! let model = unsafe { Model::load_mmap("Qwen3-0.6B-Q8_0.gguf")? };
 //! let template = model.chat_template().expect("known chat template");
-//! let prompt = template.render(&[Message::user("Hello!")], ChatOptions::default());
+//! let prompt = template.render(&[Message::user("Hello!")], ChatOptions::default())?;
 //! let tokens = model.tokenizer().encode(&prompt, true);
 //!
 //! let mut session = model.session(SessionOptions::default());
@@ -35,4 +35,5 @@ pub mod tokenizer;
 pub use error::{Error, Result};
 pub use model::{Architecture, Model, ModelConfig};
 pub use nibble_gguf as gguf;
-pub use session::{Session, SessionOptions, StopReason};
+pub use nibble_json as json;
+pub use session::{CHECKPOINT_TAIL, MAX_CHECKPOINTS, Session, SessionOptions, StopReason};

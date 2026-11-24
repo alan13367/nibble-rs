@@ -3,10 +3,11 @@
 A tiny, fast, cross-platform inference engine for GGUF models, written in Rust
 with **zero external dependencies**.
 
-> Early development. Today: a CPU reference engine for Qwen3 (`qwen3`) and
-> Qwen3.5 (`qwen35`, hybrid Gated DeltaNet) on F32, F16, BF16 and Q8_0
-> weights, checked against llama.cpp, with an OpenAI-compatible server and
-> `run`, `chat`, `tokenize` and `inspect` commands.
+> Early development. Today: a CPU engine for Qwen3 (`qwen3`) and Qwen3.5
+> (`qwen35`, hybrid Gated DeltaNet) on F32, F16, BF16 and Q8_0 weights,
+> checked against llama.cpp and as fast as it on AVX2 CPUs, with an
+> OpenAI-compatible server and `run`, `chat`, `bench`, `tokenize` and
+> `inspect` commands.
 
 ## Build
 
@@ -21,7 +22,11 @@ cargo build --release
 ```
 
 `nibble <command> --help` lists each command's options: sampling, context
-size, threads, and `--probs N` to show the top candidates at each step.
+size, threads (one per physical core by default), and `--probs N` to show
+the top candidates at each step.
+
+`nibble bench -m <model.gguf>` measures prompt and decode speed the way
+`llama-bench` does (`pp512`, `tg128`), so the numbers compare directly.
 
 ## OpenAI-compatible server
 
@@ -38,9 +43,18 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   `frequency_penalty`, `seed`, `stop`, `max_tokens` / `max_completion_tokens`.
 - `--api-key KEY` (or `NIBBLE_API_KEY`) requires `Authorization: Bearer KEY`.
   The server listens on localhost unless `--host` says otherwise.
+- Tool calling (`tools`, `tool_choice: "auto" | "none"`,
+  `parallel_tool_calls`, `tool` messages), streamed and not, in each Qwen
+  template's own format.
+- `logprobs` / `top_logprobs` for chat, and `logprobs: N` for completions.
 - Requests are served one at a time in arrival order; the cached prompt
-  prefix is reused between requests. Tools, images, logprobs and `n > 1`
-  are rejected with a 400 for now.
+  prefix is reused between requests. For Qwen3.5, whose recurrent state
+  cannot be rewound, the session keeps checkpoints, so a new chat turn does
+  not re-evaluate the conversation.
+- Rejected with a 400: images, `n > 1`, and forced tool calls
+  (`tool_choice: "required"` or a named function), which need constrained
+  decoding.
+- Checked with the official OpenAI Python client.
 
 ## Inspecting files
 
@@ -59,6 +73,7 @@ types    Q8_0 x195 (782.6 MiB), F32 x140 (1.9 MiB)
 | Crate | Purpose |
 |---|---|
 | `crates/nibble-gguf` | GGUF parser, memory mapping, writer |
+| `crates/nibble-json` | JSON parser and writer (for chat templates and the server) |
 | `crates/nibble` | The engine (library) |
 | `crates/nibble-server` | OpenAI-compatible HTTP server (std only) |
 | `crates/nibble-cli` | The `nibble` binary |

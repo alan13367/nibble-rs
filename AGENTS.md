@@ -29,9 +29,10 @@ dependencies. These rules apply to every change in this repository.
 | Path | Contents |
 |---|---|
 | `crates/nibble-gguf` | GGUF parser, writer and memory mapping. Knows nothing about models. |
-| `crates/nibble` | The engine: weight formats (`quant.rs`), CPU ops (`cpu.rs`), models (`model/`), tokenizer, chat templates, sampler, sessions. |
+| `crates/nibble` | The engine: weight formats (`quant.rs`), CPU execution (`cpu/`: thread pool, kernel dispatch, SIMD kernels, scalar references), models (`model/`), tokenizer, chat templates and tool-call parsing (`chat/`), sampler, sessions. |
 | `crates/nibble/src/model` | `mod.rs` is the architecture registry and the only place that matches on architectures. `layers.rs` holds the shared blocks (embedding/output head, GQA attention, KV cache, SwiGLU). One file per architecture. |
-| `crates/nibble-server` | OpenAI-compatible server: `http.rs` (HTTP/1.1, SSE), `json.rs`, `openai.rs` (request/response mapping), `worker.rs` (the generation queue), `server.rs` (connections and routing). Tested end to end over sockets on a tiny model. |
+| `crates/nibble-json` | Strict JSON parser and writer, including the Python-style output of Jinja's `tojson`. Used by the chat templates and the server. |
+| `crates/nibble-server` | OpenAI-compatible server: `http.rs` (HTTP/1.1, SSE), `openai.rs` (request/response mapping), `text.rs` (stop sequences, reasoning split), `worker.rs` (the generation queue), `server.rs` (connections, routing, chat output). Tested end to end over sockets on a tiny model. |
 | `crates/nibble-cli` | The `nibble` binary. Argument parsing and output only; logic belongs in the library. |
 
 ## Before you report a change as done
@@ -78,15 +79,21 @@ When you report back:
 ## `unsafe`
 
 - **Allowed only for** OS and driver FFI (memory mapping, GPU APIs, the
-  Objective-C runtime), SIMD intrinsics, and reinterpreting byte buffers.
+  Objective-C runtime), SIMD intrinsics, reinterpreting byte buffers, and
+  the CPU thread pool (`cpu/pool.rs`), which lends borrowed buffers to its
+  persistent workers. Keep the pool's unsafe inside its safe API.
 - **Every `unsafe` block** has a `// SAFETY:` comment saying why it is sound.
   Every `unsafe fn` has a `# Safety` section. Keep blocks as small as possible.
 - **Unsafe contracts stay visible.** Memory-mapped loading is `unsafe` because
   the file must not change while it is mapped. Do not wrap it in a safe library
   function; callers acknowledge it at the call site, as the CLI does.
 - **Every SIMD or GPU kernel needs a scalar reference** (in `quant.rs` or
-  `cpu.rs`) and a test that compares the two on random inputs. Keep the scalar
-  path even when a fast path exists.
+  `cpu/scalar.rs`) and a test that compares the two on random inputs. Keep the
+  scalar path even when a fast path exists.
+- **SIMD kernels are reachable only through a CPU-feature token** (such as
+  `cpu::avx2::Avx2`, created only by runtime detection) and are dispatched in
+  `cpu/kernels.rs`. Never expose a safe function that runs SIMD code without
+  that proof.
 
 ## Correctness: match llama.cpp
 
@@ -135,10 +142,17 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
   - the top two logits at that step are within roughly 0.1 of each other, and
   - llama.cpp itself flips at that token between `-fa on` and `-fa off`.
 
-  Anything else is a bug: find the first layer that differs.
+  Anything else is a bug: find the first layer that differs. Running nibble
+  with `NIBBLE_KERNELS=scalar` tells a SIMD kernel bug from a model bug.
 - **Match ggml's numerics.** Activations are converted to the weight type's dot
   type before matrix products (F16→F16, BF16→BF16, Q8_0→Q8_0), and the KV cache
   is F16. Keep this when adding formats or kernels.
+- **SIMD kernels transcribe ggml's kernel for the same instruction set**,
+  accumulator layout and reduction order included (they differ between
+  `vec.cpp` and `quants.c`), so results match llama.cpp on the same CPU.
+  Attention follows llama.cpp without flash attention: V is stored
+  transposed, the softmax probabilities are rounded to f16, and rows are
+  padded as llama.cpp pads the cache.
 
 ### Tests
 

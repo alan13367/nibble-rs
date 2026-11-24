@@ -1,6 +1,7 @@
 //! The `nibble` command-line tool.
 
 mod args;
+mod bench;
 mod chat;
 mod inspect;
 mod run;
@@ -24,6 +25,7 @@ Usage:
   nibble serve -m <model.gguf>             Serve the OpenAI API over HTTP
   nibble tokenize -m <model.gguf> -p TEXT  Show how text tokenizes
   nibble inspect <model.gguf>              Show a GGUF file's metadata and tensors
+  nibble bench -m <model.gguf>             Measure prompt and decode speed
 
 Run `nibble <command> --help` for a command's options.
 
@@ -63,6 +65,7 @@ fn run(args: Vec<OsString>) -> CliResult<()> {
     match command.to_str() {
         Some("run") => run::run(rest),
         Some("chat") => chat::run(rest),
+        Some("bench") => bench::run(rest),
         Some("serve") => serve::run(rest),
         Some("tokenize") => tokenize::run(rest),
         Some("inspect") => parse_inspect(rest).and_then(|opts| match opts {

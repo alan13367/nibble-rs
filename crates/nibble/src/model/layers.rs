@@ -7,9 +7,8 @@ use nibble_gguf::Gguf;
 
 use super::bind::{matrix, vector};
 use super::{Ctx, ModelConfig};
-use crate::cpu::{self, Weight, matvec};
+use crate::cpu::{self, EncodedInput, Kernels, Weight};
 use crate::error::Result;
-use crate::quant::f32_to_f16;
 
 /// Token embeddings, final norm and output projection.
 pub(crate) struct Head {
@@ -43,14 +42,8 @@ impl Head {
     /// `logits = output · (rmsnorm(x) * output_norm)`.
     pub(crate) fn logits(&self, ctx: &Ctx<'_>, x: &[f32], s: &mut Scratch, logits: &mut [f32]) {
         cpu::rmsnorm(&mut s.xn, x, &self.output_norm, ctx.config.rms_eps);
-        matvec(
-            ctx.bytes,
-            &self.output,
-            &s.xn,
-            logits,
-            &mut s.xq,
-            ctx.threads,
-        );
+        ctx.cpu
+            .matvec(ctx.bytes, &self.output, &s.xn, logits, &mut s.input);
     }
 }
 
@@ -60,8 +53,8 @@ pub(crate) struct Scratch {
     pub(crate) xn: Vec<f32>,
     /// A block's output, before it is added to the residual stream.
     pub(crate) out: Vec<f32>,
-    /// The activation encoded for the current matrix (see `quant::quantize_activation`).
-    pub(crate) xq: Vec<u8>,
+    /// The input of the current matrix products, encoded for their weights.
+    pub(crate) input: EncodedInput,
     /// `(cos, sin)` per rotated pair for the current position.
     pub(crate) rope: Vec<(f32, f32)>,
 }
@@ -71,58 +64,139 @@ impl Scratch {
         Self {
             xn: vec![0.0; c.n_embd],
             out: vec![0.0; c.n_embd],
-            xq: Vec::new(),
+            input: EncodedInput::new(),
             rope: Vec::with_capacity(c.rope_dims / 2),
         }
     }
 }
 
-/// Keys and values of one attention layer for every position so far, in f16
-/// (llama.cpp's default cache type).
+/// Positions are processed in blocks of this many: the step of ggml's f16
+/// dot product, which llama.cpp's padding of the cache (to 256 positions)
+/// always fills.
+const KV_BLOCK: usize = 32;
+
+/// Keys and values of one attention layer for up to `capacity` positions, in
+/// f16 (llama.cpp's default cache type), laid out as llama.cpp lays them out
+/// without flash attention: keys by position, values transposed. Both
+/// attention products are then contiguous f16 dot products.
+///
+/// The buffers are allocated for the whole context up front, as llama.cpp
+/// does, so the forward pass never reallocates them. The OS backs their
+/// zeroed pages with memory only when they are written, though Windows
+/// counts the whole allocation against its commit limit. Writing the first
+/// position touches one page per value row.
 pub(crate) struct KvCache {
-    k: Vec<u16>,
-    v: Vec<u16>,
+    /// `capacity` rows of `kv_dim` keys.
+    k: Vec<u8>,
+    /// `kv_dim` rows of `stride` values: row `i` holds element `i` of every
+    /// position's value. Entries past `len` are zero.
+    vt: Vec<u8>,
+    /// The value being written, as f16, before it is scattered into `vt`.
+    staging: Vec<u8>,
+    head_dim: usize,
     kv_dim: usize,
+    capacity: usize,
+    /// `capacity` rounded up to a whole block.
+    stride: usize,
+    len: usize,
 }
 
 impl KvCache {
-    pub(crate) fn new(c: &ModelConfig) -> Self {
+    pub(crate) fn new(c: &ModelConfig, capacity: usize) -> Self {
+        let kv_dim = c.n_head_kv * c.head_dim;
+        let stride = capacity.next_multiple_of(KV_BLOCK);
         Self {
-            k: Vec::new(),
-            v: Vec::new(),
-            kv_dim: c.n_head_kv * c.head_dim,
+            k: vec![0; 2 * kv_dim * capacity],
+            vt: vec![0; 2 * kv_dim * stride],
+            staging: vec![0; 2 * kv_dim],
+            head_dim: c.head_dim,
+            kv_dim,
+            capacity,
+            stride,
+            len: 0,
         }
     }
 
     /// Number of cached positions.
     pub(crate) fn len(&self) -> usize {
-        self.k.len() / self.kv_dim
+        self.len
     }
 
     /// Appends one position.
-    pub(crate) fn push(&mut self, k: &[f32], v: &[f32]) {
-        self.k.extend(k.iter().map(|&x| f32_to_f16(x)));
-        self.v.extend(v.iter().map(|&x| f32_to_f16(x)));
+    ///
+    /// # Panics
+    ///
+    /// If the cache is full; sessions check the context size first.
+    pub(crate) fn push(&mut self, kernels: Kernels, k: &[f32], v: &[f32]) {
+        let t = self.len;
+        assert!(
+            t < self.capacity,
+            "KV cache of {} positions is full",
+            self.capacity
+        );
+        let row = 2 * self.kv_dim;
+        kernels.to_f16(k, &mut self.k[t * row..(t + 1) * row]);
+        kernels.to_f16(v, &mut self.staging);
+        for (i, value) in self.staging.as_chunks::<2>().0.iter().enumerate() {
+            let at = 2 * (i * self.stride + t);
+            self.vt[at..at + 2].copy_from_slice(value);
+        }
+        self.len += 1;
     }
 
     /// Keeps the first `n_pos` positions.
     pub(crate) fn truncate(&mut self, n_pos: usize) {
-        self.k.truncate(n_pos * self.kv_dim);
-        self.v.truncate(n_pos * self.kv_dim);
+        if n_pos >= self.len {
+            return;
+        }
+        // The value product reads the dropped entries of the last block,
+        // weighted by zero, so they must not hold an infinity.
+        for row in self.vt.chunks_exact_mut(2 * self.stride) {
+            row[2 * n_pos..2 * self.len].fill(0);
+        }
+        self.len = n_pos;
     }
+
+    /// The keys of KV head `g` at position `t`.
+    fn key(&self, t: usize, g: usize) -> &[u8] {
+        let start = t * self.kv_dim + g * self.head_dim;
+        &self.k[2 * start..2 * (start + self.head_dim)]
+    }
+
+    /// Element `i` of the value of every position, through the end of the
+    /// block that holds the last position.
+    fn values(&self, i: usize) -> &[u8] {
+        let start = i * self.stride;
+        &self.vt[2 * start..2 * (start + self.len.next_multiple_of(KV_BLOCK))]
+    }
+}
+
+/// Per-head buffers for [`attend`].
+struct HeadScratch {
+    /// Attention scores, then probabilities, for every position.
+    scores: Vec<f32>,
+    /// The probabilities as f16, zero-padded to a whole block.
+    probs: Vec<u8>,
 }
 
 /// Buffers for [`attend`].
 pub(crate) struct AttentionScratch {
-    q16: Vec<u16>,
-    scores: Vec<f32>,
+    /// The queries as f16.
+    q16: Vec<u8>,
+    heads: Vec<HeadScratch>,
 }
 
 impl AttentionScratch {
     pub(crate) fn new(c: &ModelConfig, n_ctx: usize) -> Self {
+        let padded = n_ctx.next_multiple_of(KV_BLOCK);
         Self {
-            q16: vec![0; c.n_head * c.head_dim],
-            scores: vec![0.0; n_ctx],
+            q16: vec![0; 2 * c.n_head * c.head_dim],
+            heads: (0..c.n_head)
+                .map(|_| HeadScratch {
+                    scores: vec![0.0; n_ctx],
+                    probs: vec![0; 2 * padded],
+                })
+                .collect(),
         }
     }
 }
@@ -130,36 +204,46 @@ impl AttentionScratch {
 /// Causal softmax attention of the query heads `q` over every cached position,
 /// with grouped-query sharing (query head `h` reads KV head `h / (n_head / n_head_kv)`).
 /// Writes `n_head * head_dim` values to `out`.
+///
+/// As llama.cpp without flash attention: queries meet the f16 keys in f16,
+/// the softmax probabilities are rounded to f16, and each output value is
+/// the f16 dot product of the probabilities with a row of transposed values.
+/// Heads run in parallel.
 pub(crate) fn attend(
-    c: &ModelConfig,
+    ctx: &Ctx<'_>,
     q: &[f32],
     cache: &KvCache,
     s: &mut AttentionScratch,
     out: &mut [f32],
 ) {
+    let c = ctx.config;
     let hd = c.head_dim;
-    let kv_dim = cache.kv_dim;
     let group = c.n_head / c.n_head_kv;
     let scale = 1.0 / (hd as f32).sqrt();
+    let kernels = ctx.cpu.kernels();
+    kernels.to_f16(q, &mut s.q16);
+    let q16 = &s.q16;
     let n_pos = cache.len();
-    // Queries are compared with the f16 keys in f16, as ggml does.
-    for (h, &x) in s.q16.iter_mut().zip(q) {
-        *h = f32_to_f16(x);
-    }
-    for h in 0..c.n_head {
-        let kv_off = (h / group) * hd;
-        let q = &s.q16[h * hd..(h + 1) * hd];
-        let scores = &mut s.scores[..n_pos];
-        for (t, score) in scores.iter_mut().enumerate() {
-            *score = cpu::dot_f16(q, &cache.k[t * kv_dim + kv_off..][..hd]) * scale;
-        }
-        cpu::softmax(scores);
-        let out = &mut out[h * hd..(h + 1) * hd];
-        out.fill(0.0);
-        for (t, &p) in scores.iter().enumerate() {
-            cpu::axpy_f16(out, p, &cache.v[t * kv_dim + kv_off..][..hd]);
-        }
-    }
+    let padded = n_pos.next_multiple_of(KV_BLOCK);
+    ctx.cpu
+        .pool()
+        .for_each_chunk_pair(out, hd, &mut s.heads, 1, |h, out, head| {
+            let head = &mut head[0];
+            let kv_head = h / group;
+            let q = &q16[2 * h * hd..2 * (h + 1) * hd];
+            let scores = &mut head.scores[..n_pos];
+            for (t, score) in scores.iter_mut().enumerate() {
+                *score = kernels.dot_f16(q, cache.key(t, kv_head)) * scale;
+            }
+            kernels.softmax(scores);
+            let probs = &mut head.probs[..2 * padded];
+            let (p, padding) = probs.split_at_mut(2 * n_pos);
+            kernels.to_f16(scores, p);
+            padding.fill(0);
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = kernels.dot_f16(probs, cache.values(kv_head * hd + i));
+            }
+        });
 }
 
 /// Standard grouped-query attention, as in Llama, Mistral and Qwen: Q/K/V and
@@ -214,7 +298,7 @@ impl Attention {
         })
     }
 
-    /// Attention over `xn` (the normalized hidden state) at the cache's next
+    /// Attention over `s.xn` (the normalized hidden state) at the cache's next
     /// position. Appends this position to `cache` and writes the projected
     /// output to `s.out`.
     pub(crate) fn forward(
@@ -225,9 +309,16 @@ impl Attention {
         s: &mut Scratch,
     ) {
         let c = ctx.config;
-        matvec(ctx.bytes, &self.wq, &s.xn, &mut b.q, &mut s.xq, ctx.threads);
-        matvec(ctx.bytes, &self.wk, &s.xn, &mut b.k, &mut s.xq, ctx.threads);
-        matvec(ctx.bytes, &self.wv, &s.xn, &mut b.v, &mut s.xq, ctx.threads);
+        ctx.cpu.matvecs(
+            ctx.bytes,
+            &s.xn,
+            &mut s.input,
+            [
+                (&self.wq, &mut b.q[..]),
+                (&self.wk, &mut b.k[..]),
+                (&self.wv, &mut b.v[..]),
+            ],
+        );
         if let Some(w) = &self.q_norm {
             cpu::rmsnorm_chunks(&mut b.q, w, c.rms_eps);
         }
@@ -236,16 +327,10 @@ impl Attention {
         }
         cpu::rope_neox(&mut b.q, c.head_dim, &s.rope);
         cpu::rope_neox(&mut b.k, c.head_dim, &s.rope);
-        cache.push(&b.k, &b.v);
-        attend(c, &b.q, cache, &mut b.core, &mut b.att);
-        matvec(
-            ctx.bytes,
-            &self.wo,
-            &b.att,
-            &mut s.out,
-            &mut s.xq,
-            ctx.threads,
-        );
+        cache.push(ctx.cpu.kernels(), &b.k, &b.v);
+        attend(ctx, &b.q, cache, &mut b.core, &mut b.att);
+        ctx.cpu
+            .matvec(ctx.bytes, &self.wo, &b.att, &mut s.out, &mut s.input);
     }
 }
 
@@ -258,14 +343,15 @@ pub(crate) struct SwiGlu {
 
 /// Buffers for [`SwiGlu::forward`].
 pub(crate) struct FfnBuffers {
-    gate: Vec<f32>,
+    /// `silu(gate · x) * (up · x)`.
+    hidden: Vec<f32>,
     up: Vec<f32>,
 }
 
 impl FfnBuffers {
     pub(crate) fn new(c: &ModelConfig) -> Self {
         Self {
-            gate: vec![0.0; c.n_ff],
+            hidden: vec![0.0; c.n_ff],
             up: vec![0.0; c.n_ff],
         }
     }
@@ -284,32 +370,16 @@ impl SwiGlu {
 
     /// Feed-forward of `s.xn`, written to `s.out`.
     pub(crate) fn forward(&self, ctx: &Ctx<'_>, b: &mut FfnBuffers, s: &mut Scratch) {
-        matvec(
+        ctx.cpu.swiglu(
             ctx.bytes,
             &self.gate,
-            &s.xn,
-            &mut b.gate,
-            &mut s.xq,
-            ctx.threads,
-        );
-        matvec(
-            ctx.bytes,
             &self.up,
             &s.xn,
+            &mut s.input,
+            &mut b.hidden,
             &mut b.up,
-            &mut s.xq,
-            ctx.threads,
         );
-        for (g, &u) in b.gate.iter_mut().zip(&b.up) {
-            *g = cpu::silu(*g) * u;
-        }
-        matvec(
-            ctx.bytes,
-            &self.down,
-            &b.gate,
-            &mut s.out,
-            &mut s.xq,
-            ctx.threads,
-        );
+        ctx.cpu
+            .matvec(ctx.bytes, &self.down, &b.hidden, &mut s.out, &mut s.input);
     }
 }

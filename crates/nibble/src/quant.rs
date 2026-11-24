@@ -134,32 +134,100 @@ pub(crate) fn dequantize_row(ty: GgmlType, row: &[u8], out: &mut [f32]) {
     }
 }
 
-/// Encodes the activation `x` in the dot type of weight type `ty`, into `out`.
-pub(crate) fn quantize_activation(ty: GgmlType, x: &[f32], out: &mut Vec<u8>) {
-    out.clear();
-    match ty {
-        GgmlType::F32 => out.extend(x.iter().flat_map(|v| v.to_le_bytes())),
-        GgmlType::F16 => out.extend(x.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes())),
-        GgmlType::Bf16 => out.extend(x.iter().flat_map(|&v| f32_to_bf16(v).to_le_bytes())),
-        GgmlType::Q8_0 => {
-            for block in x.as_chunks::<QK8_0>().0 {
+/// The format an activation is encoded in before its dot products with the
+/// rows of one weight type: ggml's `vec_dot_type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DotType {
+    F32,
+    F16,
+    Bf16,
+    Q8_0,
+}
+
+impl DotType {
+    /// Number of dot types, for tables indexed by [`DotType::index`].
+    pub(crate) const COUNT: usize = 4;
+
+    /// The dot type of weight type `ty`.
+    ///
+    /// # Panics
+    ///
+    /// If `ty` is not [supported](is_supported). Weights are checked when
+    /// they are bound, so this is an internal invariant.
+    #[must_use]
+    pub(crate) fn of(ty: GgmlType) -> Self {
+        match ty {
+            GgmlType::F32 => Self::F32,
+            GgmlType::F16 => Self::F16,
+            GgmlType::Bf16 => Self::Bf16,
+            GgmlType::Q8_0 => Self::Q8_0,
+            other => unreachable!("no dot type for unsupported weight type {other}"),
+        }
+    }
+
+    /// A dense index in `0..COUNT`.
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Bytes that encode `n` values; `n` is a multiple of the block size.
+    #[must_use]
+    pub(crate) const fn encoded_len(self, n: usize) -> usize {
+        match self {
+            Self::F32 => 4 * n,
+            Self::F16 | Self::Bf16 => 2 * n,
+            Self::Q8_0 => n / QK8_0 * Q8_0_BLOCK_BYTES,
+        }
+    }
+}
+
+/// Encodes the activation `x` as `dt` into `out`, which holds exactly
+/// `dt.encoded_len(x.len())` bytes.
+pub(crate) fn encode_activation(dt: DotType, x: &[f32], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), dt.encoded_len(x.len()));
+    match dt {
+        DotType::F32 => {
+            for (o, &v) in out.as_chunks_mut::<4>().0.iter_mut().zip(x) {
+                *o = v.to_le_bytes();
+            }
+        }
+        DotType::F16 => {
+            for (o, &v) in out.as_chunks_mut::<2>().0.iter_mut().zip(x) {
+                *o = f32_to_f16(v).to_le_bytes();
+            }
+        }
+        DotType::Bf16 => {
+            for (o, &v) in out.as_chunks_mut::<2>().0.iter_mut().zip(x) {
+                *o = f32_to_bf16(v).to_le_bytes();
+            }
+        }
+        DotType::Q8_0 => {
+            let blocks = out.as_chunks_mut::<Q8_0_BLOCK_BYTES>().0;
+            for (o, block) in blocks.iter_mut().zip(x.as_chunks::<QK8_0>().0) {
                 // As ggml's AVX2/NEON quantize_row_q8_0: d = amax/127, q = round_even(x * 127/amax).
                 let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
                 let d = amax / 127.0;
                 let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-                out.extend(f32_to_f16(d).to_le_bytes());
-                out.extend(
-                    block
-                        .iter()
-                        .map(|&v| (v * id).round_ties_even() as i8 as u8),
-                );
+                let (scale, qs) = o.split_at_mut(2);
+                scale.copy_from_slice(&f32_to_f16(d).to_le_bytes());
+                for (q, &v) in qs.iter_mut().zip(block) {
+                    *q = (v * id).round_ties_even() as i8 as u8;
+                }
             }
         }
-        other => unreachable!("quantize_activation called with unsupported type {other}"),
     }
 }
 
-/// Dot product of a weight row with an activation encoded by [`quantize_activation`].
+/// `x` encoded as `dt`, in a new buffer.
+#[cfg(test)]
+pub(crate) fn encoded(dt: DotType, x: &[f32]) -> Vec<u8> {
+    let mut out = vec![0; dt.encoded_len(x.len())];
+    encode_activation(dt, x, &mut out);
+    out
+}
+
+/// Dot product of a weight row with an activation encoded by [`encode_activation`].
 #[must_use]
 pub(crate) fn dot_row(ty: GgmlType, row: &[u8], xq: &[u8]) -> f32 {
     match ty {
@@ -283,10 +351,8 @@ mod tests {
             (GgmlType::Q8_0, 1e-2),
         ] {
             // Weight rows use the same encoding as activations of their type.
-            let mut row = Vec::new();
-            quantize_activation(ty, &w, &mut row);
-            let mut xq = Vec::new();
-            quantize_activation(ty, &x, &mut xq);
+            let row = encoded(DotType::of(ty), &w);
+            let xq = encoded(DotType::of(ty), &x);
             let got = f64::from(dot_row(ty, &row, &xq));
             let exact: f64 = w
                 .iter()
@@ -317,8 +383,7 @@ mod tests {
         assert_eq!((out[0], out[1], out[2], out[31]), (2.0, -3.0, 0.0, 63.5));
 
         let x: Vec<f32> = (0..32).map(|i| i as f32 - 16.0).collect();
-        let mut q = Vec::new();
-        quantize_activation(GgmlType::Q8_0, &x, &mut q);
+        let q = encoded(DotType::Q8_0, &x);
         assert_eq!(q[2] as i8, -127); // amax maps to ±127
         dequantize_row(GgmlType::Q8_0, &q, &mut out);
         for (a, b) in out.iter().zip(&x) {

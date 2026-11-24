@@ -7,6 +7,7 @@ name = "nibble"
 version = "0.1.0"
 dependencies = [
  "nibble-gguf",
+ "nibble-json",
 ]
 
 [[package]]
@@ -19,6 +20,10 @@ dependencies = [
 
 [[package]]
 name = "nibble-gguf"
+version = "0.1.0"
+
+[[package]]
+name = "nibble-json"
 version = "0.1.0"
 
 [[package]]
