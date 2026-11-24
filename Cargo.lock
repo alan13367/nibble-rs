@@ -14,8 +14,16 @@ name = "nibble-cli"
 version = "0.1.0"
 dependencies = [
  "nibble",
+ "nibble-server",
 ]
 
 [[package]]
 name = "nibble-gguf"
 version = "0.1.0"
+
+[[package]]
+name = "nibble-server"
+version = "0.1.0"
+dependencies = [
+ "nibble",
+]

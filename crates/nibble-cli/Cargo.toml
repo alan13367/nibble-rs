@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 nibble.workspace = true
+nibble-server.workspace = true
 
 [lints]
 workspace = true

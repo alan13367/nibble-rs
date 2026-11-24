@@ -1,0 +1,13 @@
+[package]
+name = "nibble-server"
+description = "OpenAI-compatible HTTP server for the nibble inference engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+nibble.workspace = true
+
+[lints]
+workspace = true

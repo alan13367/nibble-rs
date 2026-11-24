@@ -9,10 +9,11 @@ rust-version = "1.100"
 repository = "https://github.com/alan13367/nibble-rs"
 
 # nibble has a strict zero-dependency policy: only path dependencies between
-# workspace crates are allowed. See PLAN.md, "Dependency policy".
+# workspace crates are allowed. See AGENTS.md.
 [workspace.dependencies]
 nibble-gguf = { path = "crates/nibble-gguf", version = "0.1.0" }
 nibble = { path = "crates/nibble", version = "0.1.0" }
+nibble-server = { path = "crates/nibble-server", version = "0.1.0" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

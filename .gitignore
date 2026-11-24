@@ -3,3 +3,6 @@
 # Model weights never go in git. Put local models in /models.
 /models
 *.gguf
+
+# Reference tools (llama.cpp release builds), not part of the repo.
+/tools
