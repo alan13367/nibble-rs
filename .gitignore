@@ -1,0 +1,5 @@
+/target
+
+# Model weights never go in git. Put local models in /models.
+/models
+*.gguf

@@ -1,0 +1,13 @@
+[package]
+name = "nibble"
+description = "Tiny, dependency-free GGUF inference engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+nibble-gguf.workspace = true
+
+[lints]
+workspace = true
