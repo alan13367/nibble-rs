@@ -175,10 +175,12 @@ impl DeltaNetDims {
         self.conv_rows() * self.conv_dim()
     }
 
-    /// Length of the pending tokens' projections: [`MAX_PENDING`] rows of
-    /// `n_v_heads` betas then `n_v_heads` alphas.
+    /// Length of the pending tokens' projections: twice [`MAX_PENDING`]
+    /// rows of `n_v_heads` betas then `n_v_heads` alphas, so that a batch
+    /// that stays pending can write its rows while the kept rows of the
+    /// batch before are still read (a GPU applies both in one dispatch).
     pub(crate) const fn pending_len(self) -> usize {
-        MAX_PENDING * 2 * self.n_v_heads
+        2 * MAX_PENDING * 2 * self.n_v_heads
     }
 
     /// Length of a layer's recurrent state: `d_v × d_k` per value head.
@@ -218,8 +220,10 @@ pub(crate) struct DeltaNetState<V> {
     /// after a rewind into the last batch): the next batch applies them
     /// before its own.
     pub(crate) keep: usize,
-    /// The pending tokens' projections ([`DeltaNetDims::pending_len`]).
+    /// The pending tokens' projections ([`DeltaNetDims::pending_len`]),
+    /// from row `pending_row` on.
     pub(crate) pending_ba: V,
+    pub(crate) pending_row: usize,
 }
 
 /// Per-head normalization of the attention queries and keys, and how the
@@ -292,6 +296,19 @@ pub(crate) trait Backend {
 
     /// Row `t` of `x` = row `tokens[t]` of `w`, for each token of the batch.
     fn embed(&mut self, w: &Weight, tokens: &[u32], x: &mut Self::Vector);
+
+    /// Row 0 of `x` = the row of `w` that token slot `slot` (below
+    /// [`MAX_LOGIT_ROWS`]) holds, as [`Backend::argmax`] wrote it: a token
+    /// chosen on the device, which is not read back first.
+    fn embed_slot(&mut self, w: &Weight, slot: usize, x: &mut Self::Vector);
+
+    /// Writes to token slot `slot` the index of the largest of the first
+    /// `len` values of `x` (the first of equal ones).
+    fn argmax(&mut self, x: &Self::Vector, len: usize, slot: usize);
+
+    /// The tokens in slots `0..out.len()`, after every op that writes them
+    /// (outside a batch).
+    fn read_slots(&mut self, out: &mut [u32]) -> Result<()>;
 
     /// `out = rmsnorm(x) * w`, for rows of `w.len()` values.
     fn rmsnorm(&mut self, x: &Self::Vector, w: Param, eps: f32, out: &mut Self::Vector);

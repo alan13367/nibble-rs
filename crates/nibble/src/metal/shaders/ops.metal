@@ -551,23 +551,217 @@ kernel void delta_net(
     }
 }
 
-// The gated RMSNorm of value head `tgpig`'s DeltaNet output, in place:
-// `rmsnorm(o) * norm * silu(z)`.
+// `DeltaBatchArgs` in `metal/kernels.rs`: a DeltaNet layer over `replay`
+// pending tokens (their inputs in the ring after the committed window from
+// row `oldest`, their projections at row `ba_read` of `pending_ba`), then
+// the `n` tokens of a batch.
+struct DeltaBatchArgs {
+    uint n_k_heads;
+    uint d_k;
+    uint d_v;
+    uint key_dim;
+    uint conv_dim;
+    uint taps;
+    uint rows;
+    uint oldest;
+    uint replay;
+    uint n;
+    uint pending;
+    uint ba_read;
+    uint ba_write;
+    float eps;
+    float scale;
+};
+
+// Input `e` of the sequence a batch's convolution runs over: the committed
+// window, the replayed tokens' inputs (both in the ring), then the batch's.
+static inline device const float * delta_input(constant DeltaBatchArgs & a,
+        device const float * ring, device const float * x, uint e) {
+    const uint in_ring = a.taps - 1 + a.replay;
+    return e < in_ring ? ring + (uint64_t) ((a.oldest + e) % a.rows) * a.conv_dim
+                       : x + (uint64_t) (e - in_ring) * a.conv_dim;
+}
+
+// Channel `c` of token `u`'s causal convolution, with SiLU: its window is
+// inputs `u..u + taps - 1` of the sequence, its own input the next one. The
+// sum runs as `conv_channel`'s.
+static inline float conv_channel_batch(constant DeltaBatchArgs & a, device const float * ring,
+        device const float * x, device const float * taps, uint u, uint c) {
+    const uint len = a.taps - 1;
+    float sum = 0.0f;
+    for (uint t = 0; t < len; ++t) {
+        sum = fma(delta_input(a, ring, x, u + t)[c], taps[(uint64_t) t * a.conv_dim + c], sum);
+    }
+    sum = fma(delta_input(a, ring, x, u + len)[c], taps[(uint64_t) len * a.conv_dim + c], sum);
+    return silu(sum);
+}
+
+// `delta_net` for the replayed tokens and then every token of a batch, in
+// order, in one dispatch: each threadgroup keeps its rows of the head's
+// state in registers across the tokens and computes every token's
+// convolution from the ring and the batch's inputs (it stores none: the
+// ring is updated afterwards). Each token's arithmetic is that of
+// `delta_net`. The state after the replayed tokens is written to `commit`
+// when the batch stays pending (whose projections then go to row
+// `ba_write` of `pending_ba`), and the final state to `state_out`.
+kernel void delta_net_batch(
+        constant DeltaBatchArgs & a [[buffer(0)]],
+        device const float * x [[buffer(1)]],
+        device const float * ring [[buffer(2)]],
+        device const float * taps [[buffer(3)]],
+        device const float * beta_in [[buffer(4)]],
+        device const float * alpha_in [[buffer(5)]],
+        device const float * dt_bias [[buffer(6)]],
+        device const float * a_log [[buffer(7)]],
+        device const float * state [[buffer(8)]],
+        device float * out [[buffer(9)]],
+        device float * state_out [[buffer(10)]],
+        device float * pending_ba [[buffer(11)]],
+        device float * commit [[buffer(12)]],
+        threadgroup float * shared [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort2 tid2 [[thread_position_in_threadgroup]],
+        ushort2 ntg2 [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const ushort tid = tid2.x;
+    const ushort ntg = ntg2.x;
+    threadgroup float buf[N_SIMDWIDTH];
+    const uint h = tgpig.x;
+    const uint dk = a.d_k;
+    const uint dv = a.d_v;
+    const uint value_dim = a.conv_dim - 2 * a.key_dim;
+    const uint nh = value_dim / dv;
+    const uint rows_per_group = nsg * DELTA_ROWS;
+    const uint j0 = tgpig.y * rows_per_group;
+    const uint kh = h % a.n_k_heads;
+    threadgroup float * qn = shared;
+    threadgroup float * kn = qn + dk;
+    threadgroup float * vv = kn + dk;
+
+    const uint n4 = dk / 4;
+    const uint jr = j0 + sgitg * DELTA_ROWS;
+    float4 s[DELTA_ROWS][DELTA_MAX_CHUNKS];
+    FOR_UNROLL (short r = 0; r < DELTA_ROWS; ++r) {
+        device const float4 * row = (device const float4 *) (state + ((uint64_t) h * dv + min(jr + r, dv - 1)) * dk);
+        FOR_UNROLL (short c = 0; c < DELTA_MAX_CHUNKS; ++c) {
+            const uint i = tiisg + c * N_SIMDWIDTH;
+            s[r][c] = i < n4 ? row[i] : 0.0f;
+        }
+    }
+    const float inv_sqrt_n = 1.0f / sqrt(float(dk));
+    threadgroup const float4 * q4 = (threadgroup const float4 *) qn;
+    threadgroup const float4 * k4 = (threadgroup const float4 *) kn;
+
+    for (uint u = 0; u < a.replay + a.n; ++u) {
+        const bool replayed = u < a.replay;
+        const uint t = u - a.replay;
+        if (u > 0) {
+            // Every thread is done with the last token's q, k and v.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float sq = 0.0f;
+        float sk = 0.0f;
+        for (uint i = tid; i < dk; i += ntg) {
+            const float qi = conv_channel_batch(a, ring, x, taps, u, kh * dk + i);
+            const float ki = conv_channel_batch(a, ring, x, taps, u, a.key_dim + kh * dk + i);
+            qn[i] = qi;
+            kn[i] = ki;
+            sq += qi * qi;
+            sk += ki * ki;
+        }
+        if (tid < rows_per_group && j0 + tid < dv) {
+            vv[tid] = conv_channel_batch(a, ring, x, taps, u, 2 * a.key_dim + h * dv + j0 + tid);
+        }
+        sq = threadgroup_sum(sq, buf, tiisg, sgitg, nsg);
+        sk = threadgroup_sum(sk, buf, tiisg, sgitg, nsg);
+        const float q_scale = 1.0f / sqrt(sq / dk + a.eps / dk);
+        const float k_scale = 1.0f / sqrt(sk / dk + a.eps / dk);
+        for (uint i = tid; i < dk; i += ntg) {
+            qn[i] = qn[i] * q_scale * inv_sqrt_n;
+            kn[i] = kn[i] * k_scale * inv_sqrt_n;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float beta_raw = replayed ? pending_ba[(a.ba_read + u) * 2 * nh + h] : beta_in[t * nh + h];
+        const float alpha_raw = replayed ? pending_ba[(a.ba_read + u) * 2 * nh + nh + h] : alpha_in[t * nh + h];
+        if (!replayed && a.pending != 0 && tgpig.y == 0 && tid == 0) {
+            pending_ba[(a.ba_write + t) * 2 * nh + h] = beta_raw;
+            pending_ba[(a.ba_write + t) * 2 * nh + nh + h] = alpha_raw;
+        }
+        const float beta = sigmoid(beta_raw);
+        const float g = alpha_raw + dt_bias[h];
+        const float softplus = g > 20.0f ? g : log(1.0f + exp(g));
+        const float decay = exp(softplus * a_log[h]);
+
+        FOR_UNROLL (short r = 0; r < DELTA_ROWS; ++r) {
+            const uint j = jr + r;
+            float kd = 0.0f;
+            FOR_UNROLL (short c = 0; c < DELTA_MAX_CHUNKS; ++c) {
+                const uint i = tiisg + c * N_SIMDWIDTH;
+                if (i < n4) {
+                    s[r][c] *= decay;
+                    kd += dot(s[r][c], k4[i]);
+                }
+            }
+            const float delta = (vv[j - j0] - simd_sum(kd)) * beta;
+            float o = 0.0f;
+            FOR_UNROLL (short c = 0; c < DELTA_MAX_CHUNKS; ++c) {
+                const uint i = tiisg + c * N_SIMDWIDTH;
+                if (i < n4) {
+                    s[r][c] += k4[i] * delta;
+                    o += dot(s[r][c], q4[i]);
+                }
+            }
+            o = simd_sum(o);
+            if (!replayed && tiisg == 0 && j < dv) {
+                out[(uint64_t) t * value_dim + h * dv + j] = o * a.scale;
+            }
+        }
+        if (a.pending != 0 && u + 1 == a.replay) {
+            FOR_UNROLL (short r = 0; r < DELTA_ROWS; ++r) {
+                device float4 * row = (device float4 *) (commit + ((uint64_t) h * dv + jr + r) * dk);
+                FOR_UNROLL (short c = 0; c < DELTA_MAX_CHUNKS; ++c) {
+                    const uint i = tiisg + c * N_SIMDWIDTH;
+                    if (i < n4 && jr + r < dv) {
+                        row[i] = s[r][c];
+                    }
+                }
+            }
+        }
+    }
+    FOR_UNROLL (short r = 0; r < DELTA_ROWS; ++r) {
+        device float4 * row = (device float4 *) (state_out + ((uint64_t) h * dv + jr + r) * dk);
+        FOR_UNROLL (short c = 0; c < DELTA_MAX_CHUNKS; ++c) {
+            const uint i = tiisg + c * N_SIMDWIDTH;
+            if (i < n4 && jr + r < dv) {
+                row[i] = s[r][c];
+            }
+        }
+    }
+}
+
+// The gated RMSNorm of value head `tgpig.x`'s DeltaNet output for token
+// `tgpig.y`, in place: `rmsnorm(o) * norm * silu(z)`.
 kernel void delta_norm(
         constant DeltaArgs & a [[buffer(0)]],
         device float * o [[buffer(1)]],
         device const float * z [[buffer(2)]],
         device const float * norm [[buffer(3)]],
-        uint tgpig [[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort ntg [[threads_per_threadgroup]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort2 tid2 [[thread_position_in_threadgroup]],
+        ushort2 ntg2 [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort nsg [[simdgroups_per_threadgroup]]) {
+    const ushort tid = tid2.x;
+    const ushort ntg = ntg2.x;
     threadgroup float buf[N_SIMDWIDTH];
     const uint dv = a.d_v;
-    o += tgpig * dv;
-    z += tgpig * dv;
+    const uint value_dim = a.conv_dim - 2 * a.key_dim;
+    o += (uint64_t) tgpig.y * value_dim + tgpig.x * dv;
+    z += (uint64_t) tgpig.y * value_dim + tgpig.x * dv;
     float so = 0.0f;
     for (uint j = tid; j < dv; j += ntg) {
         so += o[j] * o[j];
@@ -576,5 +770,51 @@ kernel void delta_norm(
     const float o_scale = 1.0f / sqrt(so / dv + a.eps);
     for (uint j = tid; j < dv; j += ntg) {
         o[j] = o[j] * o_scale * norm[j] * silu(z[j]);
+    }
+}
+
+// The index of the largest of `n` values (the first of equal ones, as the
+// CPU's argmax), into `slot[0]`: one threadgroup.
+kernel void argmax(
+        constant CountArgs & a [[buffer(0)]],
+        device const float * x [[buffer(1)]],
+        device uint * slot [[buffer(2)]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float best_v[N_SIMDWIDTH];
+    threadgroup uint best_i[N_SIMDWIDTH];
+    float v = -INFINITY;
+    uint idx = 0xFFFFFFFFu;
+    for (uint i = tid; i < a.n; i += ntg) {
+        if (x[i] > v) {
+            v = x[i];
+            idx = i;
+        }
+    }
+    // Lane by lane, keeping the larger value or, of equal ones, the first.
+    for (ushort off = N_SIMDWIDTH / 2; off > 0; off /= 2) {
+        const float ov = simd_shuffle_down(v, off);
+        const uint oi = simd_shuffle_down(idx, off);
+        if (ov > v || (ov == v && oi < idx)) {
+            v = ov;
+            idx = oi;
+        }
+    }
+    if (tiisg == 0) {
+        best_v[sgitg] = v;
+        best_i[sgitg] = idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (ushort s = 1; s < nsg; ++s) {
+            if (best_v[s] > v || (best_v[s] == v && best_i[s] < idx)) {
+                v = best_v[s];
+                idx = best_i[s];
+            }
+        }
+        slot[0] = idx == 0xFFFFFFFFu ? 0 : idx;
     }
 }

@@ -95,7 +95,9 @@ impl Neon {
             }
             GgmlType::Bf16 => neon_call!(dot_bf16_rows(rows, row_bytes, xq, out)),
             GgmlType::Q8_0 => {
-                if self.dotprod {
+                if self.dotprod && self.fp16 {
+                    neon_call!(dot_q8_0_rows_fp16(rows, row_bytes, xq, out))
+                } else if self.dotprod {
                     neon_call!(dot_q8_0_rows(rows, row_bytes, xq, out))
                 } else {
                     neon_call!(dot_q8_0_rows_mul(rows, row_bytes, xq, out))
@@ -138,6 +140,29 @@ impl Neon {
             }
             _ => scalar(out),
         }
+    }
+
+    /// See [`super::Kernels::dot_rows_n`].
+    pub(crate) fn dot_rows_n<const N: usize>(
+        self,
+        ty: GgmlType,
+        rows: &[u8],
+        row_bytes: usize,
+        xq: [&[u8]; N],
+        out: [&mut [f32]; N],
+    ) -> bool {
+        match ty {
+            GgmlType::Q8_0 if self.dotprod && self.fp16 => {
+                neon_call!(dot_q8_0_rows_n(rows, row_bytes, xq, out));
+            }
+            GgmlType::Q4K if self.dotprod => neon_call!(dot_q4_rows_n(rows, row_bytes, xq, out)),
+            GgmlType::Q5K if self.dotprod => neon_call!(dot_q5_rows_n(rows, row_bytes, xq, out)),
+            GgmlType::Q6K if self.dotprod => neon_call!(dot_q6_rows_n(rows, row_bytes, xq, out)),
+            GgmlType::Bf16 => neon_call!(dot_bf16_rows_n(rows, row_bytes, xq, out)),
+            GgmlType::F16 if self.fp16 => neon_call!(dot_f16_rows_n(rows, row_bytes, xq, out)),
+            _ => return false,
+        }
+        true
     }
 
     /// See [`super::Kernels::dot_f16_f32_rows`].
@@ -788,7 +813,7 @@ macro_rules! q8_partial {
 }
 
 macro_rules! define_q8_rows {
-    ($name:ident, $feat:literal, $dot:ident) => {
+    ($name:ident, $feat:literal, $dot:ident, $scale:ident) => {
         #[target_feature(enable = $feat)]
         fn $name(rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f32]) {
             let x = xq.as_chunks::<Q8_0_BLOCK_BYTES>().0;
@@ -804,8 +829,8 @@ macro_rules! define_q8_rows {
                 let mut sum1 = vdupq_n_f32(0.0);
                 let mut i = 0;
                 while i + 1 < n {
-                    let d0 = q8_scale(&w[i]) * q8_scale(&x[i]);
-                    let d1 = q8_scale(&w[i + 1]) * q8_scale(&x[i + 1]);
+                    let d0 = $scale(&w[i]) * $scale(&x[i]);
+                    let d1 = $scale(&w[i + 1]) * $scale(&x[i + 1]);
                     sum0 = vfmaq_n_f32(sum0, vcvtq_f32_s32(q8_partial!($dot, w[i], x[i])), d0);
                     sum1 = vfmaq_n_f32(
                         sum1,
@@ -819,7 +844,7 @@ macro_rules! define_q8_rows {
                 // loop: `sumf += sumi*(dx*dy)`, after the lanes are summed.
                 if i < n {
                     let sumi = vaddvq_s32(q8_partial!($dot, w[i], x[i]));
-                    sum = (sumi as f32).mul_add(q8_scale(&w[i]) * q8_scale(&x[i]), sum);
+                    sum = (sumi as f32).mul_add($scale(&w[i]) * $scale(&x[i]), sum);
                 }
                 *o = sum;
             }
@@ -827,12 +852,504 @@ macro_rules! define_q8_rows {
     };
 }
 
+// Kernels for several inputs at once: each row's weights are loaded and
+// decoded once for all of them, and each input's arithmetic is that of the
+// one-input kernel named, so each output is the same. In the K-quants the
+// products are exact integer sums, which any grouping gives; the float
+// update per super-block is the one-input kernel's.
+
+/// [`dot_q4_rows`] for `N` inputs.
+#[target_feature(enable = "neon,dotprod")]
+fn dot_q4_rows_n<const N: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    mut out: [&mut [f32]; N],
+) {
+    let xs = xq.map(|x| x.as_chunks::<Q8_K_BLOCK_BYTES>().0);
+    let m4b = vdupq_n_u8(0x0f);
+    let zero = vdupq_n_s32(0);
+    for (r, row) in rows.chunks_exact(row_bytes).enumerate().take(out[0].len()) {
+        let mut sum = [0.0f32; N];
+        for (b, w) in row.as_chunks::<Q4_K_BLOCK_BYTES>().0.iter().enumerate() {
+            if xs.iter().any(|x| b >= x.len()) {
+                break;
+            }
+            let d = quant::f16_to_f32(u16::from_le_bytes([w[0], w[1]]));
+            let dmin = quant::f16_to_f32(u16::from_le_bytes([w[2], w[3]]));
+            let (scales, mins) = k4_table(&w[4..16]);
+            let mut sumi = [0i32; N];
+            let mut sum_mins = [0i32; N];
+            for c in 0..N {
+                let bsums = q8k_bsums(&xs[c][b]);
+                for g in 0..8 {
+                    sum_mins[c] += i32::from(bsums[2 * g]) * i32::from(mins[g]);
+                    sum_mins[c] += i32::from(bsums[2 * g + 1]) * i32::from(mins[g]);
+                }
+            }
+            let qs = &w[16..];
+            for j in 0..4 {
+                let q0 = load_u8(at16(qs, j * 32));
+                let q1 = load_u8(at16(qs, j * 32 + 16));
+                let lo0 = vreinterpretq_s8_u8(vandq_u8(q0, m4b));
+                let lo1 = vreinterpretq_s8_u8(vandq_u8(q1, m4b));
+                let hi0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(q0));
+                let hi1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(q1));
+                for c in 0..N {
+                    let xqs = &xs[c][b][4..260];
+                    let p1 = vdotq_s32(
+                        vdotq_s32(zero, lo0, load_i8(at16(xqs, j * 64))),
+                        lo1,
+                        load_i8(at16(xqs, j * 64 + 16)),
+                    );
+                    let p2 = vdotq_s32(
+                        vdotq_s32(zero, hi0, load_i8(at16(xqs, j * 64 + 32))),
+                        hi1,
+                        load_i8(at16(xqs, j * 64 + 48)),
+                    );
+                    sumi[c] += vaddvq_s32(p1) * i32::from(scales[2 * j])
+                        + vaddvq_s32(p2) * i32::from(scales[2 * j + 1]);
+                }
+            }
+            for c in 0..N {
+                let x = &xs[c][b];
+                let xd = f32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+                sum[c] = quant::q4_k_update(sum[c], xd * d, xd * dmin, sumi[c], sum_mins[c]);
+            }
+        }
+        for (o, s) in out.iter_mut().zip(sum) {
+            o[r] = s;
+        }
+    }
+}
+
+/// [`dot_q5_rows`] for `N` inputs.
+#[target_feature(enable = "neon,dotprod")]
+fn dot_q5_rows_n<const N: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    mut out: [&mut [f32]; N],
+) {
+    let xs = xq.map(|x| x.as_chunks::<Q8_K_BLOCK_BYTES>().0);
+    let m4b = vdupq_n_u8(0x0f);
+    let one = vdupq_n_u8(1);
+    let two = vdupq_n_u8(2);
+    let zero = vdupq_n_s32(0);
+    for (r, row) in rows.chunks_exact(row_bytes).enumerate().take(out[0].len()) {
+        let mut sum = [0.0f32; N];
+        for (b, w) in row.as_chunks::<Q5_K_BLOCK_BYTES>().0.iter().enumerate() {
+            if xs.iter().any(|x| b >= x.len()) {
+                break;
+            }
+            let d = quant::f16_to_f32(u16::from_le_bytes([w[0], w[1]]));
+            let dmin = quant::f16_to_f32(u16::from_le_bytes([w[2], w[3]]));
+            let (scales, mins) = k4_table(&w[4..16]);
+            let mut isum = [0i32; N];
+            let mut sum_mins = [0i32; N];
+            for c in 0..N {
+                let bsums = q8k_bsums(&xs[c][b]);
+                for g in 0..8 {
+                    sum_mins[c] += i32::from(bsums[2 * g]) * i32::from(mins[g]);
+                    sum_mins[c] += i32::from(bsums[2 * g + 1]) * i32::from(mins[g]);
+                }
+            }
+            let mut qh0 = load_u8(at16(&w[16..], 0));
+            let mut qh1 = load_u8(at16(&w[16..], 16));
+            let ql = &w[48..];
+            for j in 0..4 {
+                let q0 = load_u8(at16(ql, j * 32));
+                let q1 = load_u8(at16(ql, j * 32 + 16));
+                let h0 = vshlq_n_u8::<4>(vandq_u8(one, qh0));
+                let h1 = vshlq_n_u8::<4>(vandq_u8(one, qh1));
+                let h2 = vshlq_n_u8::<3>(vandq_u8(two, qh0));
+                let h3 = vshlq_n_u8::<3>(vandq_u8(two, qh1));
+                qh0 = vshrq_n_u8::<2>(qh0);
+                qh1 = vshrq_n_u8::<2>(qh1);
+                let b0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q0, m4b), h0));
+                let b1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q1, m4b), h1));
+                let b2 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q0), h2));
+                let b3 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q1), h3));
+                for c in 0..N {
+                    let xqs = &xs[c][b][4..260];
+                    let p0 = vdotq_s32(
+                        vdotq_s32(zero, b0, load_i8(at16(xqs, j * 64))),
+                        b1,
+                        load_i8(at16(xqs, j * 64 + 16)),
+                    );
+                    let p1 = vdotq_s32(
+                        vdotq_s32(zero, b2, load_i8(at16(xqs, j * 64 + 32))),
+                        b3,
+                        load_i8(at16(xqs, j * 64 + 48)),
+                    );
+                    isum[c] += vaddvq_s32(p0) * i32::from(scales[2 * j]);
+                    isum[c] += vaddvq_s32(p1) * i32::from(scales[2 * j + 1]);
+                }
+            }
+            for c in 0..N {
+                let x = &xs[c][b];
+                let xd = f32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+                sum[c] = quant::q5_k_update(sum[c], xd * d, xd * dmin, isum[c], sum_mins[c]);
+            }
+        }
+        for (o, s) in out.iter_mut().zip(sum) {
+            o[r] = s;
+        }
+    }
+}
+
+/// [`dot_q6_rows`] for `N` inputs.
+#[target_feature(enable = "neon,dotprod")]
+fn dot_q6_rows_n<const N: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    mut out: [&mut [f32]; N],
+) {
+    let xs = xq.map(|x| x.as_chunks::<Q8_K_BLOCK_BYTES>().0);
+    let m4b = vdupq_n_u8(0x0f);
+    let three = vdupq_n_u8(3);
+    let zero = vdupq_n_s32(0);
+    for (r, row) in rows.chunks_exact(row_bytes).enumerate().take(out[0].len()) {
+        let mut sum = [0.0f32; N];
+        for (b, w) in row.as_chunks::<Q6_K_BLOCK_BYTES>().0.iter().enumerate() {
+            if xs.iter().any(|x| b >= x.len()) {
+                break;
+            }
+            let d = quant::f16_to_f32(u16::from_le_bytes([w[208], w[209]]));
+            let mut scales = [0i8; 16];
+            for (slot, &v) in scales.iter_mut().zip(&w[192..208]) {
+                *slot = v as i8;
+            }
+            let mut bias = [0i32; N];
+            for c in 0..N {
+                let bsums = q8k_bsums(&xs[c][b]);
+                for j in 0..16 {
+                    bias[c] += i32::from(bsums[j]) * i32::from(scales[j]);
+                }
+            }
+            let mut isum = [0i32; N];
+            let (mut ql, mut qh, mut xoff, mut sc) = (0, 128, 4, 0);
+            for _ in 0..2 {
+                let qh0 = load_u8(at16(w, qh));
+                let qh1 = load_u8(at16(w, qh + 16));
+                let q0 = load_u8(at16(w, ql));
+                let q1 = load_u8(at16(w, ql + 16));
+                let q2 = load_u8(at16(w, ql + 32));
+                let q3 = load_u8(at16(w, ql + 48));
+                let lo = [
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(q0, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(three, qh0)),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(q1, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(three, qh1)),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(q2, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<2>(qh0))),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vandq_u8(q3, m4b),
+                        vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<2>(qh1))),
+                    )),
+                ];
+                let hi = [
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(q0),
+                        vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<4>(qh0))),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(q1),
+                        vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<4>(qh1))),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(q2),
+                        vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<6>(qh0))),
+                    )),
+                    vreinterpretq_s8_u8(vorrq_u8(
+                        vshrq_n_u8::<4>(q3),
+                        vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<6>(qh1))),
+                    )),
+                ];
+                for c in 0..N {
+                    let x = &xs[c][b];
+                    for k in 0..4 {
+                        isum[c] +=
+                            vaddvq_s32(vdotq_s32(zero, lo[k], load_i8(at16(x, xoff + 16 * k))))
+                                * i32::from(scales[sc + k]);
+                    }
+                    for k in 0..4 {
+                        isum[c] += vaddvq_s32(vdotq_s32(
+                            zero,
+                            hi[k],
+                            load_i8(at16(x, xoff + 64 + 16 * k)),
+                        )) * i32::from(scales[sc + 4 + k]);
+                    }
+                }
+                ql += 64;
+                qh += 32;
+                xoff += 128;
+                sc += 8;
+            }
+            for c in 0..N {
+                let x = &xs[c][b];
+                let xd = f32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+                sum[c] = (xd * d).mul_add((isum[c] - 32 * bias[c]) as f32, sum[c]);
+            }
+        }
+        for (o, s) in out.iter_mut().zip(sum) {
+            o[r] = s;
+        }
+    }
+}
+
+/// [`dot_bf16`] of each row with `N` inputs.
+#[target_feature(enable = "neon")]
+fn dot_bf16_rows_n<const N: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    out: [&mut [f32]; N],
+) {
+    for (r, a) in rows.chunks_exact(row_bytes).enumerate().take(out[0].len()) {
+        let n = xq.iter().fold(a.len(), |m, x| m.min(x.len())) / 2 * 2;
+        let (a_steps, a_tail) = a[..n].as_chunks::<32>();
+        let mut sum = [[vdupq_n_f32(0.0); 4]; N];
+        for (s, a) in a_steps.iter().enumerate() {
+            let (a0, a1) = load_bf16_8((&a[..16]).try_into().unwrap());
+            let (a2, a3) = load_bf16_8((&a[16..]).try_into().unwrap());
+            for c in 0..N {
+                let b = &xq[c][32 * s..32 * s + 32];
+                let (b0, b1) = load_bf16_8((&b[..16]).try_into().unwrap());
+                let (b2, b3) = load_bf16_8((&b[16..]).try_into().unwrap());
+                sum[c][0] = vfmaq_f32(sum[c][0], a0, b0);
+                sum[c][1] = vfmaq_f32(sum[c][1], a1, b1);
+                sum[c][2] = vfmaq_f32(sum[c][2], a2, b2);
+                sum[c][3] = vfmaq_f32(sum[c][3], a3, b3);
+            }
+        }
+        for c in 0..N {
+            let mut sumf = reduce4(sum[c]);
+            let b_tail = &xq[c][32 * a_steps.len()..n];
+            for (a, b) in a_tail
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(b_tail.as_chunks::<2>().0)
+            {
+                sumf += quant::bf16_to_f32(u16::from_le_bytes(*a))
+                    * quant::bf16_to_f32(u16::from_le_bytes(*b));
+            }
+            out[c][r] = sumf;
+        }
+    }
+}
+
+/// [`dot_f16_rows`] (the `fp16` widening) of each row with `N` inputs of
+/// little-endian f32 bytes, in its chunks.
+#[target_feature(enable = "neon,fp16")]
+fn dot_f16_rows_n<const N: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    out: [&mut [f32]; N],
+) {
+    for (r, row) in rows.chunks_exact(row_bytes).enumerate().take(out[0].len()) {
+        let n = xq.iter().fold(row.len() / 2, |m, x| m.min(x.len() / 4));
+        let mut sumf = [0.0f64; N];
+        for (k, a) in row[..2 * n].chunks(2 * F16_CHUNK).enumerate() {
+            let (a_steps, a_tail) = a.as_chunks::<32>();
+            let mut acc = [[vdupq_n_f32(0.0); 4]; N];
+            for (s, a) in a_steps.iter().enumerate() {
+                let a = a.as_chunks::<8>().0;
+                let av = [
+                    load_f16_4(&a[0]),
+                    load_f16_4(&a[1]),
+                    load_f16_4(&a[2]),
+                    load_f16_4(&a[3]),
+                ];
+                for c in 0..N {
+                    let at = 4 * (k * F16_CHUNK + 16 * s);
+                    let b = xq[c][at..at + 64].as_chunks::<16>().0;
+                    for i in 0..4 {
+                        acc[c][i] = vfmaq_f32(acc[c][i], av[i], load_f32_le(&b[i]));
+                    }
+                }
+            }
+            for c in 0..N {
+                let mut chunk = reduce4(acc[c]);
+                let at = 4 * (k * F16_CHUNK + 16 * a_steps.len());
+                let b_tail = &xq[c][at..at + 2 * a_tail.len()];
+                for (a, b) in a_tail
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(b_tail.as_chunks::<4>().0)
+                {
+                    let a = quant::f16_to_f32(u16::from_le_bytes(*a));
+                    chunk = a.mul_add(f32::from_le_bytes(*b), chunk);
+                }
+                sumf[c] += f64::from(chunk);
+            }
+        }
+        for c in 0..N {
+            out[c][r] = sumf[c] as f32;
+        }
+    }
+}
+
+/// [`dot_q8_0_rows`] for `N` inputs at once: each block of weights is
+/// loaded once for two rows and all the inputs. Every (row, input) pair
+/// keeps the one-input kernel's lanes, its two running vectors, its scale
+/// products and its odd-block tail, so each output is the same; the two
+/// 16-byte dots of a block are chained into one accumulator, which gives the
+/// same exact integers as adding them.
+#[target_feature(enable = "neon,dotprod,fp16")]
+fn dot_q8_0_rows_n<const N: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    mut out: [&mut [f32]; N],
+) {
+    let x = xq.map(|x| x.as_chunks::<Q8_0_BLOCK_BYTES>().0);
+    let blocks = |r: usize| {
+        rows[r * row_bytes..(r + 1) * row_bytes]
+            .as_chunks::<Q8_0_BLOCK_BYTES>()
+            .0
+    };
+    let n_rows = out[0].len();
+    let mut r = 0;
+    while r + 2 <= n_rows {
+        let sums = q8_0_tile::<2, N>([blocks(r), blocks(r + 1)], x);
+        for (c, o) in out.iter_mut().enumerate() {
+            o[r] = sums[0][c];
+            o[r + 1] = sums[1][c];
+        }
+        r += 2;
+    }
+    if r < n_rows {
+        let sums = q8_0_tile::<1, N>([blocks(r)], x);
+        for (c, o) in out.iter_mut().enumerate() {
+            o[r] = sums[0][c];
+        }
+    }
+}
+
+/// The dots of `R` rows of Q8_0 blocks with `N` encoded inputs, as
+/// [`dot_q8_0_rows`] computes each.
+#[inline]
+#[target_feature(enable = "neon,dotprod,fp16")]
+fn q8_0_tile<const R: usize, const N: usize>(
+    w: [&[[u8; Q8_0_BLOCK_BYTES]]; R],
+    x: [&[[u8; Q8_0_BLOCK_BYTES]]; N],
+) -> [[f32; N]; R] {
+    let n = w
+        .iter()
+        .map(|w| w.len())
+        .chain(x.iter().map(|x| x.len()))
+        .min()
+        .unwrap_or(0);
+    let zero = vdupq_n_s32(0);
+    let mut sum0 = [[vdupq_n_f32(0.0); N]; R];
+    let mut sum1 = [[vdupq_n_f32(0.0); N]; R];
+    // One block's products for every pair, into `sums`.
+    let block = |i: usize, sums: &mut [[float32x4_t; N]; R]| {
+        let wl: [[int8x16_t; 2]; R] = std::array::from_fn(|r| {
+            [
+                load_i8(at16(&w[r][i][2..], 0)),
+                load_i8(at16(&w[r][i][2..], 16)),
+            ]
+        });
+        let ws: [f32; R] = std::array::from_fn(|r| q8_scale_fp16(&w[r][i]));
+        if N == 4 {
+            // The four inputs' scale products with a row in one multiply
+            // (each lane the same `ws * xs` as below).
+            let xs4: [f32; 4] = std::array::from_fn(|c| q8_scale_fp16(&x[c.min(N - 1)][i]));
+            let xs4 = load_f32(&xs4);
+            let d: [float32x4_t; R] = std::array::from_fn(|r| vmulq_n_f32(xs4, ws[r]));
+            macro_rules! col {
+                ($c:literal) => {{
+                    let xl = [
+                        load_i8(at16(&x[$c][i][2..], 0)),
+                        load_i8(at16(&x[$c][i][2..], 16)),
+                    ];
+                    for r in 0..R {
+                        let p = vdotq_s32(vdotq_s32(zero, wl[r][0], xl[0]), wl[r][1], xl[1]);
+                        sums[r][$c] = vfmaq_laneq_f32::<$c>(sums[r][$c], vcvtq_f32_s32(p), d[r]);
+                    }
+                }};
+            }
+            col!(0);
+            col!(1);
+            col!(2);
+            col!(3);
+            return;
+        }
+        for c in 0..N {
+            let xl = [
+                load_i8(at16(&x[c][i][2..], 0)),
+                load_i8(at16(&x[c][i][2..], 16)),
+            ];
+            let xs = q8_scale_fp16(&x[c][i]);
+            for r in 0..R {
+                let p = vdotq_s32(vdotq_s32(zero, wl[r][0], xl[0]), wl[r][1], xl[1]);
+                sums[r][c] = vfmaq_n_f32(sums[r][c], vcvtq_f32_s32(p), ws[r] * xs);
+            }
+        }
+    };
+    let mut i = 0;
+    while i + 1 < n {
+        block(i, &mut sum0);
+        block(i + 1, &mut sum1);
+        i += 2;
+    }
+    let mut out = [[0.0; N]; R];
+    for r in 0..R {
+        for c in 0..N {
+            let mut sum = vaddvq_f32(sum0[r][c]) + vaddvq_f32(sum1[r][c]);
+            if i < n {
+                let p = vdotq_s32(
+                    vdotq_s32(
+                        zero,
+                        load_i8(at16(&w[r][i][2..], 0)),
+                        load_i8(at16(&x[c][i][2..], 0)),
+                    ),
+                    load_i8(at16(&w[r][i][2..], 16)),
+                    load_i8(at16(&x[c][i][2..], 16)),
+                );
+                let sumi = vaddvq_s32(p);
+                sum = (sumi as f32).mul_add(q8_scale_fp16(&w[r][i]) * q8_scale_fp16(&x[c][i]), sum);
+            }
+            out[r][c] = sum;
+        }
+    }
+    out
+}
+
+/// [`q8_scale`] with the hardware conversion: the same exact value in one
+/// instruction instead of a software decode, which costs as much as a
+/// block's products.
+#[inline]
+#[target_feature(enable = "neon,fp16")]
+fn q8_scale_fp16(block: &[u8; Q8_0_BLOCK_BYTES]) -> f32 {
+    let bits = vdup_n_u16(u16::from_le_bytes([block[0], block[1]]));
+    vgetq_lane_f32::<0>(vcvt_f32_f16(vreinterpret_f16_u16(bits)))
+}
+
 fn q8_scale(block: &[u8; Q8_0_BLOCK_BYTES]) -> f32 {
     quant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]))
 }
 
-define_q8_rows!(dot_q8_0_rows, "neon,dotprod", i8_dot16);
-define_q8_rows!(dot_q8_0_rows_mul, "neon", i8_dot16_mul);
+define_q8_rows!(dot_q8_0_rows, "neon,dotprod", i8_dot16, q8_scale);
+define_q8_rows!(
+    dot_q8_0_rows_fp16,
+    "neon,dotprod,fp16",
+    i8_dot16,
+    q8_scale_fp16
+);
+define_q8_rows!(dot_q8_0_rows_mul, "neon", i8_dot16_mul, q8_scale);
 
 macro_rules! define_q4_rows {
     ($name:ident, $feat:literal, $dot:ident) => {

@@ -375,6 +375,7 @@ static inline void matvec_q4_K_impl(
 
 MATVEC_KERNEL(matvec_q4_K, matvec_q4_K_impl, 2)
 
+
 // ggml's `kernel_mul_mv_q5_K_f32_impl`, with `NR0` rows per simdgroup
 // (ggml takes one; a row's arithmetic is the same): lanes 0..3 take the super-blocks (stride 4), the fifth bits in `qh` are
 // split per 32-value group.
@@ -484,6 +485,7 @@ static inline void matvec_q5_K_impl(
 
 MATVEC_KERNEL(matvec_q5_K, matvec_q5_K_impl, 2)
 
+
 // ggml's `kernel_mul_mv_q6_K_f32_impl` (NR0 = 2): two lanes take the
 // super-blocks (stride 2), the other dimension of the simdgroup splits each
 // 128-value half between its eight scale groups.
@@ -569,6 +571,95 @@ static inline void matvec_q6_K_impl(
 
 MATVEC_KERNEL(matvec_q6_K, matvec_q6_K_impl, 2)
 
+// `matvec_q6_K_impl` for `nc` (at most `NC`) inputs at once: each row's
+// weights are decoded once, and each input's arithmetic is the same as in a
+// dispatch of its own. Only 2 inputs: with fast math the compiler may group
+// sums differently in wider loops (`metal/tests.rs` checks this width, and
+// the backend checks it again when it starts), and 4 inputs measured slower
+// than two groups of 2. Q3_K, Q4_K, Q5_K and IQ4_XS have no such kernel:
+// theirs regrouped sums or spilled registers, slower than the loop over
+// inputs of `MATVEC_KERNEL`.
+template <short NR0, short NC>
+static inline void matvec_q6_K_nc(
+        constant MatvecArgs & a,
+        device const char * w,
+        device const char * w2,
+        device const float * y,
+        device float * dst,
+        short nc,
+        threadgroup char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short nsg = a.nsg;
+
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = a.cols / QK_K;
+
+    const int first_row = ((int) tgpig.x * nsg + sgitg) * NR0;
+
+    device const block_q6_K * ax[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q6_K *) matrix_row(w, w2, a, first_row + row);
+    }
+
+    float sumf[NC][NR0] = { { 0.f } };
+
+    float yl[NC][16];
+
+    const short tid = tiisg/2;
+    const short ix  = tiisg%2;
+    const short ip  = tid/8;
+    const short il  = tid%8;
+    const short l0  = 4*il;
+    const short is  = 8*ip + l0/16;
+
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l =  64*ip + l0;
+    const short q_offset_h =  32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        for (short c = 0; c < NC; ++c) {
+            device const float * yb = y + (uint64_t) min(c, (short) (nc - 1)) * a.cols + i * QK_K + y_offset;
+            for (short l = 0; l < 4; ++l) {
+                yl[c][4*l + 0] = yb[l +  0];
+                yl[c][4*l + 1] = yb[l + 32];
+                yl[c][4*l + 2] = yb[l + 64];
+                yl[c][4*l + 3] = yb[l + 96];
+            }
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            device const uint8_t * q1 = ax[row][i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = ax[row][i].qh + q_offset_h;
+            device const int8_t  * sc = ax[row][i].scales + is;
+            device const half    * dh = &ax[row][i].d;
+
+            for (short c = 0; c < NC; ++c) {
+                float4 sums = {0.f, 0.f, 0.f, 0.f};
+
+                FOR_UNROLL (short l = 0; l < 4; ++l) {
+                    sums[0] += yl[c][4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                    sums[1] += yl[c][4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                    sums[2] += yl[c][4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                    sums[3] += yl[c][4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+                }
+
+                sumf[c][row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            }
+        }
+    }
+
+    simd_write_nc<NR0, NC>(a, dst, sumf, nc, first_row, tiisg);
+}
+
+MATVEC_KERNEL_NC(matvec_q6_K_c2, matvec_q6_K_nc, 2, 2)
+
 // Embedding lookups for the K-quants: thread `i` decodes part `i % 16` of
 // block `i / 16`, that is the 16 values `[16*i, 16*i + 16)` of the row, and
 // does nothing past `cols / 16` parts (the dispatch rounds up to whole
@@ -585,9 +676,10 @@ static inline void embed_write16(device float * x, uint64_t at, thread const flo
 }
 
 kernel void embed_q3_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
-        device float * x [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+        device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
     if (i < a.cols / 16) {
-        device const block_q3_K * b = (device const block_q3_K *) (w + (uint64_t) a.row * a.row_bytes) + i / 16;
+        device const block_q3_K * b = (device const block_q3_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q3_K(b, (short) (i % 16), reg);
         embed_write16(x, 16 * i, reg);
@@ -595,9 +687,10 @@ kernel void embed_q3_K(constant EmbedArgs & a [[buffer(0)]], device const char *
 }
 
 kernel void embed_q4_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
-        device float * x [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+        device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
     if (i < a.cols / 16) {
-        device const block_q4_K * b = (device const block_q4_K *) (w + (uint64_t) a.row * a.row_bytes) + i / 16;
+        device const block_q4_K * b = (device const block_q4_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q4_K(b, (short) (i % 16), reg);
         embed_write16(x, 16 * i, reg);
@@ -605,9 +698,10 @@ kernel void embed_q4_K(constant EmbedArgs & a [[buffer(0)]], device const char *
 }
 
 kernel void embed_q5_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
-        device float * x [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+        device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
     if (i < a.cols / 16) {
-        device const block_q5_K * b = (device const block_q5_K *) (w + (uint64_t) a.row * a.row_bytes) + i / 16;
+        device const block_q5_K * b = (device const block_q5_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q5_K(b, (short) (i % 16), reg);
         embed_write16(x, 16 * i, reg);
@@ -615,9 +709,10 @@ kernel void embed_q5_K(constant EmbedArgs & a [[buffer(0)]], device const char *
 }
 
 kernel void embed_q6_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
-        device float * x [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+        device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
     if (i < a.cols / 16) {
-        device const block_q6_K * b = (device const block_q6_K *) (w + (uint64_t) a.row * a.row_bytes) + i / 16;
+        device const block_q6_K * b = (device const block_q6_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q6_K(b, (short) (i % 16), reg);
         embed_write16(x, 16 * i, reg);
@@ -728,13 +823,15 @@ static inline void matvec_iq4_xs_impl(
 
 MATVEC_KERNEL(matvec_iq4_xs, matvec_iq4_xs_impl, 2)
 
+
 // Thread `i` writes values `[16*i, 16*i + 16)`: half `i % 2` of group
 // `(i % 16) / 2` of block `i / 16`, as `dequantize_row_iq4_xs` computes
 // them (`(d * scale) * value`).
 kernel void embed_iq4_xs(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
-        device float * x [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+        device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
     if (i < a.cols / 16) {
-        device const block_iq4_xs * b = (device const block_iq4_xs *) (w + (uint64_t) a.row * a.row_bytes) + i / 16;
+        device const block_iq4_xs * b = (device const block_iq4_xs *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
         const short g = (i % 16) / 2;
         const short shift = 4 * (i % 2);
         const int ls = (((b->scales_l[g/2] >> 4*(g%2)) & 0xf) | (((b->scales_h >> 2*g) & 3) << 4)) - 32;

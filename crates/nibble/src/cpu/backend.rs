@@ -12,7 +12,8 @@ use super::{
     rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
 };
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_PENDING, ModelData, Param, QkNorm,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_LOGIT_ROWS, MAX_PENDING, ModelData,
+    Param, QkNorm,
 };
 use crate::error::Result;
 
@@ -32,6 +33,8 @@ pub(crate) struct CpuBackend<'m> {
     gate: Vec<f32>,
     /// The products that [`Backend::residual`] adds.
     product: Vec<f32>,
+    /// The token slots of [`Backend::argmax`].
+    slots: [u32; MAX_LOGIT_ROWS],
     /// One DeltaNet layer's state, which a batch that stays pending runs on.
     work: Vec<f32>,
     /// The convolution, betas, decays and (unused) outputs of the pending
@@ -53,6 +56,7 @@ impl<'m> CpuBackend<'m> {
             query: vec![0.0; c.n_head * c.head_dim],
             gate: vec![0.0; c.n_head * c.head_dim],
             product: vec![0.0; c.n_embd],
+            slots: [0; MAX_LOGIT_ROWS],
             work: Vec::new(),
             replay: Default::default(),
         }
@@ -137,6 +141,27 @@ impl Backend for CpuBackend<'_> {
         for (&token, x) in tokens.iter().zip(x.chunks_exact_mut(w.cols)) {
             w.dequantize_row(self.model.bytes, token as usize, x);
         }
+    }
+
+    fn embed_slot(&mut self, w: &Weight, slot: usize, x: &mut Vec<f32>) {
+        let token = self.slots[slot] as usize;
+        w.dequantize_row(self.model.bytes, token, &mut x[..w.cols]);
+    }
+
+    fn argmax(&mut self, x: &Vec<f32>, len: usize, slot: usize) {
+        let x = &x[..len];
+        let mut best = 0;
+        for (i, &v) in x.iter().enumerate() {
+            if v > x[best] {
+                best = i;
+            }
+        }
+        self.slots[slot] = best as u32;
+    }
+
+    fn read_slots(&mut self, out: &mut [u32]) -> Result<()> {
+        out.copy_from_slice(&self.slots[..out.len()]);
+        Ok(())
     }
 
     fn rmsnorm(&mut self, x: &Vec<f32>, w: Param, eps: f32, out: &mut Vec<f32>) {
@@ -312,7 +337,11 @@ impl Backend for CpuBackend<'_> {
             beta.resize(MAX_PENDING * nh, 0.0);
             decay.resize(MAX_PENDING * nh, 0.0);
             out.resize(MAX_PENDING * vd, 0.0);
-            for (i, ba) in state.pending_ba.chunks_exact(2 * nh).take(r).enumerate() {
+            let kept = state
+                .pending_ba
+                .chunks_exact(2 * nh)
+                .skip(state.pending_row);
+            for (i, ba) in kept.take(r).enumerate() {
                 beta[i * nh..(i + 1) * nh].copy_from_slice(&ba[..nh]);
                 decay[i * nh..(i + 1) * nh].copy_from_slice(&ba[nh..]);
             }
@@ -340,6 +369,8 @@ impl Backend for CpuBackend<'_> {
             &mut z[..n * vd],
         );
         if pending {
+            // The kept rows were applied above, so the new ones go first.
+            state.pending_row = 0;
             let ba = state.pending_ba.chunks_exact_mut(2 * nh);
             for ((ba, beta), alpha) in ba.zip(beta.chunks_exact(nh)).zip(alpha.chunks_exact(nh)) {
                 ba[..nh].copy_from_slice(beta);

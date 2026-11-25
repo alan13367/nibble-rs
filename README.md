@@ -10,9 +10,11 @@ with **zero external dependencies**.
 > `--backend cpu`) on the CPU, with AVX2 and NEON kernels that reproduce
 > llama.cpp's results bit for bit. The exceptions are BF16 on ARM, where
 > nibble is about six times faster instead, and the K-quants and IQ4_XS on
-> x86, which still use the scalar dot products. It comes with an
-> OpenAI-compatible server and `run`, `chat`, `serve`, `bench`, `tokenize`
-> and `inspect` commands.
+> x86, which still use the scalar dot products. Models with a
+> multi-token-prediction head (Qwen3.5 files converted with it) can draft
+> tokens and check them in one pass (`--draft N`), with the same output as
+> without. It comes with an OpenAI-compatible server and `run`, `chat`,
+> `serve`, `bench`, `tokenize` and `inspect` commands.
 
 ## Build
 
@@ -34,6 +36,13 @@ performance cores on Apple Silicon, else one per physical core), and
 
 `nibble bench -m <model.gguf>` measures prompt and decode speed the way
 `llama-bench` does (`pp512`, `tg128`), so the numbers compare directly.
+
+`--draft N` (on `run`, `chat` and `serve`) drafts up to N tokens after each
+token with the model's MTP head, if the file has one (`nibble inspect`
+shows `nextn_predict_layers`), and checks them all in one forward pass.
+The tokens generated are the same as without it. On an M4 Max, Qwen3.5-4B
+Q8_0 decodes at about 131 tok/s with `--draft 3` on Metal (73 without) and
+80 on the CPU (49); 2 or 3 drafts are best.
 
 ## OpenAI-compatible server
 
@@ -58,10 +67,49 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   prefix is reused between requests. For Qwen3.5, whose recurrent state
   cannot be rewound, the session keeps checkpoints, so a new chat turn does
   not re-evaluate the conversation.
+- `reasoning_effort` `none` or `minimal` turns Qwen's thinking off, the
+  other levels on (an explicit `enable_thinking` wins).
+- `usage.prompt_tokens_details.cached_tokens` reports the prompt tokens
+  reused from the cache; `/v1/models` reports the context size as
+  `max_model_len` and `context_length`.
+- `nibble serve` prints a line per request: prompt tokens (cached and
+  evaluated), generation speed, and drafts accepted.
 - Rejected with a 400: images, `n > 1`, and forced tool calls
   (`tool_choice: "required"` or a named function), which need constrained
   decoding.
 - Checked with the official OpenAI Python client.
+
+### Coding harnesses
+
+Agent harnesses that speak the OpenAI chat API can use the server as a
+provider; give it a context large enough for the harness's system prompt
+and tools, and drafting if the model has an MTP head:
+
+```sh
+./target/release/nibble serve -m models/Qwen3.5-4B-Q8_0.gguf -c 32768 --draft 3 \
+    --port 8080 --model-id qwen3.5-4b
+```
+
+For example, in [Yawl](https://github.com/alan13367/yawl)'s
+`~/.yawl/config.json`:
+
+```json
+{
+  "model": "nibble:qwen3.5-4b",
+  "providers": {
+    "nibble": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "models": [{ "id": "qwen3.5-4b", "reasoning_efforts": ["minimal", "high"] }]
+    }
+  }
+}
+```
+
+`yawl --reasoning minimal` then answers without thinking. The first request
+evaluates the harness's whole system prompt (about 2,000 tokens for Yawl,
+some 9 s on the 4B today: prompt processing is not optimized yet); later
+requests reuse it from the cache.
 
 ## Inspecting files
 

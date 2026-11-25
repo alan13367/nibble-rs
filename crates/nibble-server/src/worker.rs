@@ -75,17 +75,19 @@ pub(crate) enum Event {
     Done {
         finish: Finish,
         prompt_tokens: usize,
+        /// Prompt tokens reused from the last request instead of evaluated.
+        cached_tokens: usize,
         completion_tokens: usize,
     },
     Error(String),
 }
 
 /// Serves jobs until every sender is dropped.
-pub(crate) fn run(model: &Model, options: SessionOptions, jobs: &Receiver<Job>) {
+pub(crate) fn run(model: &Model, options: SessionOptions, log: bool, jobs: &Receiver<Job>) {
     match model.session(options) {
         Ok(mut session) => {
             for job in jobs {
-                serve(&mut session, job);
+                serve(&mut session, job, log);
             }
         }
         Err(e) => {
@@ -97,7 +99,9 @@ pub(crate) fn run(model: &Model, options: SessionOptions, jobs: &Receiver<Job>) 
     }
 }
 
-fn serve(session: &mut Session<'_>, job: Job) {
+fn serve(session: &mut Session<'_>, job: Job, log: bool) {
+    let started = std::time::Instant::now();
+    let drafts_before = session.draft_stats();
     let n_ctx = session.n_ctx();
     if job.prompt.is_empty() {
         let _ = job.events.send(Event::Error("the prompt is empty".into()));
@@ -127,6 +131,7 @@ fn serve(session: &mut Session<'_>, job: Job) {
 
     let tokenizer = session.model().tokenizer();
     let mut sampler = Sampler::new(job.sampler);
+    let mut first_token = None;
     let mut decoder = StreamDecoder::new();
     let mut stops = StopMatcher::new(job.stop);
     // Log-probabilities of tokens whose text is not released yet.
@@ -139,6 +144,7 @@ fn serve(session: &mut Session<'_>, job: Job) {
         &mut sampler,
         job.max_tokens,
         |token, logits| {
+            first_token.get_or_insert_with(std::time::Instant::now);
             completion_tokens += 1;
             if let Some(n_top) = job.logprobs {
                 pending.push(TokenLogprob::new(tokenizer, token, logits, n_top));
@@ -180,6 +186,30 @@ fn serve(session: &mut Session<'_>, job: Job) {
     let _ = job.events.send(Event::Done {
         finish,
         prompt_tokens: job.prompt.len(),
+        cached_tokens: keep,
         completion_tokens,
     });
+    if log {
+        let prompt_end = first_token.unwrap_or_else(std::time::Instant::now);
+        let prompt_secs = (prompt_end - started).as_secs_f64();
+        let gen_secs = prompt_end.elapsed().as_secs_f64();
+        let new = job.prompt.len() - keep;
+        let d = session.draft_stats();
+        let drafts = if d.drafted > drafts_before.drafted {
+            let (drafted, accepted) = (
+                d.drafted - drafts_before.drafted,
+                d.accepted - drafts_before.accepted,
+            );
+            format!(", drafts {accepted}/{drafted} accepted")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "nibble: prompt {} tokens ({keep} cached, {new} in {prompt_secs:.2} s, {:.0} tok/s), generated {completion_tokens} in {gen_secs:.2} s ({:.1} tok/s), {}{drafts}",
+            job.prompt.len(),
+            new as f64 / prompt_secs.max(1e-9),
+            completion_tokens.saturating_sub(1) as f64 / gen_secs.max(1e-9),
+            finish.as_str(),
+        );
+    }
 }

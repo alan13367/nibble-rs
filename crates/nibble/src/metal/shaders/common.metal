@@ -65,23 +65,29 @@ typedef struct {
 
 // `MatvecArgs` in `metal/kernels.rs`: `dst = W · x` (or as `mode` says) for
 // `rows` rows of `cols` elements, rows `row_bytes` apart; `nsg` simdgroups
-// per threadgroup.
+// per threadgroup; `ncols` inputs `x` of `cols` values one after another,
+// their outputs (`rows` values each) one after another in `dst`.
 struct MatvecArgs {
     uint cols;
     uint rows;
     uint row_bytes;
     uint nsg;
     uint mode;
-    uint pad;
+    uint ncols;
 };
 
-// `EmbedArgs`: decode row `row` (of `cols` elements) of a weight matrix.
+// `EmbedArgs`: decode row `row` (of `cols` elements) of a weight matrix, or
+// with `from_slot` the row the token slot (`slot[0]`) holds.
 struct EmbedArgs {
     uint cols;
     uint row;
     uint row_bytes;
-    uint pad;
+    uint from_slot;
 };
+
+static inline uint embed_row(constant EmbedArgs & a, device const uint * slot) {
+    return a.from_slot != 0 ? slot[0] : a.row;
+}
 
 
 static inline float silu(float x) {
@@ -159,7 +165,12 @@ static inline device const char * matrix_row(device const char * w, device const
 }
 
 // The entry point of a matrix-vector kernel `name` whose body is
-// `impl<NR0>(a, w, w2, x, dst, shmem, tgpig, tiisg, sgitg)`.
+// `impl<NR0>(a, w, w2, x, dst, shmem, tgpig, tiisg, sgitg)`, run for each
+// of the `ncols` inputs in turn: each input's output is computed exactly as
+// in a dispatch of its own, and the threadgroup reads its weight rows from
+// memory once, from its cache for the later inputs. The barrier keeps the
+// next input's reduction from overwriting threadgroup memory that a
+// simdgroup still reads.
 #define MATVEC_KERNEL(name, impl, NR0) \
 kernel void name( \
         constant MatvecArgs & a [[buffer(0)]], \
@@ -171,7 +182,80 @@ kernel void name( \
         uint3 tgpig [[threadgroup_position_in_grid]], \
         ushort tiisg [[thread_index_in_simdgroup]], \
         ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    impl<NR0>(a, w, w2, x, dst, shmem, tgpig, tiisg, sgitg); \
+    for (uint c = 0; c < a.ncols; ++c) { \
+        if (c > 0) { \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        impl<NR0>(a, w, w2, x + (uint64_t) c * a.cols, dst + (uint64_t) c * a.rows, shmem, tgpig, tiisg, sgitg); \
+    } \
+}
+
+// The entry point of a matrix-vector kernel `name` whose body
+// `impl<NR0, NC>(a, w, w2, x, dst, nc, shmem, tgpig, tiisg, sgitg)` takes
+// `nc` (at most `NC`) inputs at once, reading and decoding each weight
+// once for all of them; each input's arithmetic is that of `NC = 1`, so its
+// output is the same. The inputs go in groups of `NC`, group `tgpig.y` to
+// each threadgroup.
+#define MATVEC_KERNEL_NC(name, impl, NR0, NC) \
+kernel void name( \
+        constant MatvecArgs & a [[buffer(0)]], \
+        device const char * w [[buffer(1)]], \
+        device const float * x [[buffer(2)]], \
+        device float * dst [[buffer(3)]], \
+        device const char * w2 [[buffer(4)]], \
+        threadgroup char * shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    const uint c = tgpig.y * NC; \
+    if (c >= a.ncols) { \
+        return; \
+    } \
+    const short nc = (short) min((uint) NC, a.ncols - c); \
+    impl<NR0, NC>(a, w, w2, x + (uint64_t) c * a.cols, dst + (uint64_t) c * a.rows, nc, shmem, tgpig, tiisg, sgitg); \
+}
+
+// `reduce_and_write` for each of `nc` inputs whose sums are in `sumf`,
+// outputs `rows` apart.
+template <short NR0, short NC>
+static inline void reduce_and_write_nc(
+        constant MatvecArgs & a,
+        device float * dst,
+        thread float (*sumf)[NR0],
+        short nc,
+        int r0,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem) {
+    for (short c = 0; c < NC; ++c) {
+        if (c > 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (c < nc) {
+            reduce_and_write<NR0>(a, dst + (uint64_t) c * a.rows, sumf[c], r0, tiisg, sgitg, shmem);
+        }
+    }
+}
+
+// The simdgroup sums of each of `nc` inputs (one simdgroup's rows), stored.
+template <short NR0, short NC>
+static inline void simd_write_nc(
+        constant MatvecArgs & a,
+        device float * dst,
+        thread float (*sumf)[NR0],
+        short nc,
+        int r0,
+        ushort tiisg) {
+    for (short c = 0; c < NC; ++c) {
+        if (c < nc) {
+            for (short row = 0; row < NR0; ++row) {
+                sumf[c][row] = simd_sum(sumf[c][row]);
+            }
+            if (tiisg == 0) {
+                store_rows<NR0>(a, dst + (uint64_t) c * a.rows, r0, sumf[c]);
+            }
+        }
+    }
 }
 
 // The sum of `v` over the threadgroup's `nsg` simdgroups, returned to every

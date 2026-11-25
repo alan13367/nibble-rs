@@ -72,6 +72,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     let mut options = ServerOptions::new(model_id.clone());
     options.api_key = api_key;
     options.session = model_opts.session_options();
+    options.log_requests = true;
 
     // A throwaway session reports the context and the hardware the
     // server's own session will use; its buffers are not touched.

@@ -30,6 +30,9 @@ pub struct ServerOptions {
     pub max_connections: usize,
     /// Idle time after which a keep-alive connection is closed.
     pub idle_timeout: Duration,
+    /// Print a line on stderr for each finished generation: tokens, how
+    /// many of the prompt's were cached, speed, and drafts accepted.
+    pub log_requests: bool,
 }
 
 impl ServerOptions {
@@ -42,6 +45,7 @@ impl ServerOptions {
             session: SessionOptions::default(),
             max_connections: 64,
             idle_timeout: Duration::from_secs(60),
+            log_requests: false,
         }
     }
 }
@@ -67,10 +71,10 @@ pub fn serve(listener: TcpListener, model: Model, options: ServerOptions) -> io:
     let model = Arc::new(model);
     let (jobs, queue) = mpsc::channel::<Job>();
     let worker_model = Arc::clone(&model);
-    let session = options.session;
+    let (session, log) = (options.session, options.log_requests);
     std::thread::Builder::new()
         .name("nibble-worker".into())
-        .spawn(move || worker::run(&worker_model, session, &queue))?;
+        .spawn(move || worker::run(&worker_model, session, log, &queue))?;
 
     let shared = Arc::new(Shared {
         model,
@@ -259,7 +263,13 @@ fn route(
     }
     let result = match (method, path) {
         ("GET" | "HEAD", "/v1/models") => {
-            let body = openai::models(&shared.options.model_id, shared.started).to_string();
+            let n_ctx = shared.options.session.n_ctx;
+            let n_ctx = if n_ctx == 0 {
+                shared.model.config().n_ctx_train
+            } else {
+                n_ctx.min(shared.model.config().n_ctx_train)
+            };
+            let body = openai::models(&shared.options.model_id, shared.started, n_ctx).to_string();
             let response = with_cors(Response::json(200, body));
             http::write_response(w, &response, keep_alive, method == "HEAD")?;
             return Ok(true);
@@ -483,6 +493,7 @@ fn collect_chat(
             Event::Done {
                 finish,
                 prompt_tokens,
+                cached_tokens,
                 completion_tokens,
             } => {
                 add(output.finish());
@@ -492,7 +503,7 @@ fn collect_chat(
                     tool_calls: &calls,
                     logprobs: logprobs.then_some(&tokens[..]),
                 };
-                let usage = openai::usage(prompt_tokens, completion_tokens);
+                let usage = openai::usage(prompt_tokens, cached_tokens, completion_tokens);
                 let finish = output.finish_reason(finish);
                 return Ok(openai::chat_completion(meta, &reply, finish, usage));
             }
@@ -543,13 +554,14 @@ fn stream_chat(
             Event::Done {
                 finish,
                 prompt_tokens,
+                cached_tokens,
                 completion_tokens,
             } => {
                 send(&mut sse, output.finish(), &[])?;
                 let finish = output.finish_reason(finish);
                 sse.send(&chunk(&Delta::Empty, None, Some(finish)))?;
                 if include_usage {
-                    let usage = openai::usage(prompt_tokens, completion_tokens);
+                    let usage = openai::usage(prompt_tokens, cached_tokens, completion_tokens);
                     sse.send(
                         &openai::usage_chunk(meta, "chat.completion.chunk", usage).to_string(),
                     )?;
@@ -601,10 +613,11 @@ fn complete(
                 Event::Done {
                     finish,
                     prompt_tokens,
+                    cached_tokens,
                     completion_tokens,
                 } => {
                     let logprobs = want_logprobs.then(|| openai::completion_logprobs(&tokens, 0));
-                    let usage = openai::usage(prompt_tokens, completion_tokens);
+                    let usage = openai::usage(prompt_tokens, cached_tokens, completion_tokens);
                     let body =
                         openai::text_completion(&meta, &text, logprobs, Some(finish), Some(usage));
                     return Ok(send_json(w, 200, &body, keep_alive).is_ok());
@@ -633,13 +646,14 @@ fn complete(
                 Event::Done {
                     finish,
                     prompt_tokens,
+                    cached_tokens,
                     completion_tokens,
                 } => {
                     sse.send(
                         &openai::text_completion(&meta, "", None, Some(finish), None).to_string(),
                     )?;
                     if req.generation.include_usage {
-                        let usage = openai::usage(prompt_tokens, completion_tokens);
+                        let usage = openai::usage(prompt_tokens, cached_tokens, completion_tokens);
                         sse.send(
                             &openai::usage_chunk(&meta, "text_completion", usage).to_string(),
                         )?;

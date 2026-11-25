@@ -415,6 +415,30 @@ impl<T> SegmentChunks<'_, T> {
         self.segments
     }
 
+    /// The chunks of segments `first..first + N`, all at once.
+    ///
+    /// # Panics
+    ///
+    /// If those are not all segments of the slice.
+    pub(crate) fn segments_mut<const N: usize>(&mut self, first: usize) -> [&mut [T]; N] {
+        assert!(
+            first + N <= self.segments,
+            "segments {first}..{} of {}",
+            first + N,
+            self.segments
+        );
+        std::array::from_fn(|i| {
+            let at = (first + i) * self.segment_len;
+            // SAFETY: as in `segment`; the `N` segments are different, so
+            // their chunks do not overlap, and `&mut self` keeps them the
+            // only live results of this handle.
+            unsafe {
+                self.data
+                    .get_mut(at + self.range.start..at + self.range.end)
+            }
+        })
+    }
+
     /// The chunk of segment `s`.
     ///
     /// # Panics

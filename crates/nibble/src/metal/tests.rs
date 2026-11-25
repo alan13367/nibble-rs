@@ -124,6 +124,67 @@ fn every_supported_type_has_kernels() {
     assert_eq!(TYPES, crate::quant::SUPPORTED);
 }
 
+/// A product over several inputs gives each input, bit for bit, the output
+/// of a product over that input alone: for every weight type and mode, and
+/// numbers of inputs that use each kernel width and group them.
+#[test]
+fn batched_matvec_equals_one_input_at_a_time() {
+    let Some((device, pipelines)) = gpu() else {
+        return;
+    };
+    for ty in TYPES {
+        for (rows, cols) in [(65, 1024), (130, 3584), (9, 4160)] {
+            if cols % block_size(ty) != 0 {
+                continue;
+            }
+            let (bytes, w, _) = matrix(ty, rows, cols, 300);
+            let (up_bytes, mut up, _) = matrix(ty, rows, cols, 700);
+            up.offset = bytes.len();
+            let largest = bytes.len().max(up_bytes.len());
+            let all = [bytes, up_bytes].concat();
+            let wbuf = Weights::build(&device, &all, false, largest, usize::MAX).unwrap();
+            for output in [Output::Store, Output::Add, Output::SwiGlu(&up)] {
+                let run = |x: &[f32], initial: &[f32], ncols: usize| {
+                    let (xbuf, out) = (floats(&device, x), floats(&device, initial));
+                    let mut commands = device.commands().unwrap();
+                    encode_matvec(
+                        &mut commands,
+                        &pipelines,
+                        &wbuf,
+                        &w,
+                        (&xbuf, 0),
+                        (&out, 0),
+                        output,
+                        ncols,
+                    )
+                    .unwrap();
+                    commands.commit();
+                    commands.wait().unwrap();
+                    read(&out, initial.len())
+                };
+                for ncols in [2, 3, 4, 5, 8] {
+                    let x = values(ncols * cols, 17 + ncols as u32);
+                    let initial = values(ncols * rows, 23);
+                    let all = run(&x, &initial, ncols);
+                    for c in 0..ncols {
+                        let alone = run(
+                            &x[c * cols..(c + 1) * cols],
+                            &initial[c * rows..(c + 1) * rows],
+                            1,
+                        );
+                        let got = &all[c * rows..(c + 1) * rows];
+                        let same = got
+                            .iter()
+                            .zip(&alone)
+                            .all(|(a, b)| a.to_bits() == b.to_bits());
+                        assert!(same, "{ty} {rows}x{cols} {output:?}: input {c} of {ncols}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn matvec_matches_cpu_reference() {
     let Some((device, pipelines)) = gpu() else {
@@ -173,6 +234,7 @@ fn matvec_matches_cpu_reference() {
                     (&xbuf, 0),
                     (&out, 0),
                     output,
+                    1,
                 )
                 .unwrap();
                 commands.commit();
@@ -212,21 +274,24 @@ fn embed_matches_dequantize() {
         let cols = 1024;
         let (bytes, w, decoded) = matrix(ty, 4, cols, 1000);
         let wbuf = device.buffer_with(&bytes).unwrap();
-        for row in [0, 3] {
+        // The row from the arguments, and from a token slot.
+        for (row, from_slot) in [(0, false), (3, false), (2, true)] {
             let out = device.buffer(4 * cols).unwrap();
+            let slot = device.buffer_with(&(row as u32).to_le_bytes()).unwrap();
             let mut commands = device.commands().unwrap();
             commands.set_pipeline(pipeline);
             commands.set_bytes(
                 0,
                 &EmbedArgs {
                     cols: cols as u32,
-                    row: row as u32,
+                    row: if from_slot { 0 } else { row as u32 },
                     row_bytes: w.row_bytes as u32,
-                    pad: 0,
+                    from_slot: u32::from(from_slot),
                 },
             );
             commands.set_buffer(1, &wbuf, 0);
             commands.set_buffer(2, &out, 0);
+            commands.set_buffer(3, &slot, 0);
             let threads = cols.div_ceil(per_thread);
             commands.dispatch(Size::new(threads.div_ceil(64), 1, 1), Size::new(64, 1, 1));
             commands.commit();
@@ -409,4 +474,21 @@ fn uncovered_attention_shapes_fail_when_the_backend_starts() {
         largest_tensor: 0,
     };
     assert!(MetalBackend::new(data, 16).is_ok());
+}
+
+/// The kernels for several inputs that are built all reproduce the one-input
+/// kernels on this device, so the check when the backend starts keeps them.
+#[test]
+fn every_wide_kernel_passes_the_startup_check() {
+    let Some((device, mut pipelines)) = gpu() else {
+        return;
+    };
+    let before: Vec<(GgmlType, Vec<usize>)> = TYPES
+        .iter()
+        .map(|&ty| (ty, pipelines.matvec(ty).unwrap().widths()))
+        .collect();
+    super::check_wide_matvecs(&device, &mut pipelines).unwrap();
+    for (ty, widths) in before {
+        assert_eq!(pipelines.matvec(ty).unwrap().widths(), widths, "{ty}");
+    }
 }

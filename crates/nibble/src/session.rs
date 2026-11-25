@@ -466,10 +466,10 @@ impl<'m> Session<'m> {
     /// rewind their state, except into the last evaluation when it had 2 to
     /// 16 tokens (a draft being verified), so otherwise the session goes
     /// back to the latest checkpoint at or before `len` and evaluates the
-    /// tokens after it. A checkpoint is taken [`CHECKPOINT_TAIL`] tokens
-    /// before the end of every evaluation of at least that many tokens: in
-    /// a chat, the next turn's prompt usually diverges from the last one
-    /// just there.
+    /// tokens after it, then keeps a checkpoint at `len`. A checkpoint is
+    /// also taken [`CHECKPOINT_TAIL`] tokens before the end of every
+    /// evaluation of at least that many tokens: in a chat, the next turn's
+    /// prompt usually diverges from the last one just there.
     ///
     /// # Errors
     ///
@@ -511,6 +511,12 @@ impl<'m> Session<'m> {
             for batch in self.tokens[from..].chunks(self.n_batch) {
                 model.forward(b, state, batch, pos, None)?;
                 pos += batch.len();
+            }
+            // Where the sequence was cut is where the next one is likely to
+            // diverge too (a client resending a shared prefix, such as a
+            // harness's system prompt): keep the state there.
+            if len > from {
+                checkpoint(model, b, state, len, &mut self.checkpoints)?;
             }
             Ok(len - from)
         })
@@ -699,40 +705,29 @@ impl<'m> Session<'m> {
 
     /// Drafts up to `max` tokens after `token`, which is to be evaluated at
     /// the next position, into `self.drafts`: each the head's most likely
-    /// token, stopping after an end-of-generation token.
+    /// token (chosen on the device, the steps not waited for one by one),
+    /// cut after an end-of-generation token.
     fn draft(&mut self, token: u32, max: usize) -> Result<()> {
         self.drafts.clear();
         if max == 0 {
             return Ok(());
         }
         let model = self.model;
-        let n_vocab = model.config().n_vocab;
-        self.draft_logits.resize(n_vocab, 0.0);
         let pos = self.tokens.len();
+        self.drafts.resize(max, 0);
         on_engine!(&mut self.engine, |b, state| {
-            let mut t = token;
-            for i in 0..max {
-                model.draft(b, state, t, pos + i, i == 0, &mut self.draft_logits)?;
-                t = argmax(&self.draft_logits);
-                self.drafts.push(t);
-                if model.tokenizer().is_end_of_generation(t) {
-                    break;
-                }
-            }
+            model.draft_chain(b, state, token, pos, &mut self.drafts)?;
         });
+        let tokenizer = model.tokenizer();
+        if let Some(end) = self
+            .drafts
+            .iter()
+            .position(|&t| tokenizer.is_end_of_generation(t))
+        {
+            self.drafts.truncate(end + 1);
+        }
         Ok(())
     }
-}
-
-/// The index of the largest value (the first of equal ones).
-fn argmax(x: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, &v) in x.iter().enumerate() {
-        if v > x[best] {
-            best = i;
-        }
-    }
-    best as u32
 }
 
 /// Saves what `state` cannot rewind at position `n_pos`, evicting the

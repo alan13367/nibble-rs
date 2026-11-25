@@ -785,6 +785,58 @@ fn dot_by<const N: usize>(a: &[[u8; N]], b: &[[u8; N]], decode: impl Fn(&[u8; N]
     ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]))
 }
 
+/// A row of `cols` weights of type `ty` (a supported type; `cols` a multiple
+/// of its block size) from a fixed generator, with finite scales: inputs for
+/// a backend to check its kernels with when it starts.
+#[cfg(target_os = "macos")]
+pub(crate) fn sample_row(ty: GgmlType, cols: usize, seed: u32) -> Vec<u8> {
+    let mut s = seed.wrapping_mul(2_654_435_761).max(1);
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    let values: Vec<f32> = (0..cols)
+        .map(|_| (next() >> 8) as f32 / 8_388_608.0 - 1.0)
+        .collect();
+    match ty {
+        GgmlType::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        GgmlType::F16 => values
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect(),
+        GgmlType::Bf16 => values
+            .iter()
+            .flat_map(|&v| f32_to_bf16(v).to_le_bytes())
+            .collect(),
+        GgmlType::Q8_0 => {
+            let mut out = vec![0; cols / QK8_0 * Q8_0_BLOCK_BYTES];
+            quantize_row_q8_0(&values, &mut out, Q8_0Inverse::NATIVE);
+            out
+        }
+        _ => {
+            // Random bytes, with small finite f16 scales.
+            let n = ty.layout().map_or(0, |l| l.type_size as usize);
+            let mut row: Vec<u8> = (0..cols / QK_K * n).map(|_| (next() >> 11) as u8).collect();
+            let (d, dmin) = (0x2E66u16.to_le_bytes(), 0x2A3Du16.to_le_bytes());
+            for block in row.chunks_exact_mut(n.max(1)) {
+                match ty {
+                    GgmlType::Q4K | GgmlType::Q5K => {
+                        block[..2].copy_from_slice(&d);
+                        block[2..4].copy_from_slice(&dmin);
+                    }
+                    GgmlType::Q6K => block[208..210].copy_from_slice(&d),
+                    GgmlType::Q3K => block[108..110].copy_from_slice(&d),
+                    GgmlType::Iq4Xs => block[..2].copy_from_slice(&d),
+                    _ => {}
+                }
+            }
+            row
+        }
+    }
+}
+
 /// Deterministic inputs for the kernel tests. The llama.cpp reference values
 /// the tests compare with were computed from the same generators.
 #[cfg(test)]

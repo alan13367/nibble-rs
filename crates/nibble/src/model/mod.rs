@@ -259,6 +259,23 @@ impl Model {
         })
     }
 
+    /// `drafts.len()` greedy draft steps of the MTP head (the state has its
+    /// state) after `token` at `pos`, chosen on the device.
+    pub(crate) fn draft_chain<B: Backend>(
+        &self,
+        b: &mut B,
+        state: &mut State<B>,
+        token: u32,
+        pos: usize,
+        drafts: &mut [u32],
+    ) -> Result<()> {
+        let c = &self.config;
+        match (&self.arch, state) {
+            (Arch::Qwen35(m), State::Qwen35(s)) => m.draft_chain(b, c, s, token, pos, drafts),
+            _ => unreachable!("drafting on a model without an MTP head"),
+        }
+    }
+
     /// One draft step of the MTP head (the state has its state): `token`
     /// at `pos`, the position after the state's, paired with the trunk's
     /// last hidden state (`first`) or the head's output at the step before;

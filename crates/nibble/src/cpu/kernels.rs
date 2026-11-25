@@ -107,6 +107,34 @@ impl Kernels {
         }
     }
 
+    /// [`Kernels::dot_rows`] for `N` encoded inputs at once, one output each,
+    /// if this type has a kernel that shares the weights' loads between
+    /// them (false otherwise, writing nothing). Each output is what
+    /// [`Kernels::dot_rows`] gives for its input.
+    pub(crate) fn dot_rows_n<const N: usize>(
+        self,
+        ty: GgmlType,
+        rows: &[u8],
+        row_bytes: usize,
+        xq: [&[u8]; N],
+        out: [&mut [f32]; N],
+    ) -> bool {
+        match self {
+            // No shared-load kernels: the caller takes the inputs one by one.
+            Self::Scalar => {
+                let _ = (ty, rows, row_bytes, xq, out);
+                false
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2(_) => {
+                let _ = (ty, rows, row_bytes, xq, out);
+                false
+            }
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.dot_rows_n(ty, rows, row_bytes, xq, out),
+        }
+    }
+
     /// `out[r] = a_r · b`, where `a_r` is the f16 vector of `b.len()`
     /// little-endian values at byte `r * stride` of `a` (the cached keys of
     /// a head, or its rows of transposed values) and `b` is f32. Each result

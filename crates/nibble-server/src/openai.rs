@@ -155,6 +155,24 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatRequest, ApiError> {
             ));
         }
     };
+    // Harnesses that speak to reasoning models send `reasoning_effort`; for
+    // a model that can only think or not, the lowest efforts turn it off.
+    // Levels other clients invent (`max`, `ultra`, ...) leave the default.
+    let enable_thinking = match (enable_thinking, v.get("reasoning_effort")) {
+        (Some(b), _) => Some(b),
+        (None, Some(Json::String(effort))) => match effort.as_str() {
+            "none" | "minimal" => Some(false),
+            "low" | "medium" | "high" | "xhigh" | "max" => Some(true),
+            _ => None,
+        },
+        (None, None | Some(Json::Null)) => None,
+        (None, Some(_)) => {
+            return Err(ApiError::invalid(
+                "`reasoning_effort` must be a string",
+                Some("reasoning_effort"),
+            ));
+        }
+    };
     let tools = parse_tools(&v)?;
     let parse_tool_calls = parse_tool_choice(&v)? && !tools.is_empty();
     let parallel_tool_calls = match v.get("parallel_tool_calls") {
@@ -563,13 +581,19 @@ pub(crate) struct ResponseMeta<'a> {
     pub(crate) model: &'a str,
 }
 
-pub(crate) fn usage(prompt_tokens: usize, completion_tokens: usize) -> Json {
+/// Token counts, with the prompt tokens reused from the last request's
+/// cache under OpenAI's `prompt_tokens_details.cached_tokens`.
+pub(crate) fn usage(prompt_tokens: usize, cached_tokens: usize, completion_tokens: usize) -> Json {
     Json::object([
         ("prompt_tokens", Json::from(prompt_tokens)),
         ("completion_tokens", Json::from(completion_tokens)),
         (
             "total_tokens",
             Json::from(prompt_tokens + completion_tokens),
+        ),
+        (
+            "prompt_tokens_details",
+            Json::object([("cached_tokens", Json::from(cached_tokens))]),
         ),
     ])
 }
@@ -775,12 +799,17 @@ pub(crate) fn text_completion(
     envelope(meta, "text_completion", Json::array([choice]), usage)
 }
 
-pub(crate) fn models(id: &str, created: u64) -> Json {
+/// The `/v1/models` listing. The context length is given under the names
+/// vLLM (`max_model_len`) and OpenRouter (`context_length`) use, which
+/// clients such as coding harnesses read to size their prompts.
+pub(crate) fn models(id: &str, created: u64, n_ctx: usize) -> Json {
     let model = Json::object([
         ("id", Json::from(id)),
         ("object", Json::from("model")),
         ("created", Json::from(created)),
         ("owned_by", Json::from("nibble")),
+        ("max_model_len", Json::from(n_ctx)),
+        ("context_length", Json::from(n_ctx)),
     ]);
     Json::object([
         ("object", Json::from("list")),
@@ -900,6 +929,36 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_switches_thinking() {
+        let parse = |extra: &str| {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"x"}}]{extra}}}"#);
+            parse_chat(body.as_bytes()).map(|r| r.enable_thinking)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse(r#","reasoning_effort":"none""#).unwrap(), Some(false));
+        assert_eq!(
+            parse(r#","reasoning_effort":"minimal""#).unwrap(),
+            Some(false)
+        );
+        assert_eq!(parse(r#","reasoning_effort":"high""#).unwrap(), Some(true));
+        // An explicit template argument wins.
+        let both = r#","reasoning_effort":"high","chat_template_kwargs":{"enable_thinking":false}"#;
+        assert_eq!(parse(both).unwrap(), Some(false));
+        assert_eq!(parse(r#","reasoning_effort":"max""#).unwrap(), Some(true));
+        assert_eq!(parse(r#","reasoning_effort":"ultra""#).unwrap(), None);
+        assert!(parse(r#","reasoning_effort":3"#).is_err());
+    }
+
+    #[test]
+    fn models_report_the_context_length() {
+        let m = models("tiny", 5, 4096).to_string();
+        assert!(
+            m.contains(r#""max_model_len":4096"#) && m.contains(r#""context_length":4096"#),
+            "{m}"
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_and_invalid_requests() {
         let cases: &[(&[u8], Option<&str>)] = &[
             (b"not json", None),
@@ -1003,10 +1062,10 @@ mod tests {
             tool_calls: &[],
             logprobs: None,
         };
-        let body = chat_completion(&meta, &reply, Finish::Stop, usage(3, 1)).to_string();
+        let body = chat_completion(&meta, &reply, Finish::Stop, usage(3, 0, 1)).to_string();
         assert_eq!(
             body,
-            r#"{"id":"chatcmpl-1","object":"chat.completion","created":5,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":5,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4,"prompt_tokens_details":{"cached_tokens":0}}}"#
         );
         let chunk = chat_chunk(&meta, &Delta::Content("hi"), None, None).to_string();
         assert!(
@@ -1044,7 +1103,7 @@ mod tests {
             tool_calls: std::slice::from_ref(&call),
             logprobs: Some(&logprobs),
         };
-        let body = chat_completion(&meta, &reply, Finish::ToolCalls, usage(1, 1)).to_string();
+        let body = chat_completion(&meta, &reply, Finish::ToolCalls, usage(1, 0, 1)).to_string();
         assert!(body.contains(r#""message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}"#), "{body}");
         assert!(body.contains(r#""logprobs":{"content":[{"token":"Hi","logprob":-0.5,"bytes":[72,105],"top_logprobs":[{"token":"Hi","logprob":-0.5,"bytes":[72,105]},{"token":" Hey","logprob":-1.5,"bytes":[32,72,101,121]}]}],"refusal":null}"#), "{body}");
         assert!(body.contains(r#""finish_reason":"tool_calls""#));

@@ -887,3 +887,26 @@ fn drafting_does_not_change_generation() {
         }
     }
 }
+
+/// A rewind that has to replay keeps a checkpoint where it stopped, so a
+/// second rewind to the same point (a client resending a shared prefix)
+/// replays nothing.
+#[test]
+fn a_replayed_rewind_leaves_a_checkpoint() {
+    let model = Weights::new().model();
+    let n_vocab = model.config().n_vocab as u32;
+    let t: Vec<u32> = (0..30u32).map(|i| (i * 31 + 5) % n_vocab).collect();
+    let mut s = session(&model);
+    s.eval(&t[..20]).unwrap();
+    s.eval(&[t[20]]).unwrap();
+    // The only checkpoint is 4 tokens before the end of the 20: at 16.
+    assert_eq!(s.truncate(10).unwrap(), 10);
+    for &x in &t[21..25] {
+        s.eval(&[x]).unwrap();
+    }
+    assert_eq!(s.truncate(10).unwrap(), 0);
+    let got = s.eval(&[t[29]]).unwrap().to_vec();
+    let mut want: Vec<u32> = t[..10].to_vec();
+    want.push(t[29]);
+    assert_eq!(session(&model).eval(&want).unwrap(), &got[..]);
+}

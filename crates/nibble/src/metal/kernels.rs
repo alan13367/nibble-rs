@@ -36,9 +36,9 @@ macro_rules! kernel_args {
 
 kernel_args! {
     /// `dst = W · x`, or as `mode` says.
-    struct MatvecArgs { cols: u32, rows: u32, row_bytes: u32, nsg: u32, mode: u32, pad: u32 }
+    struct MatvecArgs { cols: u32, rows: u32, row_bytes: u32, nsg: u32, mode: u32, ncols: u32 }
     /// Decode row `row` of a matrix.
-    struct EmbedArgs { cols: u32, row: u32, row_bytes: u32, pad: u32 }
+    struct EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     struct RmsArgs { n: u32, eps: f32 }
     struct CountArgs { n: u32 }
     struct AttentionArgs {
@@ -49,6 +49,11 @@ kernel_args! {
     struct DeltaArgs {
         n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32, rows: u32,
         oldest: u32, store: u32, pending: u32, eps: f32, scale: f32,
+    }
+    struct DeltaBatchArgs {
+        n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32, rows: u32,
+        oldest: u32, replay: u32, n: u32, pending: u32, ba_read: u32, ba_write: u32, eps: f32,
+        scale: f32,
     }
 }
 
@@ -62,6 +67,9 @@ pub(crate) const MATVEC_SWIGLU: u32 = 2;
 #[derive(Debug)]
 pub(crate) struct Matvec {
     pipeline: Pipeline,
+    /// Kernels that take several inputs at once (`{name}_c{NC}`), by `NC`,
+    /// with their rows (as `nr0`).
+    wide: Vec<(usize, Pipeline, usize)>,
     /// Simdgroups per threadgroup (fixed for quantized types; float types
     /// use `min(4, ceil(cols / 128))`).
     nsg: Option<u32>,
@@ -74,8 +82,32 @@ pub(crate) struct Matvec {
 }
 
 impl Matvec {
-    pub(crate) fn pipeline(&self) -> &Pipeline {
-        &self.pipeline
+    /// The kernel for a product of `ncols` inputs, its rows (as `nr0`) and
+    /// the inputs each threadgroup takes: the one-input kernel for one (it
+    /// also takes several, one after another), else the widest kernel of at
+    /// most 2 inputs for 2 and of at most 4 for more, whose threadgroups
+    /// take a group of inputs each (more than 4 are measured faster as
+    /// groups of 4 than in fewer, wider threadgroups).
+    pub(crate) fn pipeline(&self, ncols: usize) -> (&Pipeline, usize, usize) {
+        let want = match ncols {
+            0 | 1 => return (&self.pipeline, self.nr0, 1),
+            2 => 2,
+            _ => 4,
+        };
+        self.wide
+            .iter()
+            .rfind(|(nc, ..)| *nc <= want)
+            .map_or((&self.pipeline, self.nr0, 1), |(nc, p, nr0)| (p, *nr0, *nc))
+    }
+
+    /// Inputs per threadgroup of the kernels for several inputs.
+    pub(crate) fn widths(&self) -> Vec<usize> {
+        self.wide.iter().map(|(nc, ..)| *nc).collect()
+    }
+
+    /// Stops using the kernel for `nc` inputs.
+    pub(crate) fn drop_width(&mut self, nc: usize) {
+        self.wide.retain(|(n, ..)| *n != nc);
     }
 
     /// Simdgroups for a product with `cols` columns.
@@ -84,23 +116,38 @@ impl Matvec {
             .unwrap_or_else(|| cols.div_ceil(128).clamp(1, 4) as u32)
     }
 
-    /// Threadgroups and threads per threadgroup for `rows` rows.
-    pub(crate) fn grid(&self, rows: usize, nsg: u32) -> (Size, Size) {
+    /// Threadgroups and threads per threadgroup for `rows` rows, with
+    /// `nr0` rows per threadgroup (per simdgroup for some types), for
+    /// `col_groups` groups of inputs.
+    pub(crate) fn grid(
+        &self,
+        rows: usize,
+        nsg: u32,
+        nr0: usize,
+        col_groups: usize,
+    ) -> (Size, Size) {
         let per_group = if self.per_simdgroup {
-            self.nr0 * nsg as usize
+            nr0 * nsg as usize
         } else {
-            self.nr0
+            nr0
         };
         (
-            Size::new(rows.div_ceil(per_group), 1, 1),
+            Size::new(rows.div_ceil(per_group), col_groups, 1),
             Size::new(32, nsg as usize, 1),
         )
     }
 
-    pub(crate) fn smem(&self) -> usize {
-        self.smem
+    /// Threadgroup memory in bytes for `nr0` rows (the reduction of
+    /// threadgroups whose simdgroups share rows takes one row of floats
+    /// per row).
+    pub(crate) fn smem(&self, nr0: usize) -> usize {
+        self.smem / self.nr0 * nr0
     }
 }
+
+/// `(inputs, rows)` of the matrix-vector kernels that take several inputs at
+/// once (`{name}_c{inputs}` in the shaders, instantiated with as many rows).
+const WIDE: &[(usize, usize)] = &[(2, 2), (4, 2)];
 
 /// A row of [`MATVECS`].
 type MatvecSpec = (GgmlType, &'static str, Option<u32>, usize, bool, usize);
@@ -159,10 +206,12 @@ pub(crate) struct Pipelines {
     pub(crate) rmsnorm: Pipeline,
     pub(crate) swiglu: Pipeline,
     pub(crate) copy: Pipeline,
+    pub(crate) argmax: Pipeline,
     /// `(G, D, pipeline)` from [`ATTENTIONS`].
     attentions: Vec<(usize, usize, Pipeline)>,
     pub(crate) attention_reduce: Pipeline,
     pub(crate) delta_net: Pipeline,
+    pub(crate) delta_net_batch: Pipeline,
     pub(crate) delta_norm: Pipeline,
 }
 
@@ -177,10 +226,15 @@ impl Pipelines {
             .iter()
             .filter_map(|&(ty, name, nsg, nr0, per_simdgroup, smem)| {
                 let pipeline = get(name).ok()?;
+                let wide = WIDE
+                    .iter()
+                    .filter_map(|&(nc, rows)| Some((nc, get(&format!("{name}_c{nc}")).ok()?, rows)))
+                    .collect();
                 Some((
                     ty,
                     Matvec {
                         pipeline,
+                        wide,
                         nsg,
                         nr0,
                         per_simdgroup,
@@ -199,14 +253,21 @@ impl Pipelines {
             rmsnorm: get("rmsnorm")?,
             swiglu: get("swiglu")?,
             copy: get("copy_f32")?,
+            argmax: get("argmax")?,
             attentions: ATTENTIONS
                 .iter()
                 .map(|&(g, d)| Ok((g, d, get(&format!("attention_g{g}_d{d}"))?)))
                 .collect::<Result<_, String>>()?,
             attention_reduce: get("attention_reduce")?,
             delta_net: get("delta_net")?,
+            delta_net_batch: get("delta_net_batch")?,
             delta_norm: get("delta_norm")?,
         })
+    }
+
+    /// The matrix-vector kernels, by weight type.
+    pub(crate) fn matvecs_mut(&mut self) -> impl Iterator<Item = (GgmlType, &mut Matvec)> {
+        self.matvecs.iter_mut().map(|(t, m)| (*t, m))
     }
 
     /// The matrix-vector kernel for weights of type `ty`.

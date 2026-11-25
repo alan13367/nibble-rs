@@ -296,13 +296,43 @@ fn dot_batch(
         return kernels.dot_rows(w.ty, rows, w.row_bytes, xq, out.segment(0));
     }
     let xq_len = xq.len() / n;
+    let x = |t: usize| &xq[t * xq_len..(t + 1) * xq_len];
     let block = (BATCH_BLOCK_BYTES / w.row_bytes.max(1)).max(1);
     let mut b0 = 0;
     while b0 < out.len() {
         let b1 = (b0 + block).min(out.len());
         let rows = w.rows_bytes(bytes, first + b0..first + b1);
-        for (t, x) in xq.chunks_exact(xq_len).enumerate() {
-            kernels.dot_rows(w.ty, rows, w.row_bytes, x, &mut out.segment(t)[b0..b1]);
+        let mut t = 0;
+        // Groups of 4 inputs, then one of 3 or of 2, where the type has
+        // such kernels.
+        while t + 4 <= n {
+            let o = out.segments_mut::<4>(t).map(|o| &mut o[b0..b1]);
+            if !kernels.dot_rows_n(
+                w.ty,
+                rows,
+                w.row_bytes,
+                [x(t), x(t + 1), x(t + 2), x(t + 3)],
+                o,
+            ) {
+                break;
+            }
+            t += 4;
+        }
+        if t + 3 == n {
+            let o = out.segments_mut::<3>(t).map(|o| &mut o[b0..b1]);
+            if kernels.dot_rows_n(w.ty, rows, w.row_bytes, [x(t), x(t + 1), x(t + 2)], o) {
+                t += 3;
+            }
+        }
+        while t + 2 <= n {
+            let o = out.segments_mut::<2>(t).map(|o| &mut o[b0..b1]);
+            if !kernels.dot_rows_n(w.ty, rows, w.row_bytes, [x(t), x(t + 1)], o) {
+                break;
+            }
+            t += 2;
+        }
+        for t in t..n {
+            kernels.dot_rows(w.ty, rows, w.row_bytes, x(t), &mut out.segment(t)[b0..b1]);
         }
         b0 = b1;
     }
@@ -648,7 +678,7 @@ mod tests {
             for kernels in [Kernels::Scalar, Kernels::detect()] {
                 for threads in [1, 4] {
                     let cpu = Cpu::with_kernels(threads, kernels);
-                    for n in [2, 5] {
+                    for n in [2, 3, 5, 7] {
                         let x = batch_input(cols, n);
                         let mut input = EncodedInput::new();
                         let mut batch = vec![0.0; n * w.rows];

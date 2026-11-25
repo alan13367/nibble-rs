@@ -214,6 +214,7 @@ impl Qwen35 {
                 draft_h: b.vector(c.n_embd)?,
                 batch: 0..0,
                 n_embd: c.n_embd,
+                logits: b.vector(c.n_vocab)?,
             }),
             _ => None,
         };
@@ -229,6 +230,7 @@ impl Qwen35 {
                         pending: 0,
                         keep: 0,
                         pending_ba: b.vector(d.pending_len())?,
+                        pending_row: 0,
                     }),
                     Mixer::Attention(_) => LayerState::Attention(b.kv_cache(n_ctx)?),
                 })
@@ -336,10 +338,62 @@ impl Qwen35 {
         } else {
             HeadInput::Draft
         };
-        head.run(b, c, m, &mut s.attn, &mut s.ffn, &[token], input);
+        head.run(
+            b,
+            c,
+            m,
+            &mut s.attn,
+            &mut s.ffn,
+            Embed::Tokens(&[token]),
+            input,
+        );
         b.copy_rows(&m.scratch.xn, 0, &mut m.draft_h, 0, 1, c.n_embd);
         b.logits(&head.head, &m.scratch.xn, 0..1, logits)
     }
+
+    /// `drafts.len()` draft steps of the MTP head after `token` at `pos`,
+    /// each taking the head's most likely token as the next step's: the
+    /// tokens are chosen on the device and read back once at the end.
+    ///
+    /// # Panics
+    ///
+    /// If the state has no MTP head (an internal invariant).
+    pub(crate) fn draft_chain<B: Backend>(
+        &self,
+        b: &mut B,
+        c: &ModelConfig,
+        s: &mut State<B>,
+        token: u32,
+        pos: usize,
+        drafts: &mut [u32],
+    ) -> Result<()> {
+        let (Some(head), Some(m)) = (&self.mtp, &mut s.mtp) else {
+            panic!("drafting without an MTP head");
+        };
+        b.kv_truncate(&mut m.cache, pos)?;
+        for i in 0..drafts.len() {
+            b.begin(pos + i, 1)?;
+            let (embed, input) = if i == 0 {
+                (Embed::Tokens(std::slice::from_ref(&token)), HeadInput::Last)
+            } else {
+                (Embed::Slot(i - 1), HeadInput::Draft)
+            };
+            head.run(b, c, m, &mut s.attn, &mut s.ffn, embed, input);
+            b.copy_rows(&m.scratch.xn, 0, &mut m.draft_h, 0, 1, c.n_embd);
+            b.matvecs(&m.scratch.xn, [(&head.head, &mut m.logits)]);
+            b.argmax(&m.logits, head.head.rows, i);
+            b.end()?;
+        }
+        b.read_slots(drafts)
+    }
+}
+
+/// Where the MTP head's tokens come from.
+#[derive(Clone, Copy)]
+enum Embed<'a> {
+    Tokens(&'a [u32]),
+    /// A token chosen on the device ([`Backend::argmax`]).
+    Slot(usize),
 }
 
 /// Which hidden state the MTP head pairs with its tokens.
@@ -400,7 +454,7 @@ impl Mtp {
         m: &mut MtpState<B>,
         attn: &mut AttentionBuffers<B>,
         ffn: &mut FfnBuffers<B>,
-        tokens: &[u32],
+        tokens: Embed<'_>,
         input: HeadInput,
     ) {
         let eps = c.rms_eps;
@@ -419,7 +473,10 @@ impl Mtp {
             HeadInput::Last => &*last_h,
             HeadInput::Draft => &*draft_h,
         };
-        b.embed(&self.embed, tokens, embd);
+        match tokens {
+            Embed::Tokens(t) => b.embed(&self.embed, t, embd),
+            Embed::Slot(slot) => b.embed_slot(&self.embed, slot, embd),
+        }
         b.norm_pair(embd, self.enorm, h, self.hnorm, eps, pair);
         b.matvecs(pair, [(&self.eh_proj, &mut scratch.x)]);
         b.rmsnorm(&scratch.x, self.attn_norm, eps, &mut scratch.xn);
@@ -453,7 +510,15 @@ impl Mtp {
         b.copy_rows(&m.last_h, 0, &mut m.h, 0, 1, e);
         b.copy_rows(trunk, 0, &mut m.h, 1, n - 1, e);
         b.copy_rows(trunk, n - 1, &mut m.last_h, 0, 1, e);
-        self.run(b, c, m, &mut s.attn, &mut s.ffn, tokens, HeadInput::Batch);
+        self.run(
+            b,
+            c,
+            m,
+            &mut s.attn,
+            &mut s.ffn,
+            Embed::Tokens(tokens),
+            HeadInput::Batch,
+        );
         m.batch = pos..pos + n;
         b.end()
     }
@@ -602,6 +667,8 @@ struct MtpState<B: Backend> {
     /// The positions of the last catch-up.
     batch: Range<usize>,
     n_embd: usize,
+    /// The logits of a draft step chained on the device.
+    logits: B::Vector,
 }
 
 enum LayerState<B: Backend> {
@@ -691,7 +758,8 @@ impl<B: Backend> State<B> {
             if keep > 0 {
                 b.read(&s.pending_ba, &mut pending)?;
                 let n = keep * 2 * d.n_v_heads;
-                snapshot.pending_ba[i * n..(i + 1) * n].copy_from_slice(&pending[..n]);
+                let at = s.pending_row * 2 * d.n_v_heads;
+                snapshot.pending_ba[i * n..(i + 1) * n].copy_from_slice(&pending[at..at + n]);
             }
             let n = d.state_len();
             b.read(&s.ssm, &mut snapshot.ssm[i * n..(i + 1) * n])?;
@@ -729,6 +797,7 @@ impl<B: Backend> State<B> {
                     let n = keep * 2 * d.n_v_heads;
                     pending[..n].copy_from_slice(&snapshot.pending_ba[i * n..(i + 1) * n]);
                     b.write(&mut s.pending_ba, &pending)?;
+                    s.pending_row = 0;
                     s.pending = keep;
                     s.keep = keep;
                     let n = d.state_len();

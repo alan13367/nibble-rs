@@ -20,9 +20,9 @@ This is a living document: update it when a decision changes.
 | Qwen3.5-9B (UD-Q4_K_XL 5.6 GiB and Q8_0 8.9 GiB, M4 Max) | Both run on both backends (UD-Q4_K_XL mixes IQ4_XS into its K-quants; 32 value heads share 16 key heads). Greedy output identical to llama.cpp b12359 on all 6 comparison prompts for both files on the CPU (`--no-repack -ub 1`) and on Metal (`-ngl 99 -fa off -ub 1`), and after a 4,557-token prompt on Metal. Metal decode in the row above. CPU decode (UD-Q4_K_XL) 27.1 tok/s at 10 threads (llama.cpp 35.6 with repacking): the CPU gap at this size is not investigated yet. Prompt: 65.7 tok/s on Metal one token at a time (llama.cpp 685 batched) |
 | CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench`; `--backend auto\|cpu\|metal` (default auto: Metal where available, with the reason printed when it falls back to the CPU); `--draft N` (MTP drafting, with acceptance printed by `run`) |
 | OpenAI server | Complete for Phase 3: tools, logprobs, recurrent-state checkpoints. Verified with curl, socket tests, and the official OpenAI Python client (3.58 on both models on the CPU; 3.59 on Metal with Qwen3-0.6B, Qwen3.5-0.8B and the 9B: models, multi-turn chat, reasoning, streaming with usage, tool calls and results, streamed tool calls, logprobs, stop, length, completions, seeded sampling, 6 concurrent async requests, context overflow). Where the CPU and Metal answers differ (a tool call on Qwen3.5-0.8B), llama-server's CPU and Metal paths give the same first-token log-probabilities as nibble's to 0.001. Open WebUI not tried |
-| Tests | 227 pass in `cargo test --workspace` (no model files needed; the Metal tests skip where no Metal device exists and fail on a Mac whose GPU cannot start the backend); 202 as x86_64 under Rosetta before IQ4_XS (not rerun since); 10 reference tests on real models (9 pass here with `--ignored`; `qwen35_bf16` needs a file that is not on this machine) |
+| Tests | 232 pass in `cargo test --workspace` (no model files needed; the Metal tests skip where no Metal device exists and fail on a Mac whose GPU cannot start the backend); 202 as x86_64 under Rosetta before IQ4_XS (not rerun since); 10 reference tests on real models (9 pass here with `--ignored`; `qwen35_bf16` needs a file that is not on this machine) |
 | Not started | AVX2 kernels for the K-quants (scalar on x86 until an x86 machine can test them), CUDA |
-| In progress | Phase 7: batched evaluation and MTP speculative decoding (see its section). Done: one forward pass per batch on both backends (bit-identical to one token at a time), DeltaNet rollback within a short batch, `Session::eval_all`, the Qwen3.5 MTP head and speculative `generate` (`--draft N`; same tokens as without drafts). pp512 on the M4 Max, Qwen3.5-0.8B Q8_0: CPU 298.4 → 352.5 tok/s, Metal 418.2 → 959.4 (llama.cpp b12359: 1857.7 with its BLAS backend, 6924.2). Drafting does not pay yet: verifying n tokens still costs about n tokens (next: multi-column kernels) |
+| In progress | Phase 7: batched evaluation and MTP speculative decoding (see its section). Done: one forward pass per batch on both backends (bit-identical to one token at a time), DeltaNet rollback within a short batch, `Session::eval_all`, the Qwen3.5 MTP head, speculative `generate` (`--draft N`; same tokens as without drafts), multi-input Q8_0 kernels on both backends. Qwen3.5-4B Q8_0 on the M4 Max, chat prompt, 128 tokens: Metal 73.1 tok/s plain, 126.7 with 2 drafts, 130.9 with 3 (llama.cpp b12722: 64.3, 114.5, 123.5); CPU 49.5, 80.7, 80.0 (llama.cpp 44.5, 54.8, 78.9). Multi-input kernels also for F16/BF16 and Q4_K/Q5_K/Q6_K (Q6_K and the floats on Metal). `nibble serve` works with coding harnesses (checked with Yawl). pp512 on Qwen3.5-0.8B Q8_0: CPU 298.4 → 924.3 tok/s, Metal 418.2 → 1276.1 (llama.cpp b12359: 1857.7 with its BLAS backend, 6924.2); tg128 CPU 221 → 240.9, Metal unchanged (315.4). Next: multi-input kernels for the other weight types, prompt GEMM |
 | Git | Five commits; the Metal backend and IQ4_XS are committed |
 
 ## Decisions
@@ -507,32 +507,57 @@ each weight once. Prompt processing needs the same pass, so it comes first.
    on Metal and 44/58 (76%) on the CPU, llama.cpp b12722's `draft-mtp`
    44/54 and 45/51 (same text). A tensor-level check with `cb_eval` is
    still to do.
-4. **Speculative generation** (correct, not yet faster).
-   `SessionOptions::draft_max` (`--draft N`), greedy drafts, verification
-   by sample-and-match, `Session::draft_stats` and `draft_logits`. Tokens,
-   stop reason, final session and logits are the same with 0, 1, 3 and 15
-   drafts on the synthetic model (greedy and seeded sampling with a repeat
-   penalty, every stop reason, both backends), and on the 4B file with 1,
-   3 and 6 (reference test). Speed on the 4B (64 tokens, chat prompt):
-   CPU 47.0 → 36.7 tok/s, Metal 72.9 → 63.9; llama.cpp b12722 with
-   `draft-mtp` reaches 81 (CPU) and 122 (Metal). The reason: verifying n
-   tokens costs n tokens. `eval_all` of 1/2/4/8 tokens on the 4B takes
-   20.3/37.5/73.9/148.2 ms on the CPU and 15.4/23.9/43.7/84.6 ms on Metal.
-   The CPU dot kernels are compute-bound at decode (about 20 G
-   multiply-adds per second per core whether or not the weights are in
-   cache), so sharing weight reads saves nothing there; Metal runs each
-   column as its own dispatch. Still to do here: `serve` reporting draft
-   statistics, `bench` measuring drafting.
-5. **Next: kernels that share each weight load across the columns of a
-   batch.** On Metal, multi-column versions of the matvec kernels for up
-   to 16 columns (each column reduced as now, so bit-identical), and
-   attention and DeltaNet over a batch in one dispatch. On the CPU,
-   register-tiled dot kernels (a block of weights against several
-   columns, keeping each column's integer lane sums and fused
-   multiply-add order, so bit-identical; `i8mm` changes the lane sums, so
-   it is not). Done when a verification of 4 tokens costs at most about
-   1.5 tokens on both backends, and drafting is faster than plain
-   decoding on the 4B.
+4. ✅ **Speculative generation.** `SessionOptions::draft_max` (`--draft
+   N`), greedy drafts, verification by sample-and-match,
+   `Session::draft_stats` and `draft_logits`. Tokens, stop reason, final
+   session and logits are the same with 0, 1, 3 and 15 drafts on the
+   synthetic model (greedy and seeded sampling with a repeat penalty,
+   every stop reason, both backends), and on the 4B file with 1, 3 and 6
+   (reference test). The draft steps are chained on the device
+   (`Backend::argmax` into a token slot, `embed_slot` from it) and read
+   back once per pass. Still to do: `serve` reporting draft statistics,
+   `bench` measuring drafting.
+5. ✅ **Kernels that share each weight load across the inputs of a
+   batch**, every one bit-identical to its one-input kernel (tests on
+   every type and mode):
+   - Metal: one dispatch per product for the whole batch. Q8_0 has 2- and
+     4-input kernels (`matvec_q8_0_c2`/`_c4`, groups of inputs across the
+     grid); the other types loop over the inputs inside each threadgroup,
+     which reads its weights from memory once. Norms take one threadgroup
+     per row; DeltaNet runs the replayed and the new tokens of a layer in
+     one dispatch (`delta_net_batch`, the state in registers). Plain
+     decoding keeps the one-token kernels.
+   - CPU: a NEON Q8_0 tile of 2 rows by 2, 3 or 4 inputs, keeping each
+     input's lanes, accumulators and scale order; the scales are widened
+     with `fcvt` (`fp16`) instead of the software decode, which cost as
+     much as a block's products and also made plain decoding 6% faster
+     (47.2 → 50.1 tok/s on the 4B).
+   - Verifying 1/2/3/4 tokens on the 4B: Metal 13.4/13.9/15.6/16.3 ms,
+     CPU 19.7/21.5/23.1/26.5 ms (before: 15.4/23.9/–/43.7 and
+     20.3/37.5/–/73.9). Measured and not kept: 4 rows per threadgroup
+     for the Metal wide kernels (fewer threadgroups, slower), loading a
+     block's weights first and the inputs one at a time (slower), two
+     2-input groups instead of one 4-input group, a 2-row CPU tile for
+     one input (no faster: one input is memory-bound at 10 threads).
+   - Other types. Metal: F32/F16/BF16 and Q6_K have 2-input kernels
+     (wider batches go in groups of 2 across the grid; 4-input versions
+     measured slower), Q3_K/Q4_K/Q5_K/IQ4_XS keep the loop over inputs:
+     their multi-input kernels either compiled to regrouped sums (fast
+     math) or spilled registers and ran slower than the loop. Since
+     bit-identity of these kernels depends on the shader compiler, the
+     backend runs each wide kernel against the one-input kernel when it
+     starts and stops using any that differ. CPU: NEON kernels for
+     Q4_K/Q5_K/Q6_K (exact integer sums, the float update per super-block
+     unchanged), F16 and BF16; Q3_K and IQ4_XS take one input at a time.
+   - Verifying 1/2/3/4 tokens: Qwen3.5-0.8B Q4_K_M Metal 2.6/3.4/5.0/6.3 ms,
+     CPU 4.0/5.3/6.7/9.5; Qwen3-0.6B BF16 Metal 4.1/4.5/4.9/5.3, CPU
+     5.8/7.0/9.2/11.8; Qwen3.5-9B UD-Q4_K_XL Metal 16.5/22.8/–/–, CPU
+     33.2/40.0/53.2/77.5. The K-quants on Metal and the CPU's 4-input
+     batches are the weak spots.
+   - Still to do: better K-quant multi-input kernels on Metal (llama.cpp's
+     `mul_mv_ext` dequantizes to `float4x4` per lane, a layout that rounds
+     differently from the one-input kernel), batched attention on Metal,
+     AVX2 tiles.
 6. **Prompt speed:** Metal `mul_mm` (simdgroup matrices; rounds
    differently, compared with llama.cpp's Metal path at its default
    `-ub`) and larger CPU tiles. Done when pp512 is within 25% of
@@ -540,6 +565,27 @@ each weight once. Prompt processing needs the same pass, so it comes first.
    llama.cpp's BLAS backend).
 7. **Parallel server slots:** several sequences decoded in one batch.
 8. **MTP sidecar files** (`mtp-*.gguf`) and `--draft-p-min`.
+
+### Coding harnesses
+
+Checked with [Yawl](https://github.com/alan13367/yawl) 0.2.1 through its
+`openai-completions` provider, on Qwen3.5-4B Q8_0 with `-c 32768 --draft 3`
+on Metal: reading files, editing one and running a script through its shell
+tool all completed with no tool errors. Added for it: `max_model_len` and
+`context_length` in `/v1/models`, `prompt_tokens_details.cached_tokens` in
+`usage`, `reasoning_effort` mapped to thinking on or off (`none`/`minimal`
+off), a log line per request in `nibble serve`, and a checkpoint where a
+rewind that had to replay stops (a second session with the same system
+prompt then reuses it instead of replaying 2,000 tokens again).
+
+- **Prompt speed is the bottleneck:** Yawl's system prompt and tools are
+  about 2,000 tokens, 8.8 s at 223 tok/s on the 4B on Metal; each tool
+  result is evaluated at about 190 tok/s. Step 6 (prompt GEMM) is what
+  makes harness use responsive.
+- **Prefix reuse across sessions:** the first replay to a new shared
+  prefix still costs a full re-evaluation; checkpoints at more points
+  (llama.cpp also keeps one at the start of the last user message) would
+  avoid it.
 
 ## Validation
 
