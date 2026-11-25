@@ -8,8 +8,8 @@ use std::ops::Range;
 
 use super::attention::{AttentionScratch, KvCache, attend};
 use super::{
-    Cpu, DeltaStep, EncodedInput, Kernels, Split, Weight, add_in_place, l2_norm_chunks, rmsnorm,
-    rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
+    Cpu, DeltaStep, EncodedInput, Experts, Kernels, Split, Weight, add_in_place, l2_norm_chunks,
+    rmsnorm, rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
 };
 use crate::backend::{
     Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_LOGIT_ROWS, MAX_PENDING, ModelData,
@@ -35,6 +35,11 @@ pub(crate) struct CpuBackend<'m> {
     product: Vec<f32>,
     /// The token slots of [`Backend::argmax`].
     slots: [u32; MAX_LOGIT_ROWS],
+    /// The experts of the current mixture-of-experts layer, `k` per token,
+    /// and the router's probabilities and their order for one token.
+    expert_ids: Vec<usize>,
+    probs: Vec<f32>,
+    order: Vec<usize>,
     /// One DeltaNet layer's state, which a batch that stays pending runs on.
     work: Vec<f32>,
     /// The convolution, betas, decays and (unused) outputs of the pending
@@ -57,6 +62,9 @@ impl<'m> CpuBackend<'m> {
             gate: vec![0.0; c.n_head * c.head_dim],
             product: vec![0.0; c.n_embd],
             slots: [0; MAX_LOGIT_ROWS],
+            expert_ids: Vec::new(),
+            probs: Vec::new(),
+            order: Vec::new(),
             work: Vec::new(),
             replay: Default::default(),
         }
@@ -256,6 +264,136 @@ impl Backend for CpuBackend<'_> {
             .swiglu(self.model.bytes, gate, up, x, &mut self.input, out, up_out);
     }
 
+    fn moe_route(&mut self, logits: &Vec<f32>, n_expert: usize, k: usize, route: &mut Vec<f32>) {
+        let kernels = self.cpu.kernels();
+        // Grows once, to the router's width.
+        self.probs.resize(n_expert, 0.0);
+        self.order.resize(n_expert, 0);
+        let rows = logits
+            .chunks_exact(n_expert)
+            .zip(route.chunks_exact_mut(2 * k));
+        for (logits, route) in rows.take(self.n) {
+            let (probs, order) = (&mut self.probs, &mut self.order);
+            probs.copy_from_slice(logits);
+            kernels.softmax(probs);
+            // ggml's `argsort` (descending, `std::sort`) then its first `k`;
+            // equal probabilities, which ggml leaves in no particular order,
+            // go by index here.
+            for (i, o) in order.iter_mut().enumerate() {
+                *o = i;
+            }
+            let by_prob = |a: &usize, b: &usize| probs[*b].total_cmp(&probs[*a]).then(a.cmp(b));
+            if k < n_expert {
+                order.select_nth_unstable_by(k, by_prob);
+            }
+            order[..k].sort_unstable_by(by_prob);
+            let (ids, weights) = route.split_at_mut(k);
+            for ((id, w), &e) in ids.iter_mut().zip(weights.iter_mut()).zip(&order[..k]) {
+                *id = e as f32;
+                *w = probs[e];
+            }
+            // `ggml_sum_rows`, clamped to the smallest normal f16, then `ggml_div`.
+            let sum = sum_row(weights).max(6.103_515_6e-5);
+            for w in weights.iter_mut() {
+                *w /= sum;
+            }
+        }
+    }
+
+    fn moe_swiglu(
+        &mut self,
+        gate: &Experts,
+        up: &Experts,
+        x: &Vec<f32>,
+        route: &Vec<f32>,
+        k: usize,
+        out: &mut Vec<f32>,
+        up_out: &mut Vec<f32>,
+    ) {
+        let n = self.n;
+        let ff = gate.first.rows;
+        fill_ids(&mut self.expert_ids, route, k, n);
+        let (x, out, up_out) = (
+            &x[..n * gate.first.cols],
+            &mut out[..n * k * ff],
+            &mut up_out[..n * k * ff],
+        );
+        self.cpu.moe_swiglu(
+            self.model.bytes,
+            gate,
+            up,
+            &self.expert_ids,
+            x,
+            &mut self.input,
+            out,
+            up_out,
+        );
+    }
+
+    fn moe_down(
+        &mut self,
+        down: &Experts,
+        hidden: &Vec<f32>,
+        route: &Vec<f32>,
+        k: usize,
+        products: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) {
+        let n = self.n;
+        let (ff, e) = (down.first.cols, down.first.rows);
+        fill_ids(&mut self.expert_ids, route, k, n);
+        let product = &mut products[..n * k * e];
+        self.cpu.moe_products(
+            self.model.bytes,
+            down,
+            &self.expert_ids,
+            &hidden[..n * k * ff],
+            &mut self.input,
+            product,
+        );
+        let rows = out.chunks_exact_mut(e).zip(route.chunks_exact(2 * k));
+        for (t, (out, route)) in rows.take(n).enumerate() {
+            let weights = &route[k..];
+            for (j, &w) in weights.iter().enumerate() {
+                let p = &product[(t * k + j) * e..(t * k + j + 1) * e];
+                if j == 0 {
+                    for (o, &p) in out.iter_mut().zip(p) {
+                        *o = p * w;
+                    }
+                } else {
+                    for (o, &p) in out.iter_mut().zip(p) {
+                        *o += p * w;
+                    }
+                }
+            }
+        }
+    }
+
+    fn moe_residual(
+        &mut self,
+        moe: &Vec<f32>,
+        shared: &Vec<f32>,
+        gate: &Vec<f32>,
+        x: &mut Vec<f32>,
+        norm: Param,
+        eps: f32,
+        out: &mut Vec<f32>,
+    ) {
+        let (e, weight) = (norm.len(), self.param(norm));
+        let rows = x
+            .chunks_exact_mut(e)
+            .zip(out.chunks_exact_mut(e))
+            .zip(moe.chunks_exact(e).zip(shared.chunks_exact(e)))
+            .zip(gate);
+        for (((x, out), (moe, shared)), &g) in rows.take(self.n) {
+            let g = sigmoid(g);
+            for ((x, &m), &s) in x.iter_mut().zip(moe).zip(shared) {
+                *x += m + s * g;
+            }
+            rmsnorm(out, x, weight, eps);
+        }
+    }
+
     fn attention(
         &mut self,
         q: &mut Vec<f32>,
@@ -399,6 +537,32 @@ impl Backend for CpuBackend<'_> {
                 *o *= z;
             }
         }
+    }
+}
+
+/// The expert indices of the first `n` rows of `route` (`k` per row), in order.
+fn fill_ids(ids: &mut Vec<usize>, route: &[f32], k: usize, n: usize) {
+    ids.clear();
+    for row in route.chunks_exact(2 * k).take(n) {
+        ids.extend(row[..k].iter().map(|&e| e as usize));
+    }
+}
+
+/// `ggml_sum_rows` of one row. On macOS ggml sums with Accelerate's
+/// `vDSP_sve`, which for 8 values (the experts Qwen3.5 uses) adds them in
+/// four lanes, `v[i] + v[i + 4]`, then reduces the lanes pairwise (checked
+/// against llama.cpp b12722); other lengths are summed in order there, an
+/// order not checked against `vDSP_sve`. Elsewhere ggml sums in `f64`.
+fn sum_row(v: &[f32]) -> f32 {
+    if cfg!(target_os = "macos") {
+        if v.len() == 8 {
+            let l: [f32; 4] = std::array::from_fn(|i| v[i] + v[i + 4]);
+            (l[0] + l[1]) + (l[2] + l[3])
+        } else {
+            v.iter().sum()
+        }
+    } else {
+        v.iter().map(|&x| f64::from(x)).sum::<f64>() as f32
     }
 }
 

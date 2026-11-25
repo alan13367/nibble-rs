@@ -38,7 +38,7 @@ use nibble_gguf::Gguf;
 
 use super::bind::{matrix, tensor_f32, vector};
 use super::config::Meta;
-use super::layers::{FfnBuffers, Head, Next, Scratch, SwiGlu};
+use super::layers::{Ffn, FfnBuffers, Head, Moe, MoeDims, Next, Scratch, SwiGlu};
 use super::{Architecture, Logits, ModelConfig};
 use crate::backend::{Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, Param, Params, QkNorm};
 use crate::cpu::Weight;
@@ -48,6 +48,8 @@ pub(crate) struct Qwen35 {
     head: Head,
     blocks: Vec<Block>,
     dims: DeltaNetDims,
+    /// The sizes of the mixture-of-experts feed-forwards (`qwen35moe`).
+    moe: Option<MoeDims>,
     /// Boxed: most models have none, and it is several weights big.
     mtp: Option<Box<Mtp>>,
 }
@@ -65,7 +67,7 @@ struct Mtp {
     attn_norm: Param,
     attn: GatedAttention,
     post_attention_norm: Param,
-    ffn: SwiGlu,
+    ffn: Ffn,
     /// `nextn.shared_head_norm`, or the trunk's output norm.
     head_norm: Param,
     /// `nextn.shared_head_head`, or the trunk's output projection.
@@ -76,7 +78,7 @@ struct Block {
     attn_norm: Param,
     mixer: Mixer,
     post_attention_norm: Param,
-    ffn: SwiGlu,
+    ffn: Ffn,
 }
 
 enum Mixer {
@@ -111,7 +113,31 @@ struct GatedAttention {
 
 impl Qwen35 {
     pub(crate) fn load(g: &Gguf<'_>, c: &ModelConfig, p: &mut Params) -> Result<Self> {
-        let m = Meta::new(g, Architecture::Qwen35);
+        let m = Meta::new(g, c.architecture);
+        let moe = match c.architecture {
+            Architecture::Qwen35Moe => {
+                let d = MoeDims {
+                    n_expert: m.usize("expert_count")?,
+                    k: m.usize("expert_used_count")?,
+                    n_ff: m.usize("expert_feed_forward_length")?,
+                    n_ff_shared: m.usize("expert_shared_feed_forward_length")?,
+                };
+                if d.k == 0 || d.k > d.n_expert || d.n_ff == 0 || d.n_ff_shared == 0 {
+                    return Err(m.invalid(
+                        "expert_used_count",
+                        "expert counts and sizes must be non-zero, with at most expert_count used",
+                    ));
+                }
+                Some(d)
+            }
+            _ => None,
+        };
+        let ffn = |layer: usize| -> Result<Ffn> {
+            Ok(match moe {
+                Some(d) => Ffn::Moe(Box::new(Moe::load(g, c, d, layer)?)),
+                None => Ffn::Dense(SwiGlu::load(g, c, layer)?),
+            })
+        };
         let n_v_heads = m.usize("ssm.time_step_rank")?;
         let inner = m.usize("ssm.inner_size")?;
         let dims = DeltaNetDims {
@@ -161,7 +187,7 @@ impl Qwen35 {
                     attn_norm: vector(g, p, &name("attn_norm"), c.n_embd)?,
                     mixer,
                     post_attention_norm: vector(g, p, &name("post_attention_norm"), c.n_embd)?,
-                    ffn: SwiGlu::load(g, c, i)?,
+                    ffn: ffn(i)?,
                 })
             })
             .collect::<Result<_>>()?;
@@ -170,15 +196,21 @@ impl Qwen35 {
         // whose head has no tensors, keeps the trunk usable without one.
         let eh_proj = format!("blk.{}.nextn.eh_proj.weight", c.n_layer);
         let mtp = match m.usize_opt("nextn_predict_layers")? {
-            Some(1) if g.tensor(&eh_proj).is_some() => {
-                Some(Box::new(Mtp::load(g, c, p, &head, c.n_layer)?))
-            }
+            Some(1) if g.tensor(&eh_proj).is_some() => Some(Box::new(Mtp::load(
+                g,
+                c,
+                p,
+                &head,
+                ffn(c.n_layer)?,
+                c.n_layer,
+            )?)),
             _ => None,
         };
         Ok(Self {
             head,
             blocks,
             dims,
+            moe,
             mtp,
         })
     }
@@ -242,7 +274,7 @@ impl Qwen35 {
         Ok(State {
             layers,
             scratch: Scratch::new(b, c, n_batch)?,
-            ffn: FfnBuffers::new(b, c, n_batch)?,
+            ffn: FfnBuffers::new(b, c, self.moe, n_batch)?,
             dn: DeltaNetBuffers {
                 qkv: b.vector(rows(d.conv_dim()))?,
                 conv: b.vector(rows(d.conv_dim()))?,
@@ -413,6 +445,7 @@ impl Mtp {
         c: &ModelConfig,
         p: &mut Params,
         trunk: &Head,
+        ffn: Ffn,
         layer: usize,
     ) -> Result<Self> {
         let name = |n: &str| format!("blk.{layer}.{n}.weight");
@@ -432,7 +465,7 @@ impl Mtp {
             attn_norm: vector(g, p, &name("attn_norm"), c.n_embd)?,
             attn: GatedAttention::load(g, c, p, layer)?,
             post_attention_norm: vector(g, p, &name("post_attention_norm"), c.n_embd)?,
-            ffn: SwiGlu::load(g, c, layer)?,
+            ffn,
             head_norm: if has("nextn.shared_head_norm") {
                 vector(g, p, &name("nextn.shared_head_norm"), c.n_embd)?
             } else {

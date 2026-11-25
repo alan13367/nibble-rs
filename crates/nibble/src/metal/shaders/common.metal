@@ -171,7 +171,58 @@ static inline device const char * matrix_row(device const char * w, device const
 // memory once, from its cache for the later inputs. The barrier keeps the
 // next input's reduction from overwriting threadgroup memory that a
 // simdgroup still reads.
+// `MoeArgs` in `metal/kernels.rs`: the expert of slot `s` (of `k` per
+// input row) is entry `s % k` of row `s / k` of the route (`2k` values a
+// row: expert indices, then weights); experts are `expert_rows` rows apart,
+// `count` of them. The slot's input is row `s` of `x` if `per_slot`, else
+// row `s / k`; its output is row `s` of `dst`.
+struct MoeArgs {
+    uint k;
+    uint per_slot;
+    uint expert_rows;
+    uint count;
+};
+
+static inline uint moe_expert(device const float * route, constant MoeArgs & m, uint s) {
+    const uint e = (uint) route[(uint64_t) (s / m.k) * 2 * m.k + s % m.k];
+    return min(e, m.count - 1);
+}
+
+// The arguments of a matrix-vector kernel `name_id`, which runs one
+// mixture-of-experts slot (`tgpig.y`) per threadgroup row: expert `e`'s
+// weights for that slot's input. `MATVEC_ID_PROLOGUE` defines `w_e`, `w2_e`,
+// `x_s` and `dst_s` for the body.
+#define MATVEC_ID_SIGNATURE(name) \
+kernel void name( \
+        constant MatvecArgs & a [[buffer(0)]], \
+        device const char * w [[buffer(1)]], \
+        device const float * x [[buffer(2)]], \
+        device float * dst [[buffer(3)]], \
+        device const char * w2 [[buffer(4)]], \
+        device const float * route [[buffer(5)]], \
+        constant MoeArgs & m [[buffer(6)]], \
+        threadgroup char * shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]])
+
+#define MATVEC_ID_PROLOGUE \
+    const uint s = tgpig.y; \
+    const uint64_t off = (uint64_t) moe_expert(route, m, s) * m.expert_rows * a.row_bytes; \
+    device const char * w_e = w + off; \
+    device const char * w2_e = w2 + off; \
+    device const float * x_s = x + (uint64_t) (m.per_slot != 0 ? s : s / m.k) * a.cols; \
+    device float * dst_s = dst + (uint64_t) s * a.rows;
+
+// A one-input kernel `name` and its mixture-of-experts form `name_id`.
 #define MATVEC_KERNEL(name, impl, NR0) \
+MATVEC_ID_SIGNATURE(name##_id) { \
+    MATVEC_ID_PROLOGUE \
+    impl<NR0>(a, w_e, w2_e, x_s, dst_s, shmem, tgpig, tiisg, sgitg); \
+} \
+MATVEC_KERNEL_LOOP(name, impl, NR0)
+
+#define MATVEC_KERNEL_LOOP(name, impl, NR0) \
 kernel void name( \
         constant MatvecArgs & a [[buffer(0)]], \
         device const char * w [[buffer(1)]], \
@@ -213,6 +264,13 @@ kernel void name( \
     } \
     const short nc = (short) min((uint) NC, a.ncols - c); \
     impl<NR0, NC>(a, w, w2, x + (uint64_t) c * a.cols, dst + (uint64_t) c * a.rows, nc, shmem, tgpig, tiisg, sgitg); \
+}
+
+// The mixture-of-experts form of a kernel `impl<NR0, NC>`, with one input.
+#define MATVEC_KERNEL_NC_ID(name, impl, NR0) \
+MATVEC_ID_SIGNATURE(name) { \
+    MATVEC_ID_PROLOGUE \
+    impl<NR0, 1>(a, w_e, w2_e, x_s, dst_s, 1, shmem, tgpig, tiisg, sgitg); \
 }
 
 // `reduce_and_write` for each of `nc` inputs whose sums are in `sumf`,

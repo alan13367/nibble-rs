@@ -38,11 +38,13 @@ pub enum Architecture {
     Qwen3,
     /// Qwen3.5 hybrid DeltaNet / attention models (`qwen35`).
     Qwen35,
+    /// Qwen3.5 hybrid models with mixture-of-experts feed-forwards (`qwen35moe`).
+    Qwen35Moe,
 }
 
 impl Architecture {
     /// Every supported architecture.
-    pub const ALL: &'static [Self] = &[Self::Qwen3, Self::Qwen35];
+    pub const ALL: &'static [Self] = &[Self::Qwen3, Self::Qwen35, Self::Qwen35Moe];
 
     /// The GGUF architecture name.
     #[must_use]
@@ -50,6 +52,7 @@ impl Architecture {
         match self {
             Self::Qwen3 => "qwen3",
             Self::Qwen35 => "qwen35",
+            Self::Qwen35Moe => "qwen35moe",
         }
     }
 
@@ -152,7 +155,9 @@ impl Model {
             let p = &mut params;
             let arch = match architecture {
                 Architecture::Qwen3 => Arch::Qwen3(qwen3::Qwen3::load(&g, &config, p)?),
-                Architecture::Qwen35 => Arch::Qwen35(qwen35::Qwen35::load(&g, &config, p)?),
+                Architecture::Qwen35 | Architecture::Qwen35Moe => {
+                    Arch::Qwen35(qwen35::Qwen35::load(&g, &config, p)?)
+                }
             };
             let tokenizer = Tokenizer::from_gguf(&g)?;
             if tokenizer.vocab_size() < config.n_vocab {

@@ -3,21 +3,55 @@
 use nibble_gguf::Gguf;
 
 use crate::backend::{Param, Params};
-use crate::cpu::Weight;
+use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
 use crate::quant;
 
-/// Binds a weight matrix with `rows` rows of `cols` elements (ggml shape `[cols, rows]`).
+/// Binds a weight matrix with `rows` rows of `cols` elements (ggml shape
+/// `[cols, rows]`; a single row may also be stored as the vector `[cols]`).
 pub(crate) fn matrix(g: &Gguf<'_>, name: &str, cols: usize, rows: usize) -> Result<Weight> {
+    bind(g, name, cols, rows, &[cols as u64, rows as u64])
+}
+
+/// Binds `count` expert matrices of `rows` rows of `cols` elements, stored
+/// as one tensor of ggml shape `[cols, rows, count]`.
+pub(crate) fn experts(
+    g: &Gguf<'_>,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    count: usize,
+) -> Result<Experts> {
+    let all_rows = rows
+        .checked_mul(count)
+        .ok_or_else(|| Error::InvalidMetadata {
+            key: name.to_owned(),
+            reason: "too many expert rows".into(),
+        })?;
+    let all = bind(
+        g,
+        name,
+        cols,
+        all_rows,
+        &[cols as u64, rows as u64, count as u64],
+    )?;
+    Ok(Experts {
+        first: Weight { rows, ..all },
+        count,
+    })
+}
+
+/// Binds tensor `name` of ggml shape `expected` as `rows` rows of `cols`.
+fn bind(g: &Gguf<'_>, name: &str, cols: usize, rows: usize, expected: &[u64]) -> Result<Weight> {
     let t = g
         .tensor(name)
         .ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
-    let expected = [cols as u64, rows as u64];
-    if t.shape().dims() != expected {
+    let dims = t.shape().dims();
+    if dims != expected && !(rows == 1 && dims == [cols as u64]) {
         return Err(Error::TensorShape {
             tensor: name.to_owned(),
             expected: expected.to_vec(),
-            found: t.shape().dims().to_vec(),
+            found: dims.to_vec(),
         });
     }
     let ty = t.ggml_type();

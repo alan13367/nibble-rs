@@ -64,7 +64,7 @@ impl Neon {
     /// See [`super::Kernels::encode`].
     pub(crate) fn encode(self, dt: DotType, x: &[f32], out: &mut [u8]) {
         match dt {
-            DotType::F32 | DotType::Bf16 => quant::encode_activation(dt, x, out),
+            DotType::F32 | DotType::Bf16 | DotType::Q8_1 => quant::encode_activation(dt, x, out),
             DotType::Q8_0 => neon_call!(quantize_q8_0(x, out)),
             DotType::Q8K => neon_call!(quantize_q8_k(x, out)),
         }
@@ -137,6 +137,9 @@ impl Neon {
                 } else {
                     neon_call!(dot_iq4_xs_rows_mul(rows, row_bytes, xq, out))
                 }
+            }
+            ty if quant::is_block32(ty) && self.dotprod => {
+                neon_call!(dot_block32_rows(ty, rows, row_bytes, xq, out))
             }
             _ => scalar(out),
         }
@@ -1351,6 +1354,160 @@ define_q8_rows!(
 );
 define_q8_rows!(dot_q8_0_rows_mul, "neon", i8_dot16_mul, q8_scale);
 
+// --- Blocks of 32: Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4 ---------------------
+
+/// One block's 32 weights as the NEON kernels widen them (weights `0..16`
+/// and `16..32`), its scale and its minimum (`Q4_1`/`Q5_1`).
+#[inline]
+#[target_feature(enable = "neon")]
+fn block32_weights(ty: GgmlType, b: &[u8], values: int8x16_t) -> (int8x16_t, int8x16_t, f32, f32) {
+    let f16 = |at: usize| quant::f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]));
+    let m4b = vdupq_n_u8(0x0f);
+    let nibbles = |at: usize| {
+        let q = load_u8(at16(b, at));
+        (vandq_u8(q, m4b), vshrq_n_u8::<4>(q))
+    };
+    // The fifth bits of weights `0..16` (`2..4` for `16..32`) as 0x10 bytes:
+    // `table_b2b_0`'s bytes, here by testing each byte's bit.
+    let fifth = |at: usize| {
+        let qh = u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let bits = |word: u16| {
+            let v = vcombine_u8(vdup_n_u8(word as u8), vdup_n_u8((word >> 8) as u8));
+            let mask = vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201));
+            vandq_u8(vtstq_u8(v, mask), vdupq_n_u8(0x10))
+        };
+        (bits(qh as u16), bits((qh >> 16) as u16))
+    };
+    let s = |v: uint8x16_t| vreinterpretq_s8_u8(v);
+    match ty {
+        GgmlType::Q4_0 => {
+            let (lo, hi) = nibbles(2);
+            let eight = vdupq_n_s8(8);
+            (vsubq_s8(s(lo), eight), vsubq_s8(s(hi), eight), f16(0), 0.0)
+        }
+        GgmlType::Q4_1 => {
+            let (lo, hi) = nibbles(4);
+            (s(lo), s(hi), f16(0), f16(2))
+        }
+        GgmlType::Q5_0 => {
+            let (lo, hi) = nibbles(6);
+            let (hl, hh) = fifth(2);
+            let sixteen = vdupq_n_s8(16);
+            (
+                vsubq_s8(s(vorrq_u8(lo, hl)), sixteen),
+                vsubq_s8(s(vorrq_u8(hi, hh)), sixteen),
+                f16(0),
+                0.0,
+            )
+        }
+        GgmlType::Q5_1 => {
+            let (lo, hi) = nibbles(8);
+            let (hl, hh) = fifth(4);
+            (s(vorrq_u8(lo, hl)), s(vorrq_u8(hi, hh)), f16(0), f16(2))
+        }
+        GgmlType::Iq4Nl => {
+            let (lo, hi) = nibbles(2);
+            (vqtbl1q_s8(values, lo), vqtbl1q_s8(values, hi), f16(0), 0.0)
+        }
+        GgmlType::Mxfp4 => {
+            let (lo, hi) = nibbles(1);
+            let d = quant::blocks32::e8m0_half(b[0]);
+            (vqtbl1q_s8(values, lo), vqtbl1q_s8(values, hi), d, 0.0)
+        }
+        other => unreachable!("{other} has no 32-weight blocks"),
+    }
+}
+
+/// ggml's NEON `ggml_vec_dot_q4_0_q8_0` and its siblings for `Q4_1`, `Q5_0`,
+/// `Q5_1` (with `Q8_1`), `IQ4_NL` and `MXFP4`: blocks in pairs, the even
+/// block's `vdotq_s32` lanes into one float vector and the odd one's into
+/// another (`vmlaq_n_f32`, fused), or for `IQ4_NL`/`MXFP4` the pair's two
+/// sums added to the running sum; the scalar tail for an odd last block.
+/// The float order is that of [`quant::blocks32::dot_row`], which is the
+/// reference.
+#[target_feature(enable = "neon,dotprod")]
+fn dot_block32_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f32]) {
+    let bb = quant::blocks32::block_bytes(ty);
+    let with_min = matches!(ty, GgmlType::Q4_1 | GgmlType::Q5_1);
+    let (xb, xo) = if with_min {
+        (quant::Q8_1_BLOCK_BYTES, 4)
+    } else {
+        (Q8_0_BLOCK_BYTES, 2)
+    };
+    let table = if ty == GgmlType::Mxfp4 {
+        quant::blocks32::KVALUES_MXFP4
+    } else {
+        quant::KVALUES_IQ4NL
+    };
+    let values = load_i8(&table.map(|v| v as u8));
+    let zero = vdupq_n_s32(0);
+    let nb = row_bytes / bb;
+    let f16 = |b: &[u8], at: usize| quant::f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]));
+    for (o, row) in out.iter_mut().zip(rows.chunks_exact(row_bytes)) {
+        // Block `i`'s integer lanes, scale, min, and the activation's scale and sum.
+        let block = |i: usize| {
+            let w = &row[i * bb..(i + 1) * bb];
+            let x = &xq[i * xb..(i + 1) * xb];
+            let (lo, hi, d, m) = block32_weights(ty, w, values);
+            let p = vdotq_s32(
+                vdotq_s32(zero, lo, load_i8(at16(x, xo))),
+                hi,
+                load_i8(at16(x, xo + 16)),
+            );
+            let s = if with_min { f16(x, 2) } else { 0.0 };
+            (p, d, m, f16(x, 0), s)
+        };
+        let mut sumf = 0.0f32;
+        let mut ib = 0;
+        if matches!(ty, GgmlType::Iq4Nl | GgmlType::Mxfp4) {
+            while ib + 1 < nb {
+                let (p0, d0, _, y0, _) = block(ib);
+                let (p1, d1, _, y1, _) = block(ib + 1);
+                let (i0, i1) = (vaddvq_s32(p0) as f32, vaddvq_s32(p1) as f32);
+                sumf += (d0 * y0).mul_add(i0, (d1 * y1) * i1);
+                ib += 2;
+            }
+            for ib in ib..nb {
+                let (p, d, _, y, _) = block(ib);
+                sumf = (y * d).mul_add(vaddvq_s32(p) as f32, sumf);
+            }
+        } else {
+            let mut v0 = vdupq_n_f32(0.0);
+            let mut v1 = vdupq_n_f32(0.0);
+            let (mut summs, mut summs1) = (0.0f32, 0.0f32);
+            while ib + 1 < nb {
+                let (p0, d0, m0, y0, s0) = block(ib);
+                let (p1, d1, m1, y1, s1) = block(ib + 1);
+                v0 = vfmaq_n_f32(v0, vcvtq_f32_s32(p0), d0 * y0);
+                v1 = vfmaq_n_f32(v1, vcvtq_f32_s32(p1), d1 * y1);
+                match ty {
+                    GgmlType::Q4_1 => summs += m0.mul_add(s0, m1 * s1),
+                    GgmlType::Q5_1 => {
+                        summs = m0.mul_add(s0, summs);
+                        summs1 = m1.mul_add(s1, summs1);
+                    }
+                    _ => {}
+                }
+                ib += 2;
+            }
+            sumf = vaddvq_f32(v0) + vaddvq_f32(v1);
+            if with_min {
+                sumf = sumf + summs + summs1;
+            }
+            for ib in ib..nb {
+                let (p, d, m, y, s) = block(ib);
+                let sumi = vaddvq_s32(p) as f32;
+                sumf = match ty {
+                    GgmlType::Q4_0 => (sumi * d).mul_add(y, sumf),
+                    GgmlType::Q4_1 | GgmlType::Q5_1 => sumf + (d * y).mul_add(sumi, m * s),
+                    _ => (d * y).mul_add(sumi, sumf),
+                };
+            }
+        }
+        *o = sumf;
+    }
+}
+
 macro_rules! define_q4_rows {
     ($name:ident, $feat:literal, $dot:ident) => {
         #[target_feature(enable = $feat)]
@@ -1889,6 +2046,36 @@ mod tests {
                     } else {
                         let scale = (want.abs() as f64).max(1.0);
                         assert_near(g, want, 1e-5, scale, &format!("{ty} row {r}, {k:?}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The kernels for blocks of 32 give the scalar reference's results bit
+    /// for bit (the reference matches ggml's, see `quant`), with an even and
+    /// an odd number of blocks per row.
+    #[test]
+    fn block32_dots_equal_the_scalar_reference() {
+        for k in variants() {
+            for ty in [
+                GgmlType::Q4_0,
+                GgmlType::Q4_1,
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Iq4Nl,
+                GgmlType::Mxfp4,
+            ] {
+                for n in [768, 800] {
+                    let rows = 4;
+                    let xq = quant::encoded(DotType::of(ty), &values(n, 3));
+                    let w: Vec<u8> = (0..rows).flat_map(|r| k_row(ty, n / 32, 10 + r)).collect();
+                    let row_bytes = w.len() / rows as usize;
+                    let mut got = vec![0.0; rows as usize];
+                    k.dot_rows(ty, &w, row_bytes, &xq, &mut got);
+                    for (r, &g) in got.iter().enumerate() {
+                        let want = quant::dot_row(ty, &w[r * row_bytes..(r + 1) * row_bytes], &xq);
+                        assert_eq!(g.to_bits(), want.to_bits(), "{ty} n {n} row {r}, {k:?}");
                     }
                 }
             }

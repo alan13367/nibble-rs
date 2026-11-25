@@ -365,3 +365,55 @@ fn qwen35_4b_drafting_gives_the_tokens_of_plain_decoding() {
         }
     }
 }
+
+/// The chat prompt of the Qwen3.5 cases.
+const SKY: &str = "<|im_start|>user\nExplain why the sky is blue in two sentences.<|im_end|>\n\
+                   <|im_start|>assistant\n";
+
+/// A mixture-of-experts model (`qwen35moe`), with Q4_K, Q5_K, Q6_K, Q8_0,
+/// F32 and BF16 tensors. Expected text from llama.cpp b12722 on the CPU
+/// (`-c 2048 -b 2048 -ub 1`, otherwise as above), which its Metal path also
+/// gives; trailing newlines are not compared. Drafting with the MTP head,
+/// itself a mixture of experts, leaves the text as it is.
+#[test]
+#[ignore = "needs models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"]
+fn qwen36_35b_a3b_greedy_matches_llama_cpp() {
+    let model = load_model("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf");
+    assert!(model.has_mtp());
+    let sky = "<think>\n\n</think>\n\nSunlight reaches Earth's atmosphere and is scattered in all \
+               directions by gases and particles, a phenomenon known as Rayleigh scattering. \
+               Because blue light is scattered more than other colors due to its shorter \
+               wavelength, the sky appears blue to our eyes.";
+    let code = "    match n {\n        0 => 0,\n        1 => 1,\n        _ => fibonacci(n - 1) + \
+                fibonacci(n - 2),\n    }\n}\n\nfn main() {\n    let n = 10;\n    println!(\"The \
+                {}-th Fibonacci number is: {}\", n, fibonacci(n));\n}";
+    for draft_max in [0, 3] {
+        for (prompt, want) in [(SKY, sky), ("fn fibonacci(n: u64) -> u64 {\n", code)] {
+            let (text, ..) = greedy_on(&model, prompt, 128, nibble::BackendKind::Cpu, draft_max);
+            assert_eq!(text.trim_end(), want, "drafting {draft_max}");
+        }
+    }
+}
+
+/// A dense Qwen3.5 model with `IQ4_NL` tensors (and Q5_K, IQ4_XS, Q6_K, Q4_K,
+/// Q8_0, Q3_K). Expected text as for the 35B above.
+#[test]
+#[ignore = "needs models/Qwen3.8-27B-UD-Q4_K_XL.gguf"]
+fn qwen38_27b_ud_q4_k_xl_greedy_matches_llama_cpp() {
+    let model = load_model("Qwen3.8-27B-UD-Q4_K_XL.gguf");
+    let (text, _) = greedy(&model, SKY, 64);
+    assert_eq!(
+        text.trim_end(),
+        "<think>\nThe user wants a two-sentence explanation of why the sky is blue. This is \
+         about Rayleigh scattering. I need to be concise and accurate in exactly two \
+         sentences.\n\nKey points: Sunlight contains all colors. When it hits molecules in the \
+         atmosphere, shorter wavelengths (blue/violet) scatter more than"
+    );
+    let (text, _) = greedy(&model, "fn fibonacci(n: u64) -> u64 {\n", 64);
+    assert_eq!(
+        text.trim_end(),
+        "    if n <= 1 {\n        return n;\n    }\n    fibonacci(n - 1) + fibonacci(n - 2)\n}\n\n\
+         fn main() {\n    let n = 10;\n    println!(\"The {}th Fibonacci number is: {}\", n, \
+         fibonacci(n));"
+    );
+}

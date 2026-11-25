@@ -1,6 +1,7 @@
 //! End-to-end tests on a tiny random Qwen3.5 model built in memory: one
 //! Gated DeltaNet layer, one gated attention layer and an MTP head, checked
-//! against an independent f64 implementation over whole sequences.
+//! against an independent f64 implementation over whole sequences; and the
+//! same model with mixture-of-experts feed-forwards (`qwen35moe`).
 
 use nibble::gguf::{GgmlType, GgufWriter, Storage};
 use nibble::sampler::{Sampler, SamplerConfig};
@@ -29,12 +30,140 @@ const CONV_K: usize = 4;
 const KEY_DIM: usize = N_K * D;
 const VALUE_DIM: usize = N_V * D;
 const CONV_DIM: usize = 2 * KEY_DIM + VALUE_DIM;
+// Mixture of experts.
+const N_EXPERT: usize = 6;
+const N_USED: usize = 3;
+const N_FF_EXP: usize = 16;
+const N_FF_SHARED: usize = 24;
 
 struct Ffn {
     norm: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
     down: Vec<f32>,
+    /// With experts, these replace the dense weights above.
+    moe: Option<Moe>,
+}
+
+/// Routed experts and a gated shared expert.
+struct Moe {
+    router: Vec<f32>,
+    /// `N_EXPERT` matrices, one after another.
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    shared_gate: Vec<f32>,
+    shared_up: Vec<f32>,
+    shared_down: Vec<f32>,
+    /// The one row giving the shared expert's gate.
+    shared_scale: Vec<f32>,
+}
+
+impl Moe {
+    fn new(rng: &mut Rng) -> Self {
+        Self {
+            router: rng.matrix(N_EXPERT, N_EMBD),
+            gate: rng.matrix(N_EXPERT * N_FF_EXP, N_EMBD),
+            up: rng.matrix(N_EXPERT * N_FF_EXP, N_EMBD),
+            down: rng.matrix(N_EXPERT * N_EMBD, N_FF_EXP),
+            shared_gate: rng.matrix(N_FF_SHARED, N_EMBD),
+            shared_up: rng.matrix(N_FF_SHARED, N_EMBD),
+            shared_down: rng.matrix(N_EMBD, N_FF_SHARED),
+            shared_scale: rng.matrix(1, N_EMBD),
+        }
+    }
+
+    fn add_tensors(&self, w: &mut GgufWriter, layer: usize) {
+        let name = |n: &str| format!("blk.{layer}.{n}.weight");
+        let (e, x, f, fs) = (
+            N_EMBD as u64,
+            N_EXPERT as u64,
+            N_FF_EXP as u64,
+            N_FF_SHARED as u64,
+        );
+        w.add_tensor(
+            name("ffn_gate_inp"),
+            GgmlType::F32,
+            &[e, x],
+            f32_bytes(&self.router),
+        )
+        .add_tensor(
+            name("ffn_gate_exps"),
+            GgmlType::F32,
+            &[e, f, x],
+            f32_bytes(&self.gate),
+        )
+        .add_tensor(
+            name("ffn_up_exps"),
+            GgmlType::F32,
+            &[e, f, x],
+            f32_bytes(&self.up),
+        )
+        .add_tensor(
+            name("ffn_down_exps"),
+            GgmlType::F32,
+            &[f, e, x],
+            f32_bytes(&self.down),
+        )
+        .add_tensor(
+            name("ffn_gate_shexp"),
+            GgmlType::F32,
+            &[e, fs],
+            f32_bytes(&self.shared_gate),
+        )
+        .add_tensor(
+            name("ffn_up_shexp"),
+            GgmlType::F32,
+            &[e, fs],
+            f32_bytes(&self.shared_up),
+        )
+        .add_tensor(
+            name("ffn_down_shexp"),
+            GgmlType::F32,
+            &[fs, e],
+            f32_bytes(&self.shared_down),
+        )
+        .add_tensor(
+            name("ffn_gate_inp_shexp"),
+            GgmlType::F32,
+            &[e],
+            f32_bytes(&self.shared_scale),
+        );
+    }
+
+    /// The experts' output for the normalized hidden state `h`: softmax
+    /// routing to the `N_USED` most likely, renormalized, plus the shared
+    /// expert scaled by its sigmoid gate.
+    fn apply(&self, h: &[f64]) -> Vec<f64> {
+        let logits = matvec(&self.router, h, N_EXPERT);
+        let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let p: Vec<f64> = logits.iter().map(|&l| (l - max).exp()).collect();
+        let mut order: Vec<usize> = (0..N_EXPERT).collect();
+        order.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
+        let chosen = &order[..N_USED];
+        let total: f64 = chosen.iter().map(|&e| p[e]).sum();
+        let mut out = vec![0.0; N_EMBD];
+        for &e in chosen {
+            let rows =
+                |m: &[f32], n: usize, cols: usize| m[e * n * cols..(e + 1) * n * cols].to_vec();
+            let gate = matvec(&rows(&self.gate, N_FF_EXP, N_EMBD), h, N_FF_EXP);
+            let up = matvec(&rows(&self.up, N_FF_EXP, N_EMBD), h, N_FF_EXP);
+            let act: Vec<f64> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
+            let y = matvec(&rows(&self.down, N_EMBD, N_FF_EXP), &act, N_EMBD);
+            for (o, v) in out.iter_mut().zip(y) {
+                *o += p[e] / total * v;
+            }
+        }
+        let gate = matvec(&self.shared_gate, h, N_FF_SHARED);
+        let up = matvec(&self.shared_up, h, N_FF_SHARED);
+        let act: Vec<f64> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
+        let y = matvec(&self.shared_down, &act, N_EMBD);
+        let scale = sigmoid(matvec(&self.shared_scale, h, 1)[0]);
+        for (o, v) in out.iter_mut().zip(y) {
+            *o += scale * v;
+        }
+        out
+    }
 }
 
 struct DeltaNet {
@@ -208,6 +337,7 @@ impl Ffn {
             gate: rng.matrix(N_FF, N_EMBD),
             up: rng.matrix(N_FF, N_EMBD),
             down: rng.matrix(N_EMBD, N_FF),
+            moe: None,
         }
     }
 
@@ -218,8 +348,11 @@ impl Ffn {
             GgmlType::F32,
             &[N_EMBD as u64],
             f32_bytes(&self.norm),
-        )
-        .add_tensor(
+        );
+        if let Some(moe) = &self.moe {
+            return moe.add_tensors(w, layer);
+        }
+        w.add_tensor(
             name("ffn_gate"),
             GgmlType::F32,
             &[N_EMBD as u64, N_FF as u64],
@@ -242,6 +375,9 @@ impl Ffn {
     /// `x += swiglu(rmsnorm(x))`.
     fn apply(&self, x: &mut [f64]) {
         let h = rmsnorm(x, &self.norm, EPS);
+        if let Some(moe) = &self.moe {
+            return add(x, &moe.apply(&h));
+        }
         let gate = matvec(&self.gate, &h, N_FF);
         let up = matvec(&self.up, &h, N_FF);
         let act: Vec<f64> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
@@ -286,6 +422,20 @@ impl Weights {
         }
     }
 
+    /// The same model with mixture-of-experts feed-forwards, the MTP head's included.
+    fn moe() -> Self {
+        let mut w = Self::new();
+        let mut rng = Rng(0x00E5_9E27);
+        for ffn in [&mut w.dn.ffn, &mut w.attn.ffn, &mut w.mtp.block.ffn] {
+            ffn.moe = Some(Moe::new(&mut rng));
+        }
+        w
+    }
+
+    fn is_moe(&self) -> bool {
+        self.dn.ffn.moe.is_some()
+    }
+
     fn gguf(&self) -> Vec<u8> {
         self.gguf_with(true)
     }
@@ -295,26 +445,35 @@ impl Weights {
     fn gguf_with(&self, mtp: bool) -> Vec<u8> {
         let e = N_EMBD as u64;
         let mut w = GgufWriter::new();
-        w.add("general.architecture", "qwen35")
+        let arch = if self.is_moe() { "qwen35moe" } else { "qwen35" };
+        let key = |k: &str| format!("{arch}.{k}");
+        w.add("general.architecture", arch)
             // Three blocks, the last one an MTP head that is not part of the trunk.
-            .add("qwen35.block_count", 3u32)
-            .add("qwen35.nextn_predict_layers", 1u32)
-            .add("qwen35.context_length", N_CTX as u32)
-            .add("qwen35.embedding_length", N_EMBD as u32)
-            .add("qwen35.feed_forward_length", N_FF as u32)
-            .add("qwen35.attention.head_count", N_HEAD as u32)
-            .add("qwen35.attention.head_count_kv", N_HEAD_KV as u32)
-            .add("qwen35.attention.key_length", HEAD_DIM as u32)
-            .add("qwen35.attention.value_length", HEAD_DIM as u32)
-            .add("qwen35.attention.layer_norm_rms_epsilon", EPS)
-            .add("qwen35.rope.freq_base", ROPE_BASE)
-            .add("qwen35.rope.dimension_count", ROPE_DIMS as u32)
-            .add("qwen35.ssm.conv_kernel", CONV_K as u32)
-            .add("qwen35.ssm.state_size", D as u32)
-            .add("qwen35.ssm.group_count", N_K as u32)
-            .add("qwen35.ssm.time_step_rank", N_V as u32)
-            .add("qwen35.ssm.inner_size", VALUE_DIM as u32)
-            .add("qwen35.full_attention_interval", 2u32);
+            .add(key("block_count"), 3u32)
+            .add(key("nextn_predict_layers"), 1u32)
+            .add(key("context_length"), N_CTX as u32)
+            .add(key("embedding_length"), N_EMBD as u32)
+            .add(key("attention.head_count"), N_HEAD as u32)
+            .add(key("attention.head_count_kv"), N_HEAD_KV as u32)
+            .add(key("attention.key_length"), HEAD_DIM as u32)
+            .add(key("attention.value_length"), HEAD_DIM as u32)
+            .add(key("attention.layer_norm_rms_epsilon"), EPS)
+            .add(key("rope.freq_base"), ROPE_BASE)
+            .add(key("rope.dimension_count"), ROPE_DIMS as u32)
+            .add(key("ssm.conv_kernel"), CONV_K as u32)
+            .add(key("ssm.state_size"), D as u32)
+            .add(key("ssm.group_count"), N_K as u32)
+            .add(key("ssm.time_step_rank"), N_V as u32)
+            .add(key("ssm.inner_size"), VALUE_DIM as u32)
+            .add(key("full_attention_interval"), 2u32);
+        if self.is_moe() {
+            w.add(key("expert_count"), N_EXPERT as u32)
+                .add(key("expert_used_count"), N_USED as u32)
+                .add(key("expert_feed_forward_length"), N_FF_EXP as u32)
+                .add(key("expert_shared_feed_forward_length"), N_FF_SHARED as u32);
+        } else {
+            w.add(key("feed_forward_length"), N_FF as u32);
+        }
         add_tokenizer(&mut w, &self.vocab, "qwen35");
         w.add_tensor(
             "token_embd.weight",
@@ -909,4 +1068,46 @@ fn a_replayed_rewind_leaves_a_checkpoint() {
     let mut want: Vec<u32> = t[..10].to_vec();
     want.push(t[29]);
     assert_eq!(session(&model).eval(&want).unwrap(), &got[..]);
+}
+
+/// The mixture-of-experts model against the reference, on the CPU and on
+/// Metal: whole sequences, rewinds and the MTP head (whose feed-forward is
+/// a mixture of experts too).
+#[test]
+fn moe_matches_a_naive_reference() {
+    let w = Weights::moe();
+    let model = w.model();
+    assert_eq!(model.config().architecture, Architecture::Qwen35Moe);
+    let tokens = [17u32, 99, 258, 3, 200, 65, 66];
+    for backend in BACKENDS {
+        let Some(mut s) = drafting(&model, backend, N_CTX, 0) else {
+            continue;
+        };
+        for n in [1, 2, tokens.len()] {
+            s.truncate(0).unwrap();
+            let logits = s.eval(&tokens[..n]).unwrap();
+            assert_close(logits, &w.reference_logits(&tokens[..n]), 3e-3);
+        }
+        let next = [5u32, 77, 140];
+        let got = s.draft_logits(&next).unwrap();
+        assert_close(got, &w.reference_draft(&tokens, &next), 3e-3);
+        s.truncate(4).unwrap();
+        let logits = s.eval(&[1, 2]).unwrap();
+        let mut expected = tokens[..4].to_vec();
+        expected.extend([1, 2]);
+        assert_close(logits, &w.reference_logits(&expected), 3e-3);
+    }
+}
+
+/// Batches give every token the logits it gets alone with experts too, and
+/// short evaluations rewind without replay.
+#[test]
+fn moe_batches_match_steps_and_rewind() {
+    let model = Weights::moe().model();
+    let n_vocab = model.config().n_vocab as u32;
+    let tokens: Vec<u32> = (0..30u32).map(|i| (i * 37 + 11) % n_vocab).collect();
+    for backend in BACKENDS {
+        common::assert_batches_match_steps(&model, backend, N_CTX, &tokens[..23], 9);
+        common::assert_rewinds_into_short_batches(&model, backend, N_CTX, &tokens);
+    }
 }

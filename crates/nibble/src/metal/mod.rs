@@ -38,19 +38,24 @@ use std::ops::Range;
 
 use device::{Buffer, Commands, Device, Size};
 use kernels::{
-    AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, MatvecArgs, Pipelines, RmsArgs,
+    AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, MatvecArgs, MoeArgs,
+    MoeSumArgs, Pipelines, RmsArgs, RouteArgs,
 };
 
 use crate::backend::{
     Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_LOGIT_ROWS, MAX_PENDING, ModelData,
     Param, QkNorm,
 };
-use crate::cpu::Weight;
+use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
 use weights::Weights;
 
 /// Threads per threadgroup of the element-wise and norm kernels.
 const THREADS: usize = 256;
+
+/// The most experts a router may choose from (the routing kernel keeps
+/// their probabilities in threadgroup memory).
+const MAX_EXPERTS: usize = 4096;
 
 /// Simdgroups per threadgroup of `delta_net`, and the state rows the
 /// threadgroup updates (`DELTA_ROWS` in the shader per simdgroup).
@@ -538,6 +543,86 @@ impl<'m> MetalBackend<'m> {
     }
 }
 
+impl MetalBackend<'_> {
+    /// Encodes the mixture-of-experts products: for every slot `s` of the
+    /// batch's `n * k`, `out_s = w_e · x` (or as `output` says, with `up`'s
+    /// expert `e` as the second matrix), `e` the slot's expert in `route`;
+    /// the input is row `s` of `x` with `per_slot`, else row `s / k`.
+    #[expect(clippy::too_many_arguments, reason = "one dispatch")]
+    fn encode_matvec_id(
+        &mut self,
+        w: &Experts,
+        up: Option<&Experts>,
+        x: &Buffer,
+        out: &Buffer,
+        route: &Buffer,
+        (k, per_slot): (usize, bool),
+        output: Output<'_>,
+    ) {
+        if self.n == 0 || !self.reserve(1) {
+            return;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return;
+        };
+        commands.barrier();
+        let result = (|| {
+            let f = &w.first;
+            let mv = self
+                .pipelines
+                .matvec(f.ty)
+                .ok_or_else(|| format!("no kernel for {} weights", f.ty))?;
+            if !f.cols.is_multiple_of(4) {
+                return Err(format!("{} columns is not a multiple of 4", f.cols));
+            }
+            let (mode, virtual_rows) = match output {
+                Output::SwiGlu(_) => (kernels::MATVEC_SWIGLU, 2 * f.rows),
+                _ => (kernels::MATVEC_STORE, f.rows),
+            };
+            let nsg = mv.nsg(f.cols);
+            let (_, nr0, _) = mv.pipeline(1);
+            let args = MatvecArgs {
+                cols: u32_of(f.cols, "a matrix width")?,
+                rows: u32_of(f.rows, "a matrix height")?,
+                row_bytes: u32_of(f.row_bytes, "a matrix row")?,
+                nsg,
+                mode,
+                ncols: 1,
+            };
+            let moe = MoeArgs {
+                k: u32_of(k, "an expert count")?,
+                per_slot: u32::from(per_slot),
+                expert_rows: u32_of(f.rows, "a matrix height")?,
+                count: u32_of(w.count, "an expert count")?,
+            };
+            let locate = |e: &Experts| {
+                self.weights.locate(&e.all()).ok_or_else(|| {
+                    format!("experts at byte {} are outside the model", e.first.offset)
+                })
+            };
+            let (w_buffer, w_offset) = locate(w)?;
+            let (w2_buffer, w2_offset) = locate(up.unwrap_or(w))?;
+            commands.set_pipeline(&mv.id);
+            commands.set_bytes(0, &args);
+            commands.set_buffer(1, w_buffer, w_offset);
+            commands.set_buffer(2, x, 0);
+            commands.set_buffer(3, out, 0);
+            commands.set_buffer(4, w2_buffer, w2_offset);
+            commands.set_buffer(5, route, 0);
+            commands.set_bytes(6, &moe);
+            if mv.smem(nr0) > 0 {
+                commands.set_threadgroup_memory(0, mv.smem(nr0));
+            }
+            let (groups, threads) = mv.grid(virtual_rows, nsg, nr0, self.n * k);
+            commands.dispatch(groups, threads);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.fail(e);
+        }
+    }
+}
+
 /// Encodes `out = w · x` (or as `output` says) into `commands`, for the
 /// vectors at the byte offsets given with their buffers.
 #[expect(clippy::too_many_arguments, reason = "one dispatch")]
@@ -706,6 +791,155 @@ impl Backend for MetalBackend<'_> {
             len: 0,
             capacity: n_ctx,
         })
+    }
+
+    fn moe_route(
+        &mut self,
+        logits: &MetalVector,
+        n_expert: usize,
+        k: usize,
+        route: &mut MetalVector,
+    ) {
+        let args = match (
+            u32_of(n_expert, "an expert count"),
+            u32_of(k, "an expert count"),
+        ) {
+            (Ok(n_expert), Ok(k)) => RouteArgs { n_expert, k },
+            (Err(e), _) | (_, Err(e)) => return self.fail(e),
+        };
+        if n_expert > MAX_EXPERTS {
+            return self.fail(format!("{n_expert} experts is more than {MAX_EXPERTS}"));
+        }
+        if self.n == 0 || !self.reserve(1) {
+            return;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return;
+        };
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.moe_route);
+        commands.set_bytes(0, &args);
+        commands.set_buffer(1, &logits.buffer, 0);
+        commands.set_buffer(2, &route.buffer, 0);
+        commands.set_threadgroup_memory(0, 4 * n_expert.next_multiple_of(4));
+        commands.dispatch(Size::new(self.n, 1, 1), Size::new(32, 1, 1));
+    }
+
+    fn moe_swiglu(
+        &mut self,
+        gate: &Experts,
+        up: &Experts,
+        x: &MetalVector,
+        route: &MetalVector,
+        k: usize,
+        out: &mut MetalVector,
+        up_out: &mut MetalVector,
+    ) {
+        let (g, u) = (&gate.first, &up.first);
+        let route = &route.buffer;
+        if (g.ty, g.cols, g.rows, g.row_bytes) == (u.ty, u.cols, u.rows, u.row_bytes) {
+            let output = Output::SwiGlu(&up.first);
+            return self.encode_matvec_id(
+                gate,
+                Some(up),
+                &x.buffer,
+                &out.buffer,
+                route,
+                (k, false),
+                output,
+            );
+        }
+        self.encode_matvec_id(
+            gate,
+            None,
+            &x.buffer,
+            &out.buffer,
+            route,
+            (k, false),
+            Output::Store,
+        );
+        self.encode_matvec_id(
+            up,
+            None,
+            &x.buffer,
+            &up_out.buffer,
+            route,
+            (k, false),
+            Output::Store,
+        );
+        let n = self.n * k * g.rows;
+        self.elementwise(|p| &p.swiglu, n, &[&out.buffer, &up_out.buffer]);
+    }
+
+    fn moe_down(
+        &mut self,
+        down: &Experts,
+        hidden: &MetalVector,
+        route: &MetalVector,
+        k: usize,
+        products: &mut MetalVector,
+        out: &mut MetalVector,
+    ) {
+        let e = down.first.rows;
+        let (route, products) = (&route.buffer, &products.buffer);
+        self.encode_matvec_id(
+            down,
+            None,
+            &hidden.buffer,
+            products,
+            route,
+            (k, true),
+            Output::Store,
+        );
+        let args = MoeSumArgs {
+            n: e as u32,
+            k: k as u32,
+        };
+        if self.n > 0
+            && self.reserve(1)
+            && let Some(commands) = self.commands.as_mut()
+        {
+            commands.barrier();
+            commands.set_pipeline(&self.pipelines.moe_combine);
+            commands.set_bytes(0, &args);
+            commands.set_buffer(1, products, 0);
+            commands.set_buffer(2, route, 0);
+            commands.set_buffer(3, &out.buffer, 0);
+            commands.dispatch(
+                Size::new(e.div_ceil(THREADS), self.n, 1),
+                Size::new(THREADS, 1, 1),
+            );
+        }
+    }
+
+    fn moe_residual(
+        &mut self,
+        moe: &MetalVector,
+        shared: &MetalVector,
+        gate: &MetalVector,
+        x: &mut MetalVector,
+        norm: Param,
+        eps: f32,
+        out: &mut MetalVector,
+    ) {
+        let e = norm.len();
+        if self.n > 0
+            && self.reserve(1)
+            && let Some(commands) = self.commands.as_mut()
+        {
+            commands.barrier();
+            commands.set_pipeline(&self.pipelines.moe_residual);
+            commands.set_bytes(0, &MoeSumArgs { n: e as u32, k: 0 });
+            commands.set_buffer(1, &moe.buffer, 0);
+            commands.set_buffer(2, &shared.buffer, 0);
+            commands.set_buffer(3, &gate.buffer, 0);
+            commands.set_buffer(4, &x.buffer, 0);
+            commands.dispatch(
+                Size::new(e.div_ceil(THREADS), self.n, 1),
+                Size::new(THREADS, 1, 1),
+            );
+        }
+        self.rmsnorm(x, norm, eps, out);
     }
 
     fn check_delta_net(&self, d: DeltaNetDims) -> Result<()> {

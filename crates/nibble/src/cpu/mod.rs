@@ -82,6 +82,40 @@ impl Weight {
     }
 }
 
+/// A stack of `count` expert matrices of one shape (a 3-D tensor): expert
+/// `e`'s rows follow expert `e - 1`'s.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Experts {
+    /// Expert 0.
+    pub(crate) first: Weight,
+    pub(crate) count: usize,
+}
+
+impl Experts {
+    /// Expert `e`'s matrix.
+    ///
+    /// # Panics
+    ///
+    /// If `e` is not below `count` (an internal invariant: experts are
+    /// chosen by the router).
+    pub(crate) fn expert(&self, e: usize) -> Weight {
+        assert!(e < self.count, "expert {e} of {}", self.count);
+        Weight {
+            offset: self.first.offset + e * self.first.rows * self.first.row_bytes,
+            ..self.first
+        }
+    }
+
+    /// Every expert as one matrix of `count * rows` rows.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn all(&self) -> Weight {
+        Weight {
+            rows: self.count * self.first.rows,
+            ..self.first
+        }
+    }
+}
+
 /// The input of a matrix product, encoded in the dot type of each weight
 /// type it is multiplied with (see [`quant`]): one encoded vector per token
 /// of the batch, one after another. Reused across products, so encoding
@@ -258,6 +292,108 @@ impl Cpu {
             // take the same elements as ggml's one pass over the whole vector.
             for t in 0..n {
                 kernels.swiglu(g.segment(t), u.segment(t));
+            }
+        });
+    }
+
+    /// `out = silu(gate_e · x_t) * (up_e · x_t)` for every slot `s` of
+    /// `ids`, where `e = ids[s]` and `x_t` is the vector of token
+    /// `t = s / k` in `x` (`k` slots per token): segment `s` of `out`
+    /// (`up_out` receives `up_e · x_t`). Each output row is one
+    /// [`Kernels::dot_rows`], as in [`Cpu::swiglu`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "two weights and their two outputs"
+    )]
+    pub(crate) fn moe_swiglu(
+        &self,
+        bytes: &[u8],
+        gate: &Experts,
+        up: &Experts,
+        ids: &[usize],
+        x: &[f32],
+        input: &mut EncodedInput,
+        out: &mut [f32],
+        up_out: &mut [f32],
+    ) {
+        let (g0, u0) = (gate.first, up.first);
+        let n = x.len() / g0.cols;
+        if n == 0 || ids.is_empty() {
+            return;
+        }
+        let k = ids.len() / n;
+        input.encode(self.kernels, x, g0.cols, [g0.ty, u0.ty]);
+        let (xg, xu) = (input.get(g0.ty), input.get(u0.ty));
+        let (lg, lu) = (xg.len() / n, xu.len() / n);
+        let kernels = self.kernels;
+        let (pool, chunk_len) = self.split_rows(g0.rows, 2 * ids.len() * g0.cols);
+        let split = Split {
+            segments: ids.len(),
+            chunk_len: chunk_len.unwrap_or(g0.rows).max(1),
+        };
+        pool.for_each_segment_chunk_pair(out, split, up_out, split, |_, g, u| {
+            let rows = g.start()..g.start() + g.len();
+            for (s, &e) in ids.iter().enumerate() {
+                let t = s / k;
+                let (we, wu) = (gate.expert(e), up.expert(e));
+                let (gs, us) = (g.segment(s), u.segment(s));
+                let xg = &xg[t * lg..(t + 1) * lg];
+                kernels.dot_rows(
+                    we.ty,
+                    we.rows_bytes(bytes, rows.clone()),
+                    we.row_bytes,
+                    xg,
+                    gs,
+                );
+                let xu = &xu[t * lu..(t + 1) * lu];
+                kernels.dot_rows(
+                    wu.ty,
+                    wu.rows_bytes(bytes, rows.clone()),
+                    wu.row_bytes,
+                    xu,
+                    us,
+                );
+                kernels.swiglu(gs, us);
+            }
+        });
+    }
+
+    /// `out_s = down_e · h_s` for every slot `s` of `ids`, `e = ids[s]` and
+    /// `h_s` the `s`-th vector of `hidden`: segment `s` of `out`.
+    pub(crate) fn moe_products(
+        &self,
+        bytes: &[u8],
+        down: &Experts,
+        ids: &[usize],
+        hidden: &[f32],
+        input: &mut EncodedInput,
+        out: &mut [f32],
+    ) {
+        let w0 = down.first;
+        if ids.is_empty() {
+            return;
+        }
+        input.encode(self.kernels, hidden, w0.cols, [w0.ty]);
+        let xq = input.get(w0.ty);
+        let len = xq.len() / ids.len();
+        let kernels = self.kernels;
+        let (pool, chunk_len) = self.split_rows(w0.rows, ids.len() * w0.cols);
+        let split = Split {
+            segments: ids.len(),
+            chunk_len: chunk_len.unwrap_or(w0.rows).max(1),
+        };
+        pool.for_each_segment_chunk([out], split, |_, _, o| {
+            let rows = o.start()..o.start() + o.len();
+            for (s, &e) in ids.iter().enumerate() {
+                let w = down.expert(e);
+                let x = &xq[s * len..(s + 1) * len];
+                kernels.dot_rows(
+                    w.ty,
+                    w.rows_bytes(bytes, rows.clone()),
+                    w.row_bytes,
+                    x,
+                    o.segment(s),
+                );
             }
         });
     }

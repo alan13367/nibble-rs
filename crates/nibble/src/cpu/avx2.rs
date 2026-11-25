@@ -217,7 +217,7 @@ fn encode(dt: DotType, x: &[f32], out: &mut [u8]) {
         // The x86 AVX2 `Q8_K` kernel is not here yet; it has to be
         // transcribed and checked on an x86 machine. The scalar encoder
         // produces the bytes every architecture agrees on.
-        DotType::Q8K => quant::encode_activation(dt, x, out),
+        DotType::Q8K | DotType::Q8_1 => quant::encode_activation(dt, x, out),
     }
 }
 
@@ -330,15 +330,15 @@ fn dot_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f
                 *o = dot_f32_le(row, xq);
             }
         }
-        // AVX2 kernels for the K-quants and `IQ4_XS` will be added and tested
-        // on an x86 machine. Until then the scalar reference keeps those types
-        // correct on x86 too, instead of refusing them.
-        GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs => {
+        // AVX2 kernels for the other types will be added and tested on an
+        // x86 machine. Until then the scalar reference keeps them correct
+        // on x86 too, instead of refusing them; its sums follow the NEON
+        // kernels, so x86 results can differ from llama.cpp's in the last bits.
+        _ => {
             for (o, row) in out.iter_mut().zip(rows) {
                 *o = quant::dot_row(ty, row, xq);
             }
         }
-        other => unreachable!("no AVX2 dot product for unsupported weight type {other}"),
     }
 }
 

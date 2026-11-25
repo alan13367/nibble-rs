@@ -15,18 +15,8 @@ use crate::model::{Architecture, ModelConfig};
 use crate::quant::test_data::{k_row, values};
 use crate::quant::{self, Q8_0Inverse};
 
-/// Every weight type the backend supports.
-const TYPES: [GgmlType; 9] = [
-    GgmlType::F32,
-    GgmlType::F16,
-    GgmlType::Bf16,
-    GgmlType::Q8_0,
-    GgmlType::Q3K,
-    GgmlType::Q4K,
-    GgmlType::Q5K,
-    GgmlType::Q6K,
-    GgmlType::Iq4Xs,
-];
+/// Every weight type the backend supports: all the CPU does.
+const TYPES: &[GgmlType] = crate::quant::SUPPORTED;
 
 fn gpu() -> Option<(Device, Pipelines)> {
     let device = match Device::system_default() {
@@ -58,7 +48,7 @@ fn weight_row(ty: GgmlType, cols: usize, seed: u32) -> Vec<u8> {
             quant::quantize_row_q8_0(&x, &mut out, Q8_0Inverse::NATIVE);
             out
         }
-        _ => k_row(ty, cols / quant::QK_K, seed),
+        _ => k_row(ty, cols / block_size(ty), seed),
     }
 }
 
@@ -121,7 +111,19 @@ fn silu(x: f64) -> f64 {
 /// Metal for a model it cannot run.
 #[test]
 fn every_supported_type_has_kernels() {
-    assert_eq!(TYPES, crate::quant::SUPPORTED);
+    let Some((_, pipelines)) = gpu() else {
+        return;
+    };
+    for &ty in TYPES {
+        assert!(
+            pipelines.matvec(ty).is_some(),
+            "no matrix-vector kernel for {ty}"
+        );
+        assert!(
+            pipelines.embed(ty).is_some(),
+            "no embedding kernel for {ty}"
+        );
+    }
 }
 
 /// A product over several inputs gives each input, bit for bit, the output
@@ -132,7 +134,7 @@ fn batched_matvec_equals_one_input_at_a_time() {
     let Some((device, pipelines)) = gpu() else {
         return;
     };
-    for ty in TYPES {
+    for &ty in TYPES {
         for (rows, cols) in [(65, 1024), (130, 3584), (9, 4160)] {
             if cols % block_size(ty) != 0 {
                 continue;
@@ -198,7 +200,7 @@ fn matvec_matches_cpu_reference() {
         (5, 100),
         (9, 4160),
     ];
-    for ty in TYPES {
+    for &ty in TYPES {
         assert!(pipelines.matvec(ty).is_some(), "no matvec kernel for {ty}");
         for (rows, cols) in shapes {
             if cols % block_size(ty) != 0 {
@@ -267,7 +269,7 @@ fn embed_matches_dequantize() {
     let Some((device, pipelines)) = gpu() else {
         return;
     };
-    for ty in TYPES {
+    for &ty in TYPES {
         let (pipeline, per_thread) = pipelines
             .embed(ty)
             .unwrap_or_else(|| panic!("no embedding kernel for {ty}"));

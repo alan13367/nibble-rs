@@ -20,7 +20,7 @@
 
 use std::ops::Range;
 
-use crate::cpu::Weight;
+use crate::cpu::{Experts, Weight};
 use crate::error::Result;
 use crate::model::ModelConfig;
 
@@ -265,6 +265,12 @@ pub(crate) trait Backend {
         Ok(())
     }
 
+    /// Checks, when a session starts, that the backend can run
+    /// mixture-of-experts layers ([`Backend::moe_route`] and the ops after it).
+    fn check_moe(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Positions held by `cache`.
     fn kv_len(&self, cache: &Self::KvCache) -> usize;
 
@@ -366,6 +372,66 @@ pub(crate) trait Backend {
         x: &Self::Vector,
         out: &mut Self::Vector,
         up_out: &mut Self::Vector,
+    );
+
+    /// The experts of every row of the router `logits` (`n_expert` values
+    /// per row), as llama.cpp's `build_moe_ffn` chooses them with softmax
+    /// gating: the `k` most probable, with their probabilities divided by
+    /// their sum. Row `t` of `route` holds the `k` expert indices (as exact
+    /// floats) then their `k` weights.
+    fn moe_route(
+        &mut self,
+        logits: &Self::Vector,
+        n_expert: usize,
+        k: usize,
+        route: &mut Self::Vector,
+    );
+
+    /// `out = silu(gate_e · x) * (up_e · x)` for each of the `k` experts `e`
+    /// that `route` gives each row of `x`: row `t * k + j` of `out` for
+    /// slot `j` of row `t`. `up_out` is scratch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "two weights and their two outputs"
+    )]
+    fn moe_swiglu(
+        &mut self,
+        gate: &Experts,
+        up: &Experts,
+        x: &Self::Vector,
+        route: &Self::Vector,
+        k: usize,
+        out: &mut Self::Vector,
+        up_out: &mut Self::Vector,
+    );
+
+    /// Row `t` of `out` = `Σ_j w_j (down_e · hidden_{t·k+j})` over the `k`
+    /// slots of row `t` of `route`: each expert's output scaled by its
+    /// weight, then summed from the first slot on (`ggml_mul`, then a chain
+    /// of `ggml_add`). `products` (`k` rows of `out` per row) is scratch.
+    fn moe_down(
+        &mut self,
+        down: &Experts,
+        hidden: &Self::Vector,
+        route: &Self::Vector,
+        k: usize,
+        products: &mut Self::Vector,
+        out: &mut Self::Vector,
+    );
+
+    /// `x += moe + shared * sigmoid(gate)` (`gate` one value per row), then
+    /// `out = rmsnorm(x) * norm`: the end of a feed-forward with a gated
+    /// shared expert, for every row.
+    #[expect(clippy::too_many_arguments, reason = "one fused op")]
+    fn moe_residual(
+        &mut self,
+        moe: &Self::Vector,
+        shared: &Self::Vector,
+        gate: &Self::Vector,
+        x: &mut Self::Vector,
+        norm: Param,
+        eps: f32,
+        out: &mut Self::Vector,
     );
 
     /// Attention for the tokens of the batch, which follow the positions in

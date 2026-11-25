@@ -5,13 +5,53 @@ use nibble_gguf::GgmlType;
 
 use super::device::{Device, KernelArgs, Pipeline, Size};
 
-/// The shader source, compiled once per backend.
-pub(crate) const SOURCE: &[&str] = &[
-    include_str!("shaders/common.metal"),
-    include_str!("shaders/matvec.metal"),
-    include_str!("shaders/kquants.metal"),
-    include_str!("shaders/ops.metal"),
-];
+/// The shader source, compiled once per backend: the files in order, with
+/// the I-quant codebooks ([`codebooks`]) after the shared definitions.
+pub(crate) fn source() -> String {
+    [
+        include_str!("shaders/common.metal"),
+        &codebooks(),
+        include_str!("shaders/matvec.metal"),
+        include_str!("shaders/kquants.metal"),
+        include_str!("shaders/iquants.metal"),
+        include_str!("shaders/ops.metal"),
+        include_str!("shaders/moe.metal"),
+    ]
+    .concat()
+}
+
+/// The I-quant codebooks as MSL `constant` arrays, from the CPU's tables.
+/// `iq1s_grid_gpu` is ggml-metal's packing of `iq1s_grid`: byte `j` holds
+/// value `j` plus one in its low nibble and value `j + 4` plus one in its
+/// high nibble.
+fn codebooks() -> String {
+    use crate::quant::{iq_grids as g, iquants::ksigns};
+    use std::fmt::Write;
+    fn table<T: std::fmt::LowerHex>(out: &mut String, ty: &str, name: &str, values: &[T]) {
+        let _ = write!(out, "constant {ty} {name}[{}] = {{", values.len());
+        for v in values {
+            let _ = write!(out, "0x{v:x},");
+        }
+        out.push_str("};\n");
+    }
+    let mut out = String::new();
+    table(&mut out, "uint64_t", "iq2xxs_grid", &g::IQ2XXS_GRID);
+    table(&mut out, "uint64_t", "iq2xs_grid", &g::IQ2XS_GRID);
+    table(&mut out, "uint64_t", "iq2s_grid", &g::IQ2S_GRID);
+    table(&mut out, "uint32_t", "iq3xxs_grid", &g::IQ3XXS_GRID);
+    table(&mut out, "uint32_t", "iq3s_grid", &g::IQ3S_GRID);
+    let gpu: Vec<u32> = g::IQ1S_GRID
+        .iter()
+        .map(|&e| {
+            let v = |j: usize| ((e >> (8 * j)) as u8 as i8 + 1) as u32;
+            (0..4).map(|j| (v(j) | v(j + 4) << 4) << (8 * j)).sum()
+        })
+        .collect();
+    table(&mut out, "uint32_t", "iq1s_grid_gpu", &gpu);
+    let signs: Vec<u8> = (0..128).map(ksigns).collect();
+    table(&mut out, "uint8_t", "ksigns_iq2xs", &signs);
+    out
+}
 
 /// Declares `repr(C)` argument structs of 4-byte fields, which have no
 /// padding, so they are [`KernelArgs`].
@@ -40,6 +80,10 @@ kernel_args! {
     /// Decode row `row` of a matrix.
     struct EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     struct RmsArgs { n: u32, eps: f32 }
+    /// The experts of a slot (`MoeArgs` in `shaders/common.metal`).
+    struct MoeArgs { k: u32, per_slot: u32, expert_rows: u32, count: u32 }
+    struct RouteArgs { n_expert: u32, k: u32 }
+    struct MoeSumArgs { n: u32, k: u32 }
     struct CountArgs { n: u32 }
     struct AttentionArgs {
         n_pos: u32, head_dim: u32, group: u32, kv_dim: u32, q_stride: u32, gated: u32,
@@ -67,6 +111,8 @@ pub(crate) const MATVEC_SWIGLU: u32 = 2;
 #[derive(Debug)]
 pub(crate) struct Matvec {
     pipeline: Pipeline,
+    /// The mixture-of-experts form of `pipeline` (`{name}_id`).
+    pub(crate) id: Pipeline,
     /// Kernels that take several inputs at once (`{name}_c{NC}`), by `NC`,
     /// with their rows (as `nr0`).
     wide: Vec<(usize, Pipeline, usize)>,
@@ -166,6 +212,22 @@ const MATVECS: &[MatvecSpec] = &[
     (GgmlType::Q5K, "matvec_q5_K", Some(2), 2, true,  0),
     (GgmlType::Q6K, "matvec_q6_K", Some(2), 2, true,  0),
     (GgmlType::Iq4Xs, "matvec_iq4_xs", Some(2), 2, true, 32 * 4),
+    (GgmlType::Q4_0, "matvec_q4_0", Some(2), 4, true, 0),
+    (GgmlType::Q4_1, "matvec_q4_1", Some(2), 4, true, 0),
+    (GgmlType::Q5_0, "matvec_q5_0", Some(2), 4, true, 0),
+    (GgmlType::Q5_1, "matvec_q5_1", Some(2), 4, true, 0),
+    (GgmlType::Iq4Nl, "matvec_iq4_nl", Some(2), 2, true, 32 * 4),
+    (GgmlType::Mxfp4, "matvec_mxfp4", Some(2), 2, true, 32 * 4),
+    (GgmlType::Q2K, "matvec_q2_K", Some(2), 4, true, 0),
+    // The codebooks some kernels copy to threadgroup memory: 256 or 512
+    // grid entries and the 128 sign bytes.
+    (GgmlType::Iq2Xxs, "matvec_iq2_xxs", Some(2), 4, true, 256 * 8 + 128),
+    (GgmlType::Iq2Xs, "matvec_iq2_xs", Some(2), 4, true, 512 * 8 + 128),
+    (GgmlType::Iq2S, "matvec_iq2_s", Some(2), 4, true, 0),
+    (GgmlType::Iq3Xxs, "matvec_iq3_xxs", Some(2), 4, true, 256 * 4 + 128),
+    (GgmlType::Iq3S, "matvec_iq3_s", Some(2), 4, true, 512 * 4),
+    (GgmlType::Iq1S, "matvec_iq1_s", Some(2), 4, true, 0),
+    (GgmlType::Iq1M, "matvec_iq1_m", Some(2), 4, true, 0),
 ];
 
 /// `(type, embedding kernel, values each thread writes)`.
@@ -180,6 +242,20 @@ const EMBEDS: &[(GgmlType, &str, usize)] = &[
     (GgmlType::Q5K, "embed_q5_K", 16),
     (GgmlType::Q6K, "embed_q6_K", 16),
     (GgmlType::Iq4Xs, "embed_iq4_xs", 16),
+    (GgmlType::Q4_0, "embed_q4_0", 32),
+    (GgmlType::Q4_1, "embed_q4_1", 32),
+    (GgmlType::Q5_0, "embed_q5_0", 32),
+    (GgmlType::Q5_1, "embed_q5_1", 32),
+    (GgmlType::Iq4Nl, "embed_iq4_nl", 32),
+    (GgmlType::Mxfp4, "embed_mxfp4", 32),
+    (GgmlType::Q2K, "embed_q2_K", 8),
+    (GgmlType::Iq2Xxs, "embed_iq2_xxs", 8),
+    (GgmlType::Iq2Xs, "embed_iq2_xs", 8),
+    (GgmlType::Iq2S, "embed_iq2_s", 8),
+    (GgmlType::Iq3Xxs, "embed_iq3_xxs", 8),
+    (GgmlType::Iq3S, "embed_iq3_s", 8),
+    (GgmlType::Iq1S, "embed_iq1_s", 8),
+    (GgmlType::Iq1M, "embed_iq1_m", 8),
 ];
 
 /// The `attention_g{G}_d{D}` kernels: up to `G` query heads per key head,
@@ -207,6 +283,9 @@ pub(crate) struct Pipelines {
     pub(crate) swiglu: Pipeline,
     pub(crate) copy: Pipeline,
     pub(crate) argmax: Pipeline,
+    pub(crate) moe_route: Pipeline,
+    pub(crate) moe_combine: Pipeline,
+    pub(crate) moe_residual: Pipeline,
     /// `(G, D, pipeline)` from [`ATTENTIONS`].
     attentions: Vec<(usize, usize, Pipeline)>,
     pub(crate) attention_reduce: Pipeline,
@@ -218,7 +297,7 @@ pub(crate) struct Pipelines {
 impl Pipelines {
     /// Compiles the shaders and creates every pipeline.
     pub(crate) fn new(device: &Device) -> Result<Self, String> {
-        let library = device.library(&SOURCE.concat())?;
+        let library = device.library(&source())?;
         let get = |name: &str| device.pipeline(&library, name);
         // A weight type whose kernels are missing is unsupported (the ops
         // report it) rather than stopping the backend.
@@ -226,6 +305,7 @@ impl Pipelines {
             .iter()
             .filter_map(|&(ty, name, nsg, nr0, per_simdgroup, smem)| {
                 let pipeline = get(name).ok()?;
+                let id = get(&format!("{name}_id")).ok()?;
                 let wide = WIDE
                     .iter()
                     .filter_map(|&(nc, rows)| Some((nc, get(&format!("{name}_c{nc}")).ok()?, rows)))
@@ -234,6 +314,7 @@ impl Pipelines {
                     ty,
                     Matvec {
                         pipeline,
+                        id,
                         wide,
                         nsg,
                         nr0,
@@ -254,6 +335,9 @@ impl Pipelines {
             swiglu: get("swiglu")?,
             copy: get("copy_f32")?,
             argmax: get("argmax")?,
+            moe_route: get("moe_route")?,
+            moe_combine: get("moe_combine")?,
+            moe_residual: get("moe_residual")?,
             attentions: ATTENTIONS
                 .iter()
                 .map(|&(g, d)| Ok((g, d, get(&format!("attention_g{g}_d{d}"))?)))

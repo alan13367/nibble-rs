@@ -66,7 +66,7 @@ impl Qwen3 {
                 .map(|_| b.kv_cache(n_ctx))
                 .collect::<Result<_>>()?,
             attn: AttentionBuffers::new(b, c, n_batch)?,
-            ffn: FfnBuffers::new(b, c, n_batch)?,
+            ffn: FfnBuffers::new(b, c, None, n_batch)?,
             scratch: Scratch::new(b, c, n_batch)?,
         })
     }

@@ -3,14 +3,19 @@
 A tiny, fast, cross-platform inference engine for GGUF models, written in Rust
 with **zero external dependencies**.
 
-> Early development. Today: Qwen3 (`qwen3`) and Qwen3.5 (`qwen35`, hybrid
-> Gated DeltaNet) on F32, F16, BF16, Q8_0, Q3_K–Q6_K and IQ4_XS weights.
+> Early development. Today: Qwen3 (`qwen3`), Qwen3.5 (`qwen35`, hybrid
+> Gated DeltaNet) and Qwen3.5/3.6 mixture-of-experts models (`qwen35moe`)
+> on F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K–Q6_K, IQ1_S, IQ1_M,
+> IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4 weights.
 > On Apple Silicon it runs on the GPU with Metal by default, with the same
 > greedy output as llama.cpp's Metal path; elsewhere (or with
-> `--backend cpu`) on the CPU, with AVX2 and NEON kernels that reproduce
-> llama.cpp's results bit for bit. The exceptions are BF16 on ARM, where
-> nibble is about six times faster instead, and the K-quants and IQ4_XS on
-> x86, which still use the scalar dot products. Models with a
+> `--backend cpu`) on the CPU, with dot products that reproduce
+> llama.cpp's ARM results bit for bit (NEON kernels for most types, the
+> scalar reference for Q2_K and the IQ1–IQ3 codebooks). The exceptions are
+> BF16 on ARM, where nibble is about six times faster instead, and x86,
+> where only F32/F16/BF16/Q8_0 have AVX2 kernels and the other types use
+> the scalar code (whose sums follow ggml's ARM kernels, so x86 results can
+> differ from llama.cpp's in the last bits). Models with a
 > multi-token-prediction head (Qwen3.5 files converted with it) can draft
 > tokens and check them in one pass (`--draft N`), with the same output as
 > without. It comes with an OpenAI-compatible server and `run`, `chat`,

@@ -264,6 +264,7 @@ static inline void matvec_q8_0_impl(
 }
 
 MATVEC_KERNEL_NC(matvec_q8_0, matvec_q8_0_impl, 2, 1)
+MATVEC_KERNEL_NC_ID(matvec_q8_0_id, matvec_q8_0_impl, 2)
 MATVEC_KERNEL_NC(matvec_q8_0_c2, matvec_q8_0_impl, 2, 2)
 MATVEC_KERNEL_NC(matvec_q8_0_c4, matvec_q8_0_impl, 2, 4)
 

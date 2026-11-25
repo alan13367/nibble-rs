@@ -112,7 +112,15 @@ pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConf
         }
     };
     let n_embd = non_zero("embedding_length", m.usize("embedding_length")?)?;
-    let n_ff = non_zero("feed_forward_length", m.usize("feed_forward_length")?)?;
+    // Mixture-of-experts models may have no dense feed-forward size; their
+    // buffers are then sized by the experts'.
+    let n_ff = match m.usize_opt("feed_forward_length")? {
+        Some(n) => n,
+        None => m
+            .usize_opt("expert_feed_forward_length")?
+            .ok_or_else(|| Error::MissingMetadata(m.key("feed_forward_length")))?,
+    };
+    let n_ff = non_zero("feed_forward_length", n_ff)?;
     let n_head = m.usize("attention.head_count")?;
     let n_head_kv = m.usize_opt("attention.head_count_kv")?.unwrap_or(n_head);
     if n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 {

@@ -1,14 +1,15 @@
 //! Building blocks shared by decoder architectures: the embedding/output
-//! head, grouped-query attention, and the SwiGLU feed-forward.
+//! head, grouped-query attention, and the SwiGLU and mixture-of-experts
+//! feed-forwards.
 //!
 //! An architecture module composes these and adds only what is specific to it.
 
 use nibble_gguf::Gguf;
 
-use super::bind::{matrix, vector};
+use super::bind::{experts, matrix, vector};
 use super::{Logits, ModelConfig};
 use crate::backend::{Backend, Param, Params, QkNorm};
-use crate::cpu::Weight;
+use crate::cpu::{Experts, Weight};
 use crate::error::Result;
 
 /// Token embeddings, final norm and output projection.
@@ -204,13 +205,26 @@ pub(crate) struct FfnBuffers<B: Backend> {
     /// `silu(gate · x) * (up · x)`.
     hidden: B::Vector,
     up: B::Vector,
+    /// A mixture of experts' buffers, for models that have one.
+    moe: Option<MoeBuffers<B>>,
 }
 
 impl<B: Backend> FfnBuffers<B> {
-    pub(crate) fn new(b: &mut B, c: &ModelConfig, n_batch: usize) -> Result<Self> {
+    /// Buffers for dense feed-forwards and, with `moe`, for mixtures of
+    /// experts of those sizes.
+    pub(crate) fn new(
+        b: &mut B,
+        c: &ModelConfig,
+        moe: Option<MoeDims>,
+        n_batch: usize,
+    ) -> Result<Self> {
+        if moe.is_some() {
+            b.check_moe()?;
+        }
         Ok(Self {
             hidden: b.vector(n_batch * c.n_ff)?,
             up: b.vector(n_batch * c.n_ff)?,
+            moe: moe.map(|d| MoeBuffers::new(b, c, d, n_batch)).transpose()?,
         })
     }
 }
@@ -237,5 +251,182 @@ impl SwiGlu {
     ) {
         b.swiglu(&self.gate, &self.up, &s.xn, &mut f.hidden, &mut f.up);
         s.add(b, &self.down, &f.hidden, next);
+    }
+}
+
+/// A feed-forward block: dense SwiGLU, or a mixture of experts.
+pub(crate) enum Ffn {
+    Dense(SwiGlu),
+    Moe(Box<Moe>),
+}
+
+impl Ffn {
+    /// Feed-forward of `s.xn`, added to the hidden state, which is then
+    /// normalized with `next` into `s.xn`.
+    ///
+    /// # Panics
+    ///
+    /// For a mixture of experts, if `f` has no buffers for one (an
+    /// internal invariant: the state is built for the model).
+    pub(crate) fn forward<B: Backend>(
+        &self,
+        b: &mut B,
+        f: &mut FfnBuffers<B>,
+        s: &mut Scratch<B>,
+        next: Next,
+    ) {
+        match self {
+            Self::Dense(ffn) => ffn.forward(b, f, s, next),
+            Self::Moe(m) => {
+                let buffers = f
+                    .moe
+                    .as_mut()
+                    .expect("a mixture of experts without its buffers");
+                m.forward(b, buffers, s, next);
+            }
+        }
+    }
+}
+
+/// Mixture-of-experts feed-forward with a gated shared expert, as
+/// llama.cpp's `build_moe_ffn` with softmax gating and normalized weights,
+/// plus Qwen's shared expert:
+///
+/// ```text
+/// p      = softmax(ffn_gate_inp · x)
+/// e_1..k = the k most probable experts,  w_j = p[e_j] / Σ p[e_j]
+/// moe    = Σ_j w_j · down_e · (silu(gate_e · x) * (up_e · x))
+/// shared = sigmoid(ffn_gate_inp_shexp · x) · swiglu_shexp(x)
+/// out    = moe + shared
+/// ```
+pub(crate) struct Moe {
+    router: Weight,
+    gate: Experts,
+    up: Experts,
+    down: Experts,
+    /// Experts per token.
+    k: usize,
+    shared: SwiGlu,
+    /// `ffn_gate_inp_shexp`, one row.
+    shared_gate: Weight,
+}
+
+/// The sizes of a mixture-of-experts block.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoeDims {
+    pub(crate) n_expert: usize,
+    /// Experts per token.
+    pub(crate) k: usize,
+    /// Hidden size of each expert.
+    pub(crate) n_ff: usize,
+    /// Hidden size of the shared expert.
+    pub(crate) n_ff_shared: usize,
+}
+
+/// Buffers for [`Moe::forward`].
+pub(crate) struct MoeBuffers<B: Backend> {
+    logits: B::Vector,
+    route: B::Vector,
+    hidden: B::Vector,
+    up: B::Vector,
+    /// Each expert's output, before the weighted sum.
+    products: B::Vector,
+    out: B::Vector,
+    shared_hidden: B::Vector,
+    shared_up: B::Vector,
+    shared_out: B::Vector,
+    shared_gate: B::Vector,
+}
+
+impl<B: Backend> MoeBuffers<B> {
+    pub(crate) fn new(b: &mut B, c: &ModelConfig, d: MoeDims, n_batch: usize) -> Result<Self> {
+        let rows = |n: usize| n_batch * n;
+        Ok(Self {
+            logits: b.vector(rows(d.n_expert))?,
+            route: b.vector(rows(2 * d.k))?,
+            hidden: b.vector(rows(d.k * d.n_ff))?,
+            up: b.vector(rows(d.k * d.n_ff))?,
+            products: b.vector(rows(d.k * c.n_embd))?,
+            out: b.vector(rows(c.n_embd))?,
+            shared_hidden: b.vector(rows(d.n_ff_shared))?,
+            shared_up: b.vector(rows(d.n_ff_shared))?,
+            shared_out: b.vector(rows(c.n_embd))?,
+            shared_gate: b.vector(rows(1))?,
+        })
+    }
+}
+
+impl Moe {
+    /// Binds `blk.{layer}.ffn_{gate_inp,gate_exps,up_exps,down_exps}` and the
+    /// shared expert `ffn_{gate,up,down}_shexp` with its gate `ffn_gate_inp_shexp`.
+    pub(crate) fn load(g: &Gguf<'_>, c: &ModelConfig, d: MoeDims, layer: usize) -> Result<Self> {
+        let name = |n: &str| format!("blk.{layer}.{n}.weight");
+        Ok(Self {
+            router: matrix(g, &name("ffn_gate_inp"), c.n_embd, d.n_expert)?,
+            gate: experts(g, &name("ffn_gate_exps"), c.n_embd, d.n_ff, d.n_expert)?,
+            up: experts(g, &name("ffn_up_exps"), c.n_embd, d.n_ff, d.n_expert)?,
+            down: experts(g, &name("ffn_down_exps"), d.n_ff, c.n_embd, d.n_expert)?,
+            k: d.k,
+            shared: SwiGlu {
+                gate: matrix(g, &name("ffn_gate_shexp"), c.n_embd, d.n_ff_shared)?,
+                up: matrix(g, &name("ffn_up_shexp"), c.n_embd, d.n_ff_shared)?,
+                down: matrix(g, &name("ffn_down_shexp"), d.n_ff_shared, c.n_embd)?,
+            },
+            shared_gate: matrix(g, &name("ffn_gate_inp_shexp"), c.n_embd, 1)?,
+        })
+    }
+
+    /// See [`Ffn::forward`].
+    fn forward<B: Backend>(
+        &self,
+        b: &mut B,
+        f: &mut MoeBuffers<B>,
+        s: &mut Scratch<B>,
+        next: Next,
+    ) {
+        let n_expert = self.router.rows;
+        b.matvecs(
+            &s.xn,
+            [
+                (&self.router, &mut f.logits),
+                (&self.shared_gate, &mut f.shared_gate),
+            ],
+        );
+        b.moe_route(&f.logits, n_expert, self.k, &mut f.route);
+        b.moe_swiglu(
+            &self.gate,
+            &self.up,
+            &s.xn,
+            &f.route,
+            self.k,
+            &mut f.hidden,
+            &mut f.up,
+        );
+        b.moe_down(
+            &self.down,
+            &f.hidden,
+            &f.route,
+            self.k,
+            &mut f.products,
+            &mut f.out,
+        );
+        let sh = &self.shared;
+        b.swiglu(
+            &sh.gate,
+            &sh.up,
+            &s.xn,
+            &mut f.shared_hidden,
+            &mut f.shared_up,
+        );
+        b.matvecs(&f.shared_hidden, [(&sh.down, &mut f.shared_out)]);
+        b.moe_residual(
+            &f.out,
+            &f.shared_out,
+            &f.shared_gate,
+            &mut s.x,
+            next.norm,
+            next.eps,
+            &mut s.xn,
+        );
     }
 }
