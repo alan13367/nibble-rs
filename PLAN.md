@@ -18,11 +18,12 @@ This is a living document: update it when a decision changes.
 | Metal backend | Done (Phase 6) and the default (`auto`): `qwen3` and `qwen35` on every supported weight type, zero-copy weights (split across buffers past the device limit), a few command buffers per token. Greedy output identical to llama.cpp b12359's Metal path (`-ngl 99 -fa off -ub 1`) on 29 of 30 short prompt/model pairs, all 7 local files after a 4,557-token prompt, and all 12 runs of the two 9B files on an M4 Max. The exception is a tie on Qwen3-0.6B BF16 (top two logits 0.001 apart) where llama.cpp's own CPU path takes nibble's side. Against nibble's CPU path the tokens differ only where llama.cpp's CPU and Metal paths differ too; see Phase 6. Tested on the M4 Max only |
 | Speed (M4 Max GPU, 32 cores, tg128, 3 reps) | Faster than `llama-bench -ngl 99` (b12359) on every local file, flash attention off / on, at an empty context and at 4096 tokens (`nibble bench -d 4096`, llama-bench `-d 4096`). Empty: Qwen3-0.6B BF16 244.4 tok/s (202.5 / 215.0), Q8_0 373.7 (267.0 / 300.9), Qwen3.5-0.8B Q8_0 318.1 (244.6 / 241.6), Q4_K_M 392.9 (249.9 / 267.1), Q3_K_M 394.4 (265.2 / 256.0), Qwen3.5-9B UD-Q4_K_XL 59.4 (49.3 / 45.2), 9B Q8_0 33.2 (31.6 / 32.7). At 4096: 178.1 (126.0 / 167.5), 237.9 (154.3 / 228.0), 270.6 (217.2 / 224.0), 322.0 (245.7 / 255.8), 323.1 (236.2 / 244.1), 51.6 (49.0 / 43.9), 35.7 (31.1 / 32.6). The 9B Q4 file reads about 326 GB/s, 84% of the measured ~390 GB/s; the 0.6–0.8B files 46–71%, bound by the chain of about 180 dependent dispatches per token (4–6 µs each) |
 | Qwen3.5-9B (UD-Q4_K_XL 5.6 GiB and Q8_0 8.9 GiB, M4 Max) | Both run on both backends (UD-Q4_K_XL mixes IQ4_XS into its K-quants; 32 value heads share 16 key heads). Greedy output identical to llama.cpp b12359 on all 6 comparison prompts for both files on the CPU (`--no-repack -ub 1`) and on Metal (`-ngl 99 -fa off -ub 1`), and after a 4,557-token prompt on Metal. Metal decode in the row above. CPU decode (UD-Q4_K_XL) 27.1 tok/s at 10 threads (llama.cpp 35.6 with repacking): the CPU gap at this size is not investigated yet. Prompt: 65.7 tok/s on Metal one token at a time (llama.cpp 685 batched) |
-| CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench`; `--backend auto\|cpu\|metal` (default auto: Metal where available, with the reason printed when it falls back to the CPU) |
+| CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench`; `--backend auto\|cpu\|metal` (default auto: Metal where available, with the reason printed when it falls back to the CPU); `--draft N` (MTP drafting, with acceptance printed by `run`) |
 | OpenAI server | Complete for Phase 3: tools, logprobs, recurrent-state checkpoints. Verified with curl, socket tests, and the official OpenAI Python client (3.58 on both models on the CPU; 3.59 on Metal with Qwen3-0.6B, Qwen3.5-0.8B and the 9B: models, multi-turn chat, reasoning, streaming with usage, tool calls and results, streamed tool calls, logprobs, stop, length, completions, seeded sampling, 6 concurrent async requests, context overflow). Where the CPU and Metal answers differ (a tool call on Qwen3.5-0.8B), llama-server's CPU and Metal paths give the same first-token log-probabilities as nibble's to 0.001. Open WebUI not tried |
-| Tests | 216 pass in `cargo test --workspace` (no model files needed; the Metal tests skip where no Metal device exists and fail on a Mac whose GPU cannot start the backend); 202 as x86_64 under Rosetta before IQ4_XS (not rerun since); 9 llama.cpp reference tests on real models (8 pass here with `--ignored`; `qwen35_bf16` needs a file that is not on this machine) |
-| Not started | AVX2 kernels for the K-quants (scalar on x86 until an x86 machine can test them), CUDA, batched prompt processing |
-| Git | Four commits; the `Backend` refactor, the Metal backend and IQ4_XS are uncommitted |
+| Tests | 227 pass in `cargo test --workspace` (no model files needed; the Metal tests skip where no Metal device exists and fail on a Mac whose GPU cannot start the backend); 202 as x86_64 under Rosetta before IQ4_XS (not rerun since); 10 reference tests on real models (9 pass here with `--ignored`; `qwen35_bf16` needs a file that is not on this machine) |
+| Not started | AVX2 kernels for the K-quants (scalar on x86 until an x86 machine can test them), CUDA |
+| In progress | Phase 7: batched evaluation and MTP speculative decoding (see its section). Done: one forward pass per batch on both backends (bit-identical to one token at a time), DeltaNet rollback within a short batch, `Session::eval_all`, the Qwen3.5 MTP head and speculative `generate` (`--draft N`; same tokens as without drafts). pp512 on the M4 Max, Qwen3.5-0.8B Q8_0: CPU 298.4 → 352.5 tok/s, Metal 418.2 → 959.4 (llama.cpp b12359: 1857.7 with its BLAS backend, 6924.2). Drafting does not pay yet: verifying n tokens still costs about n tokens (next: multi-column kernels) |
+| Git | Five commits; the Metal backend and IQ4_XS are committed |
 
 ## Decisions
 
@@ -249,8 +250,13 @@ the CPU op `ggml_compute_forward_gated_delta_net`.
 - **Hybrid 3:1 layout:** 24 trunk layers. Layers with `(i + 1) % 4 != 0` are
   **Gated DeltaNet** (linear attention, 18 layers); every 4th layer is **gated
   full attention** (6 layers).
-- **MTP layer:** the Q8_0 file has `block_count = 25`. Layer 24 is the MTP
-  (`nextn`) draft head and is skipped in normal decoding. The BF16 file has no MTP layer.
+- **MTP layer:** files converted with the head have `nextn_predict_layers = 1`
+  and one more block (`block_count = 25`): layer 24 is the MTP (`nextn`)
+  draft head, skipped in normal decoding. `convert_hf_to_gguf.py --mtp`
+  instead writes the head alone to an `mtp-*.gguf` sidecar (with
+  `token_embd`, `output_norm` and `output`). Of the local files only
+  `Qwen3.5-4B-Q8_0.gguf` has one (`blk.32`, without `embed_tokens` or
+  `shared_head_head`, so it uses the tied `token_embd` for both).
 - **Dimensions:** `n_embd` 1024, FFN 3584 (SwiGLU), RMSNorm eps 1e-6.
 - **Tied embeddings:** vocabulary 248,320. There is no `output.weight`, so
   `token_embd` is also the LM head.
@@ -390,10 +396,150 @@ Design rules:
 | **3. OpenAI server** ✅ | `nibble-server` (std-only HTTP/1.1 + SSE, JSON in `nibble-json`), chat/completions/models/health, streaming with usage, `reasoning_content`, stop sequences, API key, CORS, FIFO worker with prefix reuse, tool calling, logprobs, recurrent-state checkpoints; `nibble serve` | Verified with curl, socket tests and the official OpenAI Python client on Qwen3 and Qwen3.5 (chat, streaming, reasoning, logprobs, tool round trips streamed and not, completions, errors). Open WebUI not tried |
 | **4. CPU speed** (x86 AVX2 and Apple Silicon NEON done) | AVX2 kernels for F32/F16/BF16/Q8_0, NEON kernels for those plus Q3_K/Q4_K/Q5_K/Q6_K (and `Q8_K` activations), persistent thread pool, grouped and fused matvecs, parallel DeltaNet and attention heads, performance-core default on Apple Silicon; `nibble bench`. Still to do: AVX2 K-quant kernels, measured on x86 | Met on the 5600X (Q8_0 tg128 5–16% faster than llama.cpp, BF16 3–8% faster, before the numerics fixes) and on an M4 Max (NEON tg128 faster than llama.cpp b12359 on the CPU on four of the five local files and tied on Qwen3-0.6B Q8_0, at 10 performance cores; output identical to it on 29 of 30 comparison runs) |
 | **5. CUDA backend** | Loader, bindings, memory, fatbin kernels, CUDA graphs, CPU fallback | Same greedy tokens as CPU; decode at least as fast as llama.cpp CUDA on the 3070 Ti |
-| **6. Metal backend** (done) | objc bindings, zero-copy weights (split across buffers past `maxBufferLength`), MSL kernels, a few command buffers per token, every one checked for errors; `qwen3`/`qwen35` on every supported type with the residual, SwiGLU, attention and DeltaNet fusions; attention that reads each cached key and value once per token for all query heads sharing it; `auto` as the default. Left for later: other Apple chips and older macOS versions (untested; `auto` falls back to the CPU and prints why when the backend does not start), fewer dependent steps per token on small models | Same greedy tokens as llama.cpp's Metal path (met: 29/30 short with one 0.001 tie, 7/7 after a long prompt, 12/12 on the 9B files), and as the CPU except at near-ties; decode at least as fast as llama.cpp Metal (met on every local file, flash attention off and on, at an empty context and at 4096 tokens) |
-| **7. Prompt processing** | Batched matmul on every backend (CPU tiles, CUDA tensor cores, Metal simdgroup matrices), chunked DeltaNet, parallel server slots | pp512 within 25% of llama.cpp on each backend |
-| **8. Breadth** | Qwen3.5 2B/4B, `llama` and further dense archs, MTP speculative decoding, Vulkan for AMD/Intel, an AVX2 IQ4_XS kernel. Done: IQ4_XS (CPU and Metal) and the local Qwen3.5-9B UD-Q4_K_XL file, whose 32 value heads share 16 key heads (the grouping matches llama.cpp) | The local 4B/9B `qwen35` files run correctly on every backend |
+| **6. Metal backend** ✅ | objc bindings, zero-copy weights (split across buffers past `maxBufferLength`), MSL kernels, a few command buffers per token, every one checked for errors; `qwen3`/`qwen35` on every supported type with the residual, SwiGLU, attention and DeltaNet fusions; attention that reads each cached key and value once per token for all query heads sharing it; `auto` as the default. Left for later: other Apple chips and older macOS versions (untested; `auto` falls back to the CPU and prints why when the backend does not start), fewer dependent steps per token on small models | Same greedy tokens as llama.cpp's Metal path (met: 29/30 short with one 0.001 tie, 7/7 after a long prompt, 12/12 on the 9B files), and as the CPU except at near-ties; decode at least as fast as llama.cpp Metal (met on every local file, flash attention off and on, at an empty context and at 4096 tokens) |
+| **7. Batched evaluation and MTP** (in progress) | One forward pass for a batch of tokens on CPU and Metal (CUDA when Phase 5 exists), DeltaNet rollback within a batch, the Qwen3.5 MTP head and speculative decoding with it, prompt GEMM (CPU tiles, Metal simdgroup matrices), parallel server slots. Steps in the Phase 7 section | pp512 within 25% of llama.cpp on each backend; speculative decoding gives the same tokens as plain decoding and decodes faster on the MTP files |
+| **8. Breadth** | Qwen3.5 2B/4B, `llama` and further dense archs, Vulkan for AMD/Intel, an AVX2 IQ4_XS kernel. Done: IQ4_XS (CPU and Metal) and the local Qwen3.5-9B UD-Q4_K_XL file, whose 32 value heads share 16 key heads (the grouping matches llama.cpp) | The local 4B/9B `qwen35` files run correctly on every backend |
 | **9. Packaging** | Stable Rust API, C ABI (`cdylib` + header), WASM (simd128, in-memory weights), prebuilt release binaries | — |
+
+## Phase 7: batched evaluation and MTP speculative decoding
+
+Speculative decoding pays only when the target model checks a draft of n
+tokens for about the cost of one: one forward pass over a batch, reading
+each weight once. Prompt processing needs the same pass, so it comes first.
+
+### What llama.cpp does (source at b12723, read 2026-11-25)
+
+- **The MTP head** (`src/models/qwen35.cpp`, `graph_mtp`) is one block after
+  the trunk, `blk.{n_layer}`: `nextn.eh_proj` `[2·n_embd, n_embd]`,
+  `nextn.enorm`, `nextn.hnorm`, a gated-attention block with its own KV
+  cache, a SwiGLU, and optional `nextn.embed_tokens` / `shared_head_head` /
+  `shared_head_norm` (else `token_embd`, `output`, `output_norm`). At
+  position p it reads the token at p and `h_nextn`, the trunk's final hidden
+  state at p − 1 *after* `output_norm`:
+  `x = eh_proj · [rmsnorm(e) * enorm ; rmsnorm(h) * hnorm]` (embedding
+  first), then the block, the head norm and the LM head, predicting the
+  token at p + 1. Its own normalized output is the `h` of the next draft step.
+- **The loop** (`common/speculative.cpp` `draft-mtp`,
+  `tools/server/server-context.cpp`): after every target batch (the prompt,
+  or a verification), the head runs over the same tokens, each paired with
+  the target's `h` of the position before (the first with the `h` carried
+  over from the previous batch); that fills its KV cache, and no logits
+  are computed. Drafting runs the head on the last sampled token, then on
+  each draft, up to `--draft-max` (default 3), taking the top token and
+  stopping when its probability (over the top 10) is below `--draft-p-min`
+  (default 0). The target evaluates `[last, d1..dn]` as one batch with
+  logits for every row; tokens are accepted while the target's own sample
+  equals the draft (sample-and-match: exact for any sampler, since every
+  kept token is sampled from the target). Rejected positions are dropped
+  from both KV caches. Enabled with `--spec-type draft-mtp` (or `--mtp`).
+- **Recurrent rollback** (`rs_replay`, `src/models/delta-net-base.cpp`): a
+  batch of 2 to `n_rs_seq + 1` tokens leaves the committed DeltaNet state
+  and convolution history as they were and stores the batch's inputs (conv
+  rows, k, v, gate, beta) as pending. The next batch first replays the
+  pending tokens that were kept, then runs its own. Rejecting draft tokens
+  costs nothing, and no state is copied.
+- **DeltaNet over a batch** (`ggml_compute_forward_gated_delta_net`) runs
+  the tokens one after another per head, exactly as decoding does; ggml-cpu
+  has no chunked form.
+- **Batched products round differently from decoding:** ggml-cpu uses
+  llamafile's tinyBLAS (F32, F16, Q8_0) or the repacked GEMMs, and
+  llama-bench on macOS also lists the BLAS (Accelerate) backend; ggml-metal
+  uses `mul_mv_ext` for 2–8 columns (4–8 for K-quants) and `mul_mm`
+  (simdgroup matrices on f16 tiles) above that.
+
+### Decisions
+
+- **One forward pass for n tokens.** The `Backend` ops take a batch, set
+  by `begin(pos, n)`; decoding is n = 1. Activation vectors hold up to
+  `n_batch` rows. `Session::eval` splits its tokens into batches (and at the
+  checkpoint position).
+- **CPU batches are bit-identical to decoding.** Every output element comes
+  from the same kernel call as when the tokens are evaluated one at a time:
+  a product reuses each block of weight rows for every column of the batch,
+  each token's attention runs over its own causal row with the same padding,
+  and DeltaNet runs the tokens one after another. So prompt processing still
+  compares with llama.cpp at `-ub 1`, and speculative decoding gives exactly
+  the tokens of plain decoding, greedy or seeded (the sampler sees the same
+  logits in the same order). That equality is the main test of the MTP loop.
+- **Metal batches up to 8** use multi-column versions of the current matvec
+  kernels, each column reduced as now (bit-identical to decoding, so the
+  same test holds), not ggml's `mul_mv_ext`. **Prompt batches above 8** use
+  a transcription of ggml-metal's `mul_mm`, compared with llama.cpp's Metal
+  path at its default `-ub`.
+- **DeltaNet rollback as llama.cpp's `rs_replay`**, not state snapshots:
+  copying 19 MiB of state per verification would cost about what the drafts
+  save on the 0.8B model.
+- **MTP needs a file with the head:** in the main file
+  (`nextn_predict_layers`) or as an `mtp-*.gguf` sidecar. Both layouts are
+  supported; the draft runs on the same backend as the target.
+
+### Steps
+
+1. ✅ **Batched forward.** `Backend` ops over n tokens (`begin(pos, n)`),
+   `Session::eval` in batches of `n_batch` (default 512, cut at the
+   checkpoint), and a CPU product in which each task takes a range of
+   output rows for every token, multiplying each 16 KiB block of weight
+   rows with every token's input (`ThreadPool::for_each_segment_chunk`).
+   Metal runs a batch one column at a time. Batched and per-token logits
+   are bit-identical (unit tests on every weight type and kernel set, the
+   synthetic models on both backends with batches of 2, 3, 5 and 64), and
+   greedy output with the top-3 logits is unchanged on 69 runs (the 6
+   comparison prompts on the 5 small files, CPU and Metal, and the 9B and
+   4B files). pp512 above; Metal gained by committing a batch, not a
+   token, at a time.
+2. ✅ **DeltaNet rollback.** The convolution ring has `conv_kernel - 1 +
+   MAX_PENDING` rows; a batch of 2 to 16 tokens runs from the committed
+   state on a work copy, keeps its inputs in the ring and its beta/alpha
+   projections in `pending_ba`, and the next batch first applies the kept
+   ones with the same kernels (bit-identical). Checkpoints save the window
+   and the kept pending tokens. `Session::eval_all` (up to 16 tokens, one
+   pass, every token's logits, no checkpoint) is what drafts are verified
+   with; rewinding into it replays nothing (tests on both backends).
+3. ✅ **The MTP head** (main-file layout; the sidecar is not done). It
+   runs on the trunk's backend with its own KV cache, its attention and
+   feed-forward on the trunk's scratch buffers. After each trunk batch it
+   catches up over the same tokens; a rewind into the last batch takes the
+   hidden state of the new end from the rows it paired; checkpoints carry
+   that hidden state. Checked against an f64 reference on the synthetic
+   model (with drafts chained), bit for bit against a fresh evaluation
+   after batches, rewinds and checkpoint restores, and on the 4B file by
+   acceptance: with 3 drafts on the chat prompt nibble accepts 45/55 (82%)
+   on Metal and 44/58 (76%) on the CPU, llama.cpp b12722's `draft-mtp`
+   44/54 and 45/51 (same text). A tensor-level check with `cb_eval` is
+   still to do.
+4. **Speculative generation** (correct, not yet faster).
+   `SessionOptions::draft_max` (`--draft N`), greedy drafts, verification
+   by sample-and-match, `Session::draft_stats` and `draft_logits`. Tokens,
+   stop reason, final session and logits are the same with 0, 1, 3 and 15
+   drafts on the synthetic model (greedy and seeded sampling with a repeat
+   penalty, every stop reason, both backends), and on the 4B file with 1,
+   3 and 6 (reference test). Speed on the 4B (64 tokens, chat prompt):
+   CPU 47.0 → 36.7 tok/s, Metal 72.9 → 63.9; llama.cpp b12722 with
+   `draft-mtp` reaches 81 (CPU) and 122 (Metal). The reason: verifying n
+   tokens costs n tokens. `eval_all` of 1/2/4/8 tokens on the 4B takes
+   20.3/37.5/73.9/148.2 ms on the CPU and 15.4/23.9/43.7/84.6 ms on Metal.
+   The CPU dot kernels are compute-bound at decode (about 20 G
+   multiply-adds per second per core whether or not the weights are in
+   cache), so sharing weight reads saves nothing there; Metal runs each
+   column as its own dispatch. Still to do here: `serve` reporting draft
+   statistics, `bench` measuring drafting.
+5. **Next: kernels that share each weight load across the columns of a
+   batch.** On Metal, multi-column versions of the matvec kernels for up
+   to 16 columns (each column reduced as now, so bit-identical), and
+   attention and DeltaNet over a batch in one dispatch. On the CPU,
+   register-tiled dot kernels (a block of weights against several
+   columns, keeping each column's integer lane sums and fused
+   multiply-add order, so bit-identical; `i8mm` changes the lane sums, so
+   it is not). Done when a verification of 4 tokens costs at most about
+   1.5 tokens on both backends, and drafting is faster than plain
+   decoding on the 4B.
+6. **Prompt speed:** Metal `mul_mm` (simdgroup matrices; rounds
+   differently, compared with llama.cpp's Metal path at its default
+   `-ub`) and larger CPU tiles. Done when pp512 is within 25% of
+   llama.cpp on each backend (on the CPU, compared also without
+   llama.cpp's BLAS backend).
+7. **Parallel server slots:** several sequences decoded in one batch.
+8. **MTP sidecar files** (`mtp-*.gguf`) and `--draft-p-min`.
 
 ## Validation
 
@@ -409,8 +555,9 @@ Design rules:
   and on a Mac.
 - **Comparing with llama.cpp:** use `llama-completion ... -ngl 0 --device none
   -fa off --no-repack -b 512 -ub 1`: nibble's attention matches the non-flash
-  path, its kernels are the non-repacked ones, and it evaluates prompts one
-  token at a time. llama.cpp's `-f` strips one trailing newline from the
+  path, its kernels are the non-repacked ones, and its batches give the
+  results of evaluating one token at a time. llama.cpp's `-f` strips one
+  trailing newline from the
   prompt file. The commands are in `AGENTS.md`.
 - **Bit-level checks:** small C programs outside the repository, linked
   against the release's `libggml-cpu` / `libllama`, run ggml's kernels on the

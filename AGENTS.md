@@ -142,8 +142,9 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
 - **Use `--no-repack`.** By default llama.cpp repacks Q4_K, Q5_K, Q6_K and
   Q8_0 weights and multiplies them with other kernels than the ones nibble
   transcribes.
-- **Use `-ub 1`.** nibble evaluates a prompt one token at a time; llama.cpp
-  evaluates a batch with GEMM kernels that round differently. Keep `-b`
+- **Use `-ub 1`.** nibble evaluates a prompt in batches whose results are
+  bit-identical to evaluating it one token at a time; llama.cpp evaluates
+  a batch with GEMM kernels that round differently. Keep `-b`
   large: llama-completion stops early when a chunk of `-b` prompt tokens
   ends with an end-of-generation token such as `<|im_end|>`, which every
   chat prompt contains.

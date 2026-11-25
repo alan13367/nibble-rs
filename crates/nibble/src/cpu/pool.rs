@@ -240,44 +240,6 @@ impl ThreadPool {
         }
     }
 
-    /// Splits each slice of `data` into chunks of `chunk_len` elements (the
-    /// last chunk of a slice may be shorter) and calls
-    /// `f(slice, chunk, elements)` for every chunk, in parallel. `chunk` is
-    /// the chunk's index within its slice, so it covers elements
-    /// `chunk * chunk_len..` of `data[slice]`.
-    ///
-    /// # Panics
-    ///
-    /// If `chunk_len` is zero, or as [`ThreadPool::run`].
-    pub(crate) fn for_each_chunk<T, F, const N: usize>(
-        &self,
-        data: [&mut [T]; N],
-        chunk_len: usize,
-        f: F,
-    ) where
-        T: Send,
-        F: Fn(usize, usize, &mut [T]) + Sync,
-    {
-        assert!(chunk_len > 0, "chunk length must be non-zero");
-        // Task t belongs to the slice whose range of task numbers holds it.
-        let mut first_task = [0; N];
-        let mut n_tasks = 0;
-        for (first, slice) in first_task.iter_mut().zip(&data) {
-            *first = n_tasks;
-            n_tasks += slice.len().div_ceil(chunk_len);
-        }
-        let data = data.map(|s| SharedSlice::new(s));
-        self.run(n_tasks, |task| {
-            let slice = first_task.partition_point(|&first| first <= task) - 1;
-            let chunk = task - first_task[slice];
-            let start = chunk * chunk_len;
-            let range = start..(start + chunk_len).min(data[slice].len);
-            // SAFETY: each task number maps to exactly one (slice, chunk)
-            // pair, and chunks of one slice do not overlap.
-            f(slice, chunk, unsafe { data[slice].get_mut(range) });
-        });
-    }
-
     /// Calls `f(i, a_i, b_i)` for every `i`, in parallel, where `a_i` is
     /// chunk `i` of `a` (`a_len` elements) and `b_i` chunk `i` of `b`
     /// (`b_len` elements); the last chunk of each may be shorter. Used for
@@ -318,6 +280,157 @@ impl ThreadPool {
             let (ai, bi) = unsafe { (a.get_mut(a_range), b.get_mut(b_range)) };
             f(i, ai, bi);
         });
+    }
+
+    /// Splits slices that hold `split.segments` equal segments one after
+    /// another (one vector per token of a batch) into chunks, in parallel:
+    /// chunk `c` of slice `s` is elements `c * split.chunk_len..` of *every*
+    /// segment (the last chunk of a segment may be shorter), and
+    /// `f(s, c, chunk)` gets them as a [`SegmentChunks`]. A product over a
+    /// batch uses it so that a task computes the same rows of every token's
+    /// output while those weight rows are in its cache.
+    ///
+    /// # Panics
+    ///
+    /// If a slice does not split into `split.segments` equal segments, the
+    /// chunk length is zero, or as [`ThreadPool::run`].
+    pub(crate) fn for_each_segment_chunk<T, F, const N: usize>(
+        &self,
+        data: [&mut [T]; N],
+        split: Split,
+        f: F,
+    ) where
+        T: Send,
+        F: Fn(usize, usize, &mut SegmentChunks<'_, T>) + Sync,
+    {
+        let mut first_task = [0; N];
+        let mut n_tasks = 0;
+        for (first, slice) in first_task.iter_mut().zip(&data) {
+            *first = n_tasks;
+            n_tasks += split.n_chunks(slice.len());
+        }
+        let data = data.map(|s| SharedSlice::new(s));
+        self.run(n_tasks, |task| {
+            let slice = first_task.partition_point(|&first| first <= task) - 1;
+            let chunk = task - first_task[slice];
+            f(slice, chunk, &mut split.chunk(&data[slice], chunk));
+        });
+    }
+
+    /// [`ThreadPool::for_each_chunk_pair`] for slices of segments: task `i`
+    /// gets chunk `i` of every segment of `a` and of `b`, which may be split
+    /// differently (a head's recurrent state, one segment, and its output
+    /// for every token of a batch, one segment per token).
+    ///
+    /// # Panics
+    ///
+    /// If a slice does not split into its segments, the two do not split
+    /// into as many chunks, or as [`ThreadPool::run`].
+    pub(crate) fn for_each_segment_chunk_pair<A, B, F>(
+        &self,
+        a: &mut [A],
+        a_split: Split,
+        b: &mut [B],
+        b_split: Split,
+        f: F,
+    ) where
+        A: Send,
+        B: Send,
+        F: Fn(usize, &mut SegmentChunks<'_, A>, &mut SegmentChunks<'_, B>) + Sync,
+    {
+        let n = a_split.n_chunks(a.len());
+        assert_eq!(
+            n,
+            b_split.n_chunks(b.len()),
+            "slices of {} and {} elements do not split into as many chunks",
+            a.len(),
+            b.len(),
+        );
+        let (a, b) = (SharedSlice::new(a), SharedSlice::new(b));
+        self.run(n, |i| {
+            f(i, &mut a_split.chunk(&a, i), &mut b_split.chunk(&b, i));
+        });
+    }
+}
+
+/// How [`ThreadPool::for_each_segment_chunk`] splits a slice: into
+/// `segments` equal segments, each into chunks of `chunk_len` elements (the
+/// last chunk of a segment may be shorter).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Split {
+    pub(crate) segments: usize,
+    pub(crate) chunk_len: usize,
+}
+
+impl Split {
+    /// Chunks per segment of a slice of `len` elements.
+    fn n_chunks(self, len: usize) -> usize {
+        assert!(
+            self.chunk_len > 0 && self.segments > 0,
+            "chunk length and segment count must be non-zero"
+        );
+        assert!(
+            len.is_multiple_of(self.segments),
+            "a slice of {len} elements does not split into {} segments",
+            self.segments
+        );
+        (len / self.segments).div_ceil(self.chunk_len)
+    }
+
+    fn chunk<'a, T>(self, data: &'a SharedSlice<T>, chunk: usize) -> SegmentChunks<'a, T> {
+        let segment_len = data.len / self.segments;
+        let start = chunk * self.chunk_len;
+        SegmentChunks {
+            data,
+            segment_len,
+            range: start..(start + self.chunk_len).min(segment_len),
+            segments: self.segments,
+        }
+    }
+}
+
+/// One chunk of every segment of a slice, lent to one task by
+/// [`ThreadPool::for_each_segment_chunk`].
+pub(crate) struct SegmentChunks<'a, T> {
+    data: &'a SharedSlice<T>,
+    segment_len: usize,
+    /// The chunk's elements within a segment.
+    range: Range<usize>,
+    segments: usize,
+}
+
+impl<T> SegmentChunks<'_, T> {
+    /// The chunk's first element within a segment.
+    pub(crate) const fn start(&self) -> usize {
+        self.range.start
+    }
+
+    /// Elements of the chunk in each segment.
+    pub(crate) fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    /// Segments of the slice.
+    pub(crate) const fn segments(&self) -> usize {
+        self.segments
+    }
+
+    /// The chunk of segment `s`.
+    ///
+    /// # Panics
+    ///
+    /// If `s` is not a segment of the slice.
+    pub(crate) fn segment(&mut self, s: usize) -> &mut [T] {
+        assert!(s < self.segments, "segment {s} of {}", self.segments);
+        let at = s * self.segment_len;
+        // SAFETY: the slice is mutably borrowed by the pool call that lent
+        // this chunk, for longer than `self`. Each task gets a different
+        // chunk, the chunks of a segment do not overlap, and `&mut self`
+        // keeps at most one result of this handle alive.
+        unsafe {
+            self.data
+                .get_mut(at + self.range.start..at + self.range.end)
+        }
     }
 }
 
@@ -542,19 +655,8 @@ mod tests {
     }
 
     #[test]
-    fn chunks_cover_every_element_once() {
+    fn chunk_pairs_cover_every_element_once() {
         let pool = ThreadPool::new(3);
-        let mut a = vec![0usize; 100];
-        let mut b = vec![0usize; 7];
-        let mut c: Vec<usize> = Vec::new();
-        pool.for_each_chunk([&mut a[..], &mut b[..], &mut c[..]], 16, |s, chunk, out| {
-            for (i, v) in out.iter_mut().enumerate() {
-                *v += 1000 * s + chunk * 16 + i + 1;
-            }
-        });
-        assert_eq!(a, (1..=100).collect::<Vec<_>>());
-        assert_eq!(b, (1001..=1007).collect::<Vec<_>>());
-
         let mut heads = vec![0u32; 4 * 8];
         let mut sums = vec![0u32; 4];
         pool.for_each_chunk_pair(&mut heads, 8, &mut sums, 1, |h, head, sum| {
@@ -568,6 +670,71 @@ mod tests {
                 .enumerate()
                 .all(|(h, c)| c.iter().all(|&v| v == h as u32))
         );
+    }
+
+    #[test]
+    fn segment_chunks_cover_every_element_once() {
+        let pool = ThreadPool::new(3);
+        // Three segments of 10 and of 5, in chunks of 4.
+        let mut a = vec![0usize; 30];
+        let mut b = vec![0usize; 15];
+        let split = Split {
+            segments: 3,
+            chunk_len: 4,
+        };
+        pool.for_each_segment_chunk([&mut a[..], &mut b[..]], split, |s, chunk, out| {
+            assert_eq!(out.start(), 4 * chunk);
+            for seg in 0..3 {
+                let start = out.start();
+                for (i, v) in out.segment(seg).iter_mut().enumerate() {
+                    *v += 1000 * s + 100 * seg + start + i + 1;
+                }
+            }
+        });
+        let want = |s: usize, len: usize| -> Vec<usize> {
+            (0..3)
+                .flat_map(|seg| (1..=len).map(move |i| 1000 * s + 100 * seg + i))
+                .collect()
+        };
+        assert_eq!(a, want(0, 10));
+        assert_eq!(b, want(1, 5));
+
+        // Four heads of state (one segment) with their outputs for two tokens.
+        let mut state = vec![0u32; 4 * 8];
+        let mut out = vec![0u32; 2 * 4 * 3];
+        pool.for_each_segment_chunk_pair(
+            &mut state,
+            Split {
+                segments: 1,
+                chunk_len: 8,
+            },
+            &mut out,
+            Split {
+                segments: 2,
+                chunk_len: 3,
+            },
+            |h, state, out| {
+                state.segment(0).fill(h as u32);
+                for t in 0..2 {
+                    out.segment(t).fill(10 * t as u32 + h as u32);
+                }
+            },
+        );
+        assert!((0..4).all(|h| state[8 * h..8 * h + 8].iter().all(|&v| v == h as u32)));
+        let want: Vec<u32> = (0..2u32)
+            .flat_map(|t| (0..4u32).flat_map(move |h| [10 * t + h; 3]))
+            .collect();
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not split into 3 segments")]
+    fn uneven_segments_are_rejected() {
+        let split = Split {
+            segments: 3,
+            chunk_len: 4,
+        };
+        ThreadPool::new(2).for_each_segment_chunk([&mut [0u8; 10][..]], split, |_, _, _| {});
     }
 
     #[test]

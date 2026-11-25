@@ -109,6 +109,8 @@ fn start_with(chat_template: &str, api_key: Option<&str>) -> SocketAddr {
         n_ctx: 2048,
         threads: 1,
         backend: nibble::BackendKind::Cpu,
+        n_batch: 0,
+        draft_max: 0,
     };
     let model = tiny_model(chat_template);
     std::thread::spawn(move || serve(listener, model, options));

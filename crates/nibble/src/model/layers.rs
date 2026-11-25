@@ -5,8 +5,8 @@
 
 use nibble_gguf::Gguf;
 
-use super::ModelConfig;
 use super::bind::{matrix, vector};
+use super::{Logits, ModelConfig};
 use crate::backend::{Backend, Param, Params, QkNorm};
 use crate::cpu::Weight;
 use crate::error::Result;
@@ -35,27 +35,39 @@ impl Head {
         })
     }
 
-    /// Writes the embedding of `token` to `x`.
-    pub(crate) fn embed<B: Backend>(&self, b: &mut B, token: u32, x: &mut B::Vector) {
-        b.embed(&self.token_embd, token, x);
+    /// The token embeddings.
+    pub(crate) const fn token_embd(&self) -> Weight {
+        self.token_embd
     }
 
-    /// Ends the token with `logits = output · xn`, where `xn` is the hidden
-    /// state normalized with `output_norm`, or without logits.
+    /// The output projection (the token embeddings when tied).
+    pub(crate) const fn output(&self) -> Weight {
+        self.output
+    }
+
+    /// Writes the embedding of each token to its row of `x`.
+    pub(crate) fn embed<B: Backend>(&self, b: &mut B, tokens: &[u32], x: &mut B::Vector) {
+        b.embed(&self.token_embd, tokens, x);
+    }
+
+    /// Ends the batch with `logits = output · xn` for the rows asked for,
+    /// where `xn` is the hidden state normalized with `output_norm`, or
+    /// without logits.
     pub(crate) fn finish<B: Backend>(
         &self,
         b: &mut B,
         xn: &B::Vector,
-        logits: Option<&mut [f32]>,
+        logits: Option<Logits<'_>>,
     ) -> Result<()> {
         match logits {
-            Some(logits) => b.logits(&self.output, xn, logits),
+            Some(l) => b.logits(&self.output, xn, l.rows, l.out),
             None => b.end(),
         }
     }
 }
 
-/// Buffers reused by every block within one forward pass.
+/// Buffers reused by every block within one forward pass, one row per token
+/// of a batch.
 pub(crate) struct Scratch<B: Backend> {
     /// The residual stream.
     pub(crate) x: B::Vector,
@@ -79,10 +91,10 @@ impl<B: Backend> Scratch<B> {
 }
 
 impl<B: Backend> Scratch<B> {
-    pub(crate) fn new(b: &mut B, c: &ModelConfig) -> Result<Self> {
+    pub(crate) fn new(b: &mut B, c: &ModelConfig, n_batch: usize) -> Result<Self> {
         Ok(Self {
-            x: b.vector(c.n_embd)?,
-            xn: b.vector(c.n_embd)?,
+            x: b.vector(n_batch * c.n_embd)?,
+            xn: b.vector(n_batch * c.n_embd)?,
         })
     }
 }
@@ -107,9 +119,9 @@ pub(crate) struct AttentionBuffers<B: Backend> {
 }
 
 impl<B: Backend> AttentionBuffers<B> {
-    pub(crate) fn new(b: &mut B, c: &ModelConfig) -> Result<Self> {
-        let q_dim = c.n_head * c.head_dim;
-        let kv_dim = c.n_head_kv * c.head_dim;
+    pub(crate) fn new(b: &mut B, c: &ModelConfig, n_batch: usize) -> Result<Self> {
+        let q_dim = n_batch * c.n_head * c.head_dim;
+        let kv_dim = n_batch * c.n_head_kv * c.head_dim;
         Ok(Self {
             q: b.vector(q_dim)?,
             k: b.vector(kv_dim)?,
@@ -149,10 +161,10 @@ impl Attention {
         })
     }
 
-    /// Attention over `s.xn` (the normalized hidden state) at the cache's
-    /// next position. Appends this position to `cache` and adds the
-    /// projected output to the hidden state, normalized with `next` into
-    /// `s.xn`.
+    /// Attention over `s.xn` (the normalized hidden state) for the batch's
+    /// tokens, at the cache's next positions. Appends them to `cache` and
+    /// adds the projected output to the hidden state, normalized with
+    /// `next` into `s.xn`.
     pub(crate) fn forward<B: Backend>(
         &self,
         b: &mut B,
@@ -195,10 +207,10 @@ pub(crate) struct FfnBuffers<B: Backend> {
 }
 
 impl<B: Backend> FfnBuffers<B> {
-    pub(crate) fn new(b: &mut B, c: &ModelConfig) -> Result<Self> {
+    pub(crate) fn new(b: &mut B, c: &ModelConfig, n_batch: usize) -> Result<Self> {
         Ok(Self {
-            hidden: b.vector(c.n_ff)?,
-            up: b.vector(c.n_ff)?,
+            hidden: b.vector(n_batch * c.n_ff)?,
+            up: b.vector(n_batch * c.n_ff)?,
         })
     }
 }

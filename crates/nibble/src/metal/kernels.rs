@@ -47,8 +47,8 @@ kernel_args! {
         pad: u32,
     }
     struct DeltaArgs {
-        n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, rows: u32,
-        oldest: u32, eps: f32, scale: f32,
+        n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32, rows: u32,
+        oldest: u32, store: u32, pending: u32, eps: f32, scale: f32,
     }
 }
 
@@ -158,6 +158,7 @@ pub(crate) struct Pipelines {
     embeds: Vec<(GgmlType, Pipeline, usize)>,
     pub(crate) rmsnorm: Pipeline,
     pub(crate) swiglu: Pipeline,
+    pub(crate) copy: Pipeline,
     /// `(G, D, pipeline)` from [`ATTENTIONS`].
     attentions: Vec<(usize, usize, Pipeline)>,
     pub(crate) attention_reduce: Pipeline,
@@ -197,6 +198,7 @@ impl Pipelines {
             embeds,
             rmsnorm: get("rmsnorm")?,
             swiglu: get("swiglu")?,
+            copy: get("copy_f32")?,
             attentions: ATTENTIONS
                 .iter()
                 .map(|&(g, d)| Ok((g, d, get(&format!("attention_g{g}_d{d}"))?)))

@@ -11,9 +11,9 @@
 
 use nibble_gguf::Gguf;
 
-use super::ModelConfig;
 use super::bind::vector;
 use super::layers::{Attention, AttentionBuffers, FfnBuffers, Head, Next, Scratch, SwiGlu};
+use super::{Logits, ModelConfig};
 use crate::backend::{Backend, Param, Params};
 use crate::error::Result;
 
@@ -59,30 +59,31 @@ impl Qwen3 {
         b: &mut B,
         c: &ModelConfig,
         n_ctx: usize,
+        n_batch: usize,
     ) -> Result<State<B>> {
         Ok(State {
             caches: (0..c.n_layer)
                 .map(|_| b.kv_cache(n_ctx))
                 .collect::<Result<_>>()?,
-            attn: AttentionBuffers::new(b, c)?,
-            ffn: FfnBuffers::new(b, c)?,
-            scratch: Scratch::new(b, c)?,
+            attn: AttentionBuffers::new(b, c, n_batch)?,
+            ffn: FfnBuffers::new(b, c, n_batch)?,
+            scratch: Scratch::new(b, c, n_batch)?,
         })
     }
 
-    /// Runs `token` at position `pos` (the number of cached positions).
+    /// Runs `tokens` at positions from `pos` (the number of cached positions) on.
     pub(crate) fn forward<B: Backend>(
         &self,
         b: &mut B,
         c: &ModelConfig,
         s: &mut State<B>,
-        token: u32,
+        tokens: &[u32],
         pos: usize,
-        logits: Option<&mut [f32]>,
+        logits: Option<Logits<'_>>,
     ) -> Result<()> {
         let x = &mut s.scratch;
-        b.begin(pos)?;
-        self.head.embed(b, token, &mut x.x);
+        b.begin(pos, tokens.len())?;
+        self.head.embed(b, tokens, &mut x.x);
         let norm = |p: Param| Next {
             norm: p,
             eps: c.rms_eps,

@@ -13,7 +13,9 @@
 //!
 //! Results do not depend on the thread count: work is split by output rows
 //! or heads, and each output value is computed by one kernel call, whichever
-//! thread makes it.
+//! thread makes it. Nor do they depend on the batch: a product over several
+//! tokens computes each token's output with the same kernel calls as a
+//! product over that token alone.
 
 mod attention;
 #[cfg(target_arch = "x86_64")]
@@ -32,7 +34,7 @@ use nibble_gguf::GgmlType;
 
 pub(crate) use backend::CpuBackend;
 pub(crate) use kernels::Kernels;
-pub(crate) use pool::ThreadPool;
+pub(crate) use pool::{SegmentChunks, Split, ThreadPool};
 pub(crate) use scalar::DeltaStep;
 pub(crate) use topology::default_threads;
 
@@ -50,6 +52,11 @@ const TASKS_PER_THREAD: usize = 8;
 /// Output rows per task are a multiple of this: 16 f32 values are a 64-byte
 /// cache line, so two tasks never write the same line.
 const ROW_ALIGN: usize = 16;
+
+/// A product over a batch multiplies this many bytes of weight rows with
+/// every token's input before it moves on, so that they are read from
+/// memory once per batch and stay in the core's L1 cache meanwhile.
+const BATCH_BLOCK_BYTES: usize = 16 * 1024;
 
 /// A weight matrix inside the model bytes: `rows` rows of `cols` elements each
 /// (ggml shape `[cols, rows]`).
@@ -76,8 +83,9 @@ impl Weight {
 }
 
 /// The input of a matrix product, encoded in the dot type of each weight
-/// type it is multiplied with (see [`quant`]). Reused across products, so
-/// encoding allocates only while the buffers grow to the largest input.
+/// type it is multiplied with (see [`quant`]): one encoded vector per token
+/// of the batch, one after another. Reused across products, so encoding
+/// allocates only while the buffers grow to the largest batch.
 #[derive(Debug, Default)]
 pub(crate) struct EncodedInput {
     by_dot_type: [Vec<u8>; DotType::COUNT],
@@ -88,21 +96,31 @@ impl EncodedInput {
         Self::default()
     }
 
-    /// Encodes `x` in the dot type of each weight type in `types`, once per
-    /// dot type.
-    fn encode(&mut self, kernels: Kernels, x: &[f32], types: impl IntoIterator<Item = GgmlType>) {
+    /// Encodes each `cols`-element vector of `x` in the dot type of each
+    /// weight type in `types`, once per dot type.
+    fn encode(
+        &mut self,
+        kernels: Kernels,
+        x: &[f32],
+        cols: usize,
+        types: impl IntoIterator<Item = GgmlType>,
+    ) {
         let mut done = [false; DotType::COUNT];
         for dt in types.into_iter().map(DotType::of) {
             if std::mem::replace(&mut done[dt.index()], true) {
                 continue;
             }
+            let len = dt.encoded_len(cols);
             let buf = &mut self.by_dot_type[dt.index()];
-            buf.resize(dt.encoded_len(x.len()), 0);
-            kernels.encode(dt, x, buf);
+            buf.resize(len * (x.len() / cols), 0);
+            for (x, out) in x.chunks_exact(cols).zip(buf.chunks_exact_mut(len)) {
+                kernels.encode(dt, x, out);
+            }
         }
     }
 
-    /// The input as encoded for weights of type `ty`.
+    /// The input as encoded for weights of type `ty`: one vector of
+    /// `encoded_len` bytes per token.
     fn get(&self, ty: GgmlType) -> &[u8] {
         &self.by_dot_type[DotType::of(ty).index()]
     }
@@ -112,6 +130,9 @@ impl EncodedInput {
 #[derive(Debug)]
 pub(crate) struct Cpu {
     pool: ThreadPool,
+    /// A pool without workers, which runs its tasks on the calling thread:
+    /// for products too small to share.
+    serial: ThreadPool,
     kernels: Kernels,
 }
 
@@ -126,6 +147,7 @@ impl Cpu {
     pub(crate) fn with_kernels(threads: usize, kernels: Kernels) -> Self {
         Self {
             pool: ThreadPool::new(threads),
+            serial: ThreadPool::new(1),
             kernels,
         }
     }
@@ -144,7 +166,8 @@ impl Cpu {
         &self.pool
     }
 
-    /// `out = w · x`.
+    /// `out = w · x` for every `w.cols`-element vector of `x` (one per token
+    /// of a batch), the outputs one after another in `out`.
     pub(crate) fn matvec(
         &self,
         bytes: &[u8],
@@ -156,9 +179,14 @@ impl Cpu {
         self.matvecs(bytes, x, input, [(w, out)]);
     }
 
-    /// `out_j = w_j · x` for every `(w_j, out_j)` in `products`, in one
-    /// parallel pass: `x` is encoded once per dot type, and the threads meet
-    /// once instead of once per matrix.
+    /// `out_j = w_j · x` for every `(w_j, out_j)` in `products` and every
+    /// token's vector in `x`, in one parallel pass: `x` is encoded once per
+    /// dot type, and the threads meet once instead of once per matrix.
+    /// Each task takes a range of output rows of one product for every token.
+    ///
+    /// # Panics
+    ///
+    /// If `N` is zero (an internal invariant).
     pub(crate) fn matvecs<const N: usize>(
         &self,
         bytes: &[u8],
@@ -168,33 +196,33 @@ impl Cpu {
     ) {
         let weights = products.each_ref().map(|(w, _)| *w);
         let outs = products.map(|(_, out)| out);
+        let cols = weights[0].cols;
+        let n = x.len() / cols;
+        debug_assert_eq!(x.len(), n * cols);
         for (w, out) in weights.iter().zip(&outs) {
-            debug_assert_eq!((w.cols, w.rows), (x.len(), out.len()));
+            debug_assert_eq!((w.cols, w.rows * n), (cols, out.len()));
         }
-        input.encode(self.kernels, x, weights.iter().map(|w| w.ty));
-        let input = &*input;
-        let kernels = self.kernels;
-        let product = |j: usize, first_row: usize, out: &mut [f32]| {
-            let w = weights[j];
-            let rows = w.rows_bytes(bytes, first_row..first_row + out.len());
-            kernels.dot_rows(w.ty, rows, w.row_bytes, input.get(w.ty), out);
-        };
-        let rows: usize = weights.iter().map(|w| w.rows).sum();
-        if !self.worth_splitting(rows, x.len()) {
-            for (j, out) in outs.into_iter().enumerate() {
-                product(j, 0, out);
-            }
+        if n == 0 {
             return;
         }
-        let chunk = self.rows_per_task(rows);
-        self.pool
-            .for_each_chunk(outs, chunk, |j, c, out| product(j, c * chunk, out));
+        input.encode(self.kernels, x, cols, weights.iter().map(|w| w.ty));
+        let input = &*input;
+        let kernels = self.kernels;
+        let rows: usize = weights.iter().map(|w| w.rows).sum();
+        let (pool, chunk_len) = self.split_rows(rows, n * cols);
+        let split = Split {
+            segments: n,
+            chunk_len: chunk_len.unwrap_or(rows).max(1),
+        };
+        pool.for_each_segment_chunk(outs, split, |j, _, out| {
+            dot_batch(kernels, bytes, weights[j], input.get(weights[j].ty), out);
+        });
     }
 
-    /// `out = silu(gate · x) * (up · x)`: the two products of a SwiGLU
-    /// feed-forward and ggml's `swiglu` of them, in one parallel pass. Each
-    /// task computes the same rows of both products, then their SwiGLU;
-    /// `up_out` receives `up · x`.
+    /// `out = silu(gate · x) * (up · x)` for every token's vector in `x`:
+    /// the two products of a SwiGLU feed-forward and ggml's `swiglu` of
+    /// them, in one parallel pass. Each task computes the same rows of both
+    /// products, then their SwiGLU; `up_out` receives `up · x`.
     #[expect(
         clippy::too_many_arguments,
         reason = "two weights and their two outputs"
@@ -209,38 +237,74 @@ impl Cpu {
         out: &mut [f32],
         up_out: &mut [f32],
     ) {
-        debug_assert_eq!((gate.cols, gate.rows), (x.len(), out.len()));
-        debug_assert_eq!((up.cols, up.rows), (x.len(), up_out.len()));
-        input.encode(self.kernels, x, [gate.ty, up.ty]);
-        let input = &*input;
-        let kernels = self.kernels;
-        let task = |first_row: usize, g: &mut [f32], u: &mut [f32]| {
-            let rows = first_row..first_row + g.len();
-            let gate_rows = gate.rows_bytes(bytes, rows.clone());
-            kernels.dot_rows(gate.ty, gate_rows, gate.row_bytes, input.get(gate.ty), g);
-            let up_rows = up.rows_bytes(bytes, rows);
-            kernels.dot_rows(up.ty, up_rows, up.row_bytes, input.get(up.ty), u);
-            // Chunks are whole groups of 8 (ROW_ALIGN), so the SIMD kernels
-            // take the same elements as ggml's one pass over the whole vector.
-            kernels.swiglu(g, u);
-        };
-        if !self.worth_splitting(2 * gate.rows, x.len()) {
-            task(0, out, up_out);
+        let n = x.len() / gate.cols;
+        debug_assert_eq!((gate.cols * n, gate.rows * n), (x.len(), out.len()));
+        debug_assert_eq!((up.cols * n, up.rows * n), (x.len(), up_out.len()));
+        if n == 0 {
             return;
         }
-        let chunk = self.rows_per_task(2 * gate.rows);
-        self.pool
-            .for_each_chunk_pair(out, chunk, up_out, chunk, |i, g, u| task(i * chunk, g, u));
+        input.encode(self.kernels, x, gate.cols, [gate.ty, up.ty]);
+        let input = &*input;
+        let kernels = self.kernels;
+        let (pool, chunk_len) = self.split_rows(2 * gate.rows, x.len());
+        let split = Split {
+            segments: n,
+            chunk_len: chunk_len.unwrap_or(gate.rows).max(1),
+        };
+        pool.for_each_segment_chunk_pair(out, split, up_out, split, |_, g, u| {
+            dot_batch(kernels, bytes, gate, input.get(gate.ty), g);
+            dot_batch(kernels, bytes, up, input.get(up.ty), u);
+            // Chunks are whole groups of 8 (ROW_ALIGN), so the SIMD kernels
+            // take the same elements as ggml's one pass over the whole vector.
+            for t in 0..n {
+                kernels.swiglu(g.segment(t), u.segment(t));
+            }
+        });
     }
 
-    fn worth_splitting(&self, rows: usize, cols: usize) -> bool {
-        self.threads() > 1 && rows.saturating_mul(cols) >= PARALLEL_MIN_MACS
+    /// The pool for a product of `rows` output rows per token over `cols`
+    /// input values in all, and the rows per task if it is worth splitting
+    /// (`None`: one task per product, on the calling thread).
+    fn split_rows(&self, rows: usize, cols: usize) -> (&ThreadPool, Option<usize>) {
+        if self.threads() > 1 && rows.saturating_mul(cols) >= PARALLEL_MIN_MACS {
+            let chunk = rows
+                .div_ceil(TASKS_PER_THREAD * self.threads())
+                .next_multiple_of(ROW_ALIGN);
+            (&self.pool, Some(chunk))
+        } else {
+            (&self.serial, None)
+        }
     }
+}
 
-    /// Rows per task for a product with `rows` output rows in all.
-    fn rows_per_task(&self, rows: usize) -> usize {
-        rows.div_ceil(TASKS_PER_THREAD * self.threads())
-            .next_multiple_of(ROW_ALIGN)
+/// The rows of `w` that `out` covers times every token's input in `xq` (one
+/// encoded vector per segment of `out`). For a batch, each block of
+/// [`BATCH_BLOCK_BYTES`] of weight rows meets every token before the next
+/// block is read; each output is still one row's [`Kernels::dot_rows`], so
+/// the result does not depend on the batch.
+fn dot_batch(
+    kernels: Kernels,
+    bytes: &[u8],
+    w: &Weight,
+    xq: &[u8],
+    out: &mut SegmentChunks<'_, f32>,
+) {
+    let first = out.start();
+    let n = out.segments();
+    if n == 1 {
+        let rows = w.rows_bytes(bytes, first..first + out.len());
+        return kernels.dot_rows(w.ty, rows, w.row_bytes, xq, out.segment(0));
+    }
+    let xq_len = xq.len() / n;
+    let block = (BATCH_BLOCK_BYTES / w.row_bytes.max(1)).max(1);
+    let mut b0 = 0;
+    while b0 < out.len() {
+        let b1 = (b0 + block).min(out.len());
+        let rows = w.rows_bytes(bytes, first + b0..first + b1);
+        for (t, x) in xq.chunks_exact(xq_len).enumerate() {
+            kernels.dot_rows(w.ty, rows, w.row_bytes, x, &mut out.segment(t)[b0..b1]);
+        }
+        b0 = b1;
     }
 }
 
@@ -283,13 +347,13 @@ pub(crate) fn l2_norm_chunks(x: &mut [f32], n: usize, eps: f32) {
 }
 
 /// Fills `table` with `(cos θ_i, sin θ_i)` for `θ_i = pos · base^(-2i/n_rot)`,
-/// computed iteratively in f32 exactly as ggml's rope cache does.
-pub(crate) fn rope_table(table: &mut Vec<(f32, f32)>, pos: usize, n_rot: usize, base: f32) {
-    let theta_scale = base.powf(-2.0 / n_rot as f32);
+/// one pair per rotated pair (`n_rot = 2 · table.len()`), computed
+/// iteratively in f32 exactly as ggml's rope cache does.
+pub(crate) fn rope_table(table: &mut [(f32, f32)], pos: usize, base: f32) {
+    let theta_scale = base.powf(-2.0 / (2 * table.len()) as f32);
     let mut theta = pos as f32;
-    table.clear();
-    for _ in 0..n_rot / 2 {
-        table.push((theta.cos(), theta.sin()));
+    for pair in table {
+        *pair = (theta.cos(), theta.sin());
         theta *= theta_scale;
     }
 }
@@ -343,10 +407,10 @@ mod tests {
             (7, 0xA4AF_E07E_0A6E_B439, [0xBF17_0DB0, 0x3F35_51FF, 0xBDA2_73F8, 0xBF06_6E98, 0x3DF6_6070, 0x3DE0_E8FC, 0xBF3A_EEB2, 0x3F2C_3A99]),
             (300, 0xE9FD_71C1_E4E5_0857, [0x3EF8_FEB4, 0xBF12_7FB5, 0x3F3B_3295, 0x3D33_7723, 0x3EB5_D5C2, 0xBEDC_F50B, 0x3D8D_913A, 0xBF5A_31DB]),
         ];
-        let mut table = Vec::new();
+        let mut table = vec![(0.0, 0.0); 64];
         for (pos, hash, bits) in cases {
             let mut x = values(256, 1);
-            rope_table(&mut table, pos, 128, 1e6);
+            rope_table(&mut table, pos, 1e6);
             rope_neox(&mut x, 128, &table);
             let got: Vec<u32> = [0, 1, 2, 3, 64, 65, 66, 67]
                 .iter()
@@ -369,15 +433,15 @@ mod tests {
 
     #[test]
     fn rope_is_identity_at_position_zero_and_preserves_norms() {
-        let mut table = Vec::new();
+        let mut table = vec![(0.0, 0.0); 4];
         let head: Vec<f32> = (0..8).map(|i| i as f32 - 3.5).collect();
 
-        rope_table(&mut table, 0, 8, 10_000.0);
+        rope_table(&mut table, 0, 10_000.0);
         let mut x = head.clone();
         rope_neox(&mut x, 8, &table);
         assert_eq!(x, head);
 
-        rope_table(&mut table, 17, 8, 10_000.0);
+        rope_table(&mut table, 17, 10_000.0);
         let mut x = head.clone();
         rope_neox(&mut x, 8, &table);
         for i in 0..4 {
@@ -548,6 +612,93 @@ mod tests {
                         "{} {} row {r}: {got} vs {want}",
                         kernels.name(),
                         w.ty
+                    );
+                }
+            }
+        }
+    }
+
+    /// `n` inputs of `cols` values, different per token.
+    fn batch_input(cols: usize, n: usize) -> Vec<f32> {
+        (0..n * cols)
+            .map(|i| ((i % cols) as f32 * 0.37 + (i / cols) as f32 * 1.3).sin())
+            .collect()
+    }
+
+    /// Each token's output of a product over a batch, bit for bit, is that
+    /// of the product over the token alone: on one thread (one task covers
+    /// the matrix, so it walks several blocks of rows) and on four.
+    #[test]
+    fn batched_products_equal_per_token_products() {
+        let types = [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Bf16,
+            GgmlType::Q8_0,
+            GgmlType::Q4K,
+            GgmlType::Q3K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Iq4Xs,
+        ];
+        let cols = 256;
+        for ty in types {
+            let m = matrices(&[(ty, cols, 1003)]);
+            let w = &m.weights[0];
+            for kernels in [Kernels::Scalar, Kernels::detect()] {
+                for threads in [1, 4] {
+                    let cpu = Cpu::with_kernels(threads, kernels);
+                    for n in [2, 5] {
+                        let x = batch_input(cols, n);
+                        let mut input = EncodedInput::new();
+                        let mut batch = vec![0.0; n * w.rows];
+                        cpu.matvec(&m.bytes, w, &x, &mut batch, &mut input);
+                        for (t, (x, got)) in x.chunks(cols).zip(batch.chunks(w.rows)).enumerate() {
+                            let mut want = vec![0.0; w.rows];
+                            cpu.matvec(&m.bytes, w, x, &mut want, &mut input);
+                            let same = got
+                                .iter()
+                                .zip(&want)
+                                .all(|(a, b)| a.to_bits() == b.to_bits());
+                            assert!(
+                                same,
+                                "{ty} {} {threads} threads, token {t} of {n}",
+                                kernels.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_swiglu_equals_per_token_swiglu() {
+        for (gate_ty, up_ty) in [
+            (GgmlType::Q8_0, GgmlType::F16),
+            (GgmlType::Q4K, GgmlType::Q6K),
+        ] {
+            let (cols, rows, n) = (256, 200, 3);
+            let m = matrices(&[(gate_ty, cols, rows), (up_ty, cols, rows)]);
+            let (gate, up) = (&m.weights[0], &m.weights[1]);
+            let x = batch_input(cols, n);
+            for threads in [1, 3] {
+                let cpu = Cpu::new(threads);
+                let mut input = EncodedInput::new();
+                let (mut out, mut up_out) = (vec![0.0; n * rows], vec![0.0; n * rows]);
+                cpu.swiglu(&m.bytes, gate, up, &x, &mut input, &mut out, &mut up_out);
+                for (t, x) in x.chunks(cols).enumerate() {
+                    let (mut o, mut u) = (vec![0.0; rows], vec![0.0; rows]);
+                    cpu.swiglu(&m.bytes, gate, up, x, &mut input, &mut o, &mut u);
+                    assert_eq!(
+                        out[t * rows..(t + 1) * rows],
+                        o,
+                        "{gate_ty} {up_ty} token {t}"
+                    );
+                    assert_eq!(
+                        up_out[t * rows..(t + 1) * rows],
+                        u,
+                        "{gate_ty} {up_ty} token {t}"
                     );
                 }
             }

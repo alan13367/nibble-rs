@@ -299,6 +299,8 @@ fn first_token_matches_a_naive_reference() {
                 n_ctx: 8,
                 threads: 2,
                 backend: nibble::BackendKind::Cpu,
+                n_batch: 0,
+                draft_max: 0,
             })
             .unwrap();
         let logits = session.eval(&[token]).unwrap();
@@ -327,6 +329,8 @@ fn incremental_and_batched_evaluation_agree() {
             n_ctx: 16,
             threads: 3,
             backend: nibble::BackendKind::Cpu,
+            n_batch: 0,
+            draft_max: 0,
         })
         .unwrap();
     let batched_logits = batched.eval(&tokens).unwrap().to_vec();
@@ -335,6 +339,8 @@ fn incremental_and_batched_evaluation_agree() {
             n_ctx: 16,
             threads: 1,
             backend: nibble::BackendKind::Cpu,
+            n_batch: 0,
+            draft_max: 0,
         })
         .unwrap();
     for &t in &tokens {
@@ -353,6 +359,8 @@ fn truncate_restores_an_earlier_state() {
             n_ctx: 16,
             threads: 2,
             backend: nibble::BackendKind::Cpu,
+            n_batch: 0,
+            draft_max: 0,
         })
         .unwrap();
     session.eval(&[1, 2, 3, 4]).unwrap();
@@ -365,6 +373,8 @@ fn truncate_restores_an_earlier_state() {
             n_ctx: 16,
             threads: 2,
             backend: nibble::BackendKind::Cpu,
+            n_batch: 0,
+            draft_max: 0,
         })
         .unwrap();
     assert_eq!(fresh.eval(&[1, 2, 9]).unwrap(), &after_truncate[..]);
@@ -380,6 +390,8 @@ fn generation_is_deterministic_and_respects_limits() {
                 n_ctx: 32,
                 threads: 2,
                 backend: nibble::BackendKind::Cpu,
+                n_batch: 0,
+                draft_max: 0,
             })
             .unwrap();
         let mut sampler = Sampler::new(config);
@@ -420,6 +432,8 @@ fn evaluation_errors() {
             n_ctx: 4,
             threads: 1,
             backend: nibble::BackendKind::Cpu,
+            n_batch: 0,
+            draft_max: 0,
         })
         .unwrap();
     assert!(matches!(session.eval(&[]), Err(Error::EmptyInput)));
@@ -440,6 +454,8 @@ fn evaluation_errors() {
                 n_ctx: 1 << 20,
                 threads: 1,
                 backend: nibble::BackendKind::Cpu,
+                n_batch: 0,
+                draft_max: 0,
             })
             .unwrap()
             .n_ctx(),
@@ -560,4 +576,15 @@ fn the_default_backend_is_metal_where_available() {
         session.fallback_reason().is_some(),
         cfg!(target_os = "macos") && !metal
     );
+}
+
+/// Batches give every token the logits it gets alone, on the CPU and on Metal.
+#[test]
+fn batch_size_does_not_change_the_logits() {
+    let model = Weights::new().model();
+    let n_vocab = model.config().n_vocab as u32;
+    let tokens: Vec<u32> = (0..23u32).map(|i| (i * 37 + 11) % n_vocab).collect();
+    for backend in [nibble::BackendKind::Cpu, nibble::BackendKind::Metal] {
+        common::assert_batches_match_steps(&model, backend, N_CTX, &tokens, 9);
+    }
 }

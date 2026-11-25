@@ -137,6 +137,15 @@ pub(crate) fn metal_session(model: &nibble::Model, n_ctx: usize) -> Option<nibbl
         backend: nibble::BackendKind::Metal,
         ..nibble::SessionOptions::default()
     };
+    session_or_skip(model, options)
+}
+
+/// A session with `options`, or `None` (with a note) for a Metal session
+/// where Metal is not available.
+pub(crate) fn session_or_skip(
+    model: &nibble::Model,
+    options: nibble::SessionOptions,
+) -> Option<nibble::Session<'_>> {
     match model.session(options) {
         Ok(s) => Some(s),
         // Only a missing device or framework skips: on a Mac with a GPU,
@@ -150,4 +159,187 @@ pub(crate) fn metal_session(model: &nibble::Model, n_ctx: usize) -> Option<nibbl
         }
         Err(e) => panic!("{e}"),
     }
+}
+
+/// Checks that evaluating `tokens` in batches of any size gives, bit for
+/// bit, the logits of evaluating them one token at a time, on `backend`:
+/// whole, and in two calls split at `split` (each call cuts a batch where
+/// it takes its checkpoint, 4 tokens before its end).
+pub(crate) fn assert_batches_match_steps(
+    model: &nibble::Model,
+    backend: nibble::BackendKind,
+    n_ctx: usize,
+    tokens: &[u32],
+    split: usize,
+) {
+    let options = |n_batch: usize| nibble::SessionOptions {
+        n_ctx,
+        backend,
+        threads: 2,
+        n_batch,
+        draft_max: 0,
+    };
+    let Some(mut stepped) = session_or_skip(model, options(1)) else {
+        return;
+    };
+    let steps: Vec<Vec<f32>> = tokens
+        .iter()
+        .map(|&t| stepped.eval(&[t]).unwrap().to_vec())
+        .collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for n_batch in [2, 3, 5, 64] {
+        let mut s = session_or_skip(model, options(n_batch)).unwrap();
+        assert_eq!(s.n_batch(), n_batch.min(n_ctx));
+        let whole = s.eval(tokens).unwrap();
+        assert_eq!(
+            bits(whole),
+            bits(&steps[tokens.len() - 1]),
+            "{backend} batches of {n_batch}"
+        );
+        s.clear().unwrap();
+        let first = s.eval(&tokens[..split]).unwrap();
+        assert_eq!(
+            bits(first),
+            bits(&steps[split - 1]),
+            "{backend} batches of {n_batch}, first call"
+        );
+        let second = s.eval(&tokens[split..]).unwrap();
+        assert_eq!(
+            bits(second),
+            bits(&steps[tokens.len() - 1]),
+            "{backend} batches of {n_batch}, second call"
+        );
+    }
+
+    // `eval_all`: each row is the logits after its token.
+    let n_vocab = model.config().n_vocab;
+    let mut s = session_or_skip(model, options(0)).unwrap();
+    let mut at = 0;
+    for chunk in tokens.chunks(7) {
+        let all = s.eval_all(chunk).unwrap();
+        assert_eq!(all.len(), chunk.len() * n_vocab);
+        for (i, row) in all.chunks(n_vocab).enumerate() {
+            let t = at + i;
+            assert_eq!(bits(row), bits(&steps[t]), "{backend} eval_all, token {t}");
+        }
+        assert_eq!(
+            bits(s.logits().unwrap()),
+            bits(&steps[at + chunk.len() - 1])
+        );
+        at += chunk.len();
+    }
+    s.clear().unwrap();
+    let too_many = vec![tokens[0]; nibble::MAX_EVAL_ALL + 1];
+    assert!(matches!(
+        s.eval_all(&too_many),
+        Err(nibble::Error::TooManyTokens { n, max })
+            if n == too_many.len() && max == nibble::MAX_EVAL_ALL
+    ));
+}
+
+/// Checks, on `backend`, that an evaluation of 2 to 16 tokens (a draft being
+/// verified) can be taken back without replaying anything, and that
+/// evaluation then continues bit for bit as from the kept prefix: after
+/// one rewind or several, and from a checkpoint taken while the tokens of
+/// such an evaluation were pending. `tokens` needs at least 30.
+pub(crate) fn assert_rewinds_into_short_batches(
+    model: &nibble::Model,
+    backend: nibble::BackendKind,
+    n_ctx: usize,
+    tokens: &[u32],
+) {
+    let options = |n_batch: usize| nibble::SessionOptions {
+        n_ctx,
+        backend,
+        threads: 2,
+        n_batch,
+        draft_max: 0,
+    };
+    let Some(mut s) = session_or_skip(model, options(0)) else {
+        return;
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let n_vocab = model.config().n_vocab;
+    // The logits after `seq`, evaluated one token at a time.
+    let stepped = |seq: &[u32]| {
+        let mut r = session_or_skip(model, options(1)).unwrap();
+        for &t in seq {
+            r.eval(&[t]).unwrap();
+        }
+        bits(r.logits().unwrap())
+    };
+    let (prompt, draft, x, y) = (&tokens[..11], &tokens[11..17], tokens[17], tokens[18]);
+
+    for kept in [0, 1, 4, 6] {
+        s.clear().unwrap();
+        s.eval(prompt).unwrap();
+        s.eval_all(draft).unwrap();
+        assert_eq!(
+            s.truncate(prompt.len() + kept).unwrap(),
+            0,
+            "{backend} kept {kept}"
+        );
+        let got = bits(s.eval(&[x]).unwrap());
+        let seq: Vec<u32> = prompt
+            .iter()
+            .chain(&draft[..kept])
+            .chain([&x])
+            .copied()
+            .collect();
+        assert_eq!(got, stepped(&seq), "{backend}: {kept} of the draft kept");
+    }
+
+    // Two rewinds into one evaluation, then into a second one.
+    s.clear().unwrap();
+    s.eval(prompt).unwrap();
+    s.eval_all(draft).unwrap();
+    assert_eq!(s.truncate(prompt.len() + 4).unwrap(), 0);
+    assert_eq!(s.truncate(prompt.len() + 2).unwrap(), 0);
+    let got = bits(s.eval_all(&[x, y]).unwrap()[n_vocab..].to_vec().as_slice());
+    let mut seq: Vec<u32> = prompt.iter().chain(&draft[..2]).copied().collect();
+    seq.extend([x, y]);
+    assert_eq!(got, stepped(&seq), "{backend}: after two rewinds");
+    assert_eq!(s.truncate(seq.len() - 1).unwrap(), 0);
+    let got = bits(s.eval(&[tokens[19]]).unwrap());
+    seq.pop();
+    seq.push(tokens[19]);
+    assert_eq!(
+        got,
+        stepped(&seq),
+        "{backend}: after a rewind into the second evaluation"
+    );
+
+    // A checkpoint taken while a short batch is pending: the evaluation
+    // below cuts a batch 4 tokens before its end and checkpoints there,
+    // after its first 4 tokens, which are pending.
+    s.clear().unwrap();
+    s.eval(prompt).unwrap();
+    s.eval_all(draft).unwrap();
+    s.truncate(prompt.len() + 3).unwrap();
+    let more = &tokens[20..28];
+    s.eval(more).unwrap();
+    s.eval(&[tokens[28]]).unwrap();
+    let mut seq: Vec<u32> = prompt
+        .iter()
+        .chain(&draft[..3])
+        .chain(more)
+        .copied()
+        .collect();
+    seq.push(tokens[28]);
+    let checkpoint = seq.len() - 1 - 4;
+    // One token (not pending) was evaluated since, so this restores the
+    // checkpoint and replays the token after it.
+    assert_eq!(
+        s.truncate(checkpoint + 1).unwrap(),
+        1,
+        "{backend}: replay from the checkpoint"
+    );
+    let got = bits(s.eval(&[tokens[29]]).unwrap());
+    seq.truncate(checkpoint + 1);
+    seq.push(tokens[29]);
+    assert_eq!(
+        got,
+        stepped(&seq),
+        "{backend}: from a checkpoint with pending tokens"
+    );
 }

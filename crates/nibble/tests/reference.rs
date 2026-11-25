@@ -53,15 +53,30 @@ fn load_tokenizer(file: &str) -> Tokenizer {
     Tokenizer::from_gguf(&Gguf::parse(&storage).unwrap()).unwrap()
 }
 
-/// Greedy completion of `prompt` (special tokens parsed), as text.
+/// Greedy completion of `prompt` (special tokens parsed), as text, on the CPU.
 fn greedy(model: &Model, prompt: &str, max_tokens: usize) -> (String, StopReason) {
+    let (text, stop, _) = greedy_on(model, prompt, max_tokens, nibble::BackendKind::Cpu, 0);
+    (text, stop)
+}
+
+/// [`greedy`] on `backend`, drafting up to `draft_max` tokens with the MTP
+/// head, and how the drafts fared.
+fn greedy_on(
+    model: &Model,
+    prompt: &str,
+    max_tokens: usize,
+    backend: nibble::BackendKind,
+    draft_max: usize,
+) -> (String, StopReason, nibble::DraftStats) {
     let tok = model.tokenizer();
     let tokens = tok.encode(prompt, true);
     let mut session = model
         .session(SessionOptions {
             n_ctx: 512,
             threads: 0,
-            backend: nibble::BackendKind::Cpu,
+            backend,
+            n_batch: 0,
+            draft_max,
         })
         .unwrap();
     let mut sampler = Sampler::new(SamplerConfig::greedy());
@@ -74,7 +89,7 @@ fn greedy(model: &Model, prompt: &str, max_tokens: usize) -> (String, StopReason
         })
         .unwrap();
     text.push_str(&decoder.finish());
-    (text, stop)
+    (text, stop, session.draft_stats())
 }
 
 const TOKENIZER_CASES: [&str; 7] = [
@@ -298,4 +313,55 @@ fn qwen35_q3_k_m_greedy_matches_llama_cpp() {
         text,
         " 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,"
     );
+}
+
+/// The 4B file carries an MTP head (`blk.32`): drafting with it gives the
+/// tokens of plain decoding, which match llama.cpp's on the CPU, and the
+/// drafts are mostly accepted (llama.cpp b12722's own MTP drafting accepts
+/// 81% on Metal and 88% on the CPU for the chat prompt, 3 drafts per step).
+#[test]
+#[ignore = "needs models/Qwen3.5-4B-Q8_0.gguf"]
+fn qwen35_4b_drafting_gives_the_tokens_of_plain_decoding() {
+    let model = load_model("Qwen3.5-4B-Q8_0.gguf");
+    assert!(model.has_mtp());
+    let chat = "<|im_start|>user\nExplain why the sky is blue in two sentences.<|im_end|>\n\
+                <|im_start|>assistant\n";
+    let (text, stop) = greedy(&model, "1, 1, 2, 3, 5, 8, 13,", 64);
+    assert_eq!(
+        text,
+        " 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765"
+    );
+    // Digits are single tokens: these fill the 64.
+    assert_eq!(stop, StopReason::MaxTokens);
+    let (text, _) = greedy(&model, chat, 64);
+    assert_eq!(
+        text,
+        "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Topic: Why the \
+         sky is blue.\n    *   Constraint: Exactly two sentences.\n\n2.  **Identify Key \
+         Concepts:**\n    *   Sunlight is white (contains all colors).\n    *  "
+    );
+
+    let mut backends = vec![nibble::BackendKind::Cpu];
+    if cfg!(target_os = "macos") {
+        backends.push(nibble::BackendKind::Metal);
+    }
+    for backend in backends {
+        for prompt in ["1, 1, 2, 3, 5, 8, 13,", chat] {
+            let plain = greedy_on(&model, prompt, 64, backend, 0);
+            for draft_max in [1, 3, 6] {
+                let (text, stop, stats) = greedy_on(&model, prompt, 64, backend, draft_max);
+                assert_eq!(
+                    (&text, stop),
+                    (&plain.0, plain.1),
+                    "{backend}, {draft_max} drafts"
+                );
+                // A head that computed the wrong thing would get almost
+                // none right; longer drafts are right less often.
+                assert!(
+                    stats.accepted * 3 > stats.drafted,
+                    "{backend}, {draft_max} drafts: {stats:?}"
+                );
+            }
+        }
+    }
 }

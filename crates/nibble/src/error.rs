@@ -57,11 +57,21 @@ pub enum Error {
     InvalidToken(u32),
     /// `Session::eval` was called with no tokens.
     EmptyInput,
+    /// More tokens than one call evaluates (`Session::eval_all`).
+    TooManyTokens {
+        /// Tokens passed.
+        n: usize,
+        /// The most the call takes.
+        max: usize,
+    },
     /// A conversation the chat template cannot render, such as tool-call
     /// arguments that are not a JSON object.
     InvalidChat(String),
     /// The backend asked for cannot run here, or failed while running.
     Backend(String),
+    /// Drafting was asked for, but the model has no multi-token-prediction
+    /// head.
+    NoDraftHead,
 }
 
 impl fmt::Display for Error {
@@ -105,8 +115,15 @@ impl fmt::Display for Error {
             }
             Self::InvalidToken(id) => write!(f, "token id {id} is outside the vocabulary"),
             Self::EmptyInput => write!(f, "no tokens to evaluate"),
+            Self::TooManyTokens { n, max } => {
+                write!(f, "{n} tokens to evaluate at once; at most {max} can be")
+            }
             Self::InvalidChat(msg) => write!(f, "cannot render the chat: {msg}"),
             Self::Backend(msg) => write!(f, "backend: {msg}"),
+            Self::NoDraftHead => write!(
+                f,
+                "the model has no multi-token-prediction (MTP) head to draft with"
+            ),
         }
     }
 }

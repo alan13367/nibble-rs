@@ -17,13 +17,14 @@ mod layers;
 mod qwen3;
 mod qwen35;
 
+use std::ops::Range;
 use std::path::Path;
 
 use nibble_gguf::{Gguf, Storage};
 
 pub use config::ModelConfig;
 
-use crate::backend::{Backend, ModelData, Params};
+use crate::backend::{Backend, MAX_LOGIT_ROWS, ModelData, Params};
 use crate::chat::ChatTemplate;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionOptions};
@@ -203,6 +204,16 @@ impl Model {
         self.chat_template
     }
 
+    /// Whether the file has a multi-token-prediction (MTP) head, with which
+    /// a session can draft tokens (see [`SessionOptions::draft_max`]).
+    #[must_use]
+    pub const fn has_mtp(&self) -> bool {
+        match &self.arch {
+            Arch::Qwen3(_) => false,
+            Arch::Qwen35(m) => m.has_mtp(),
+        }
+    }
+
     /// Whether the weights are memory-mapped.
     #[must_use]
     pub const fn is_mapped(&self) -> bool {
@@ -230,49 +241,85 @@ impl Model {
         }
     }
 
-    /// Fresh per-session state on `b` for up to `n_ctx` positions.
-    pub(crate) fn new_state<B: Backend>(&self, b: &mut B, n_ctx: usize) -> Result<State<B>> {
+    /// Fresh per-session state on `b` for up to `n_ctx` positions, evaluated
+    /// in batches of up to `n_batch` tokens; with the MTP head's state if
+    /// `mtp` (and the model has one), which every forward pass then
+    /// updates.
+    pub(crate) fn new_state<B: Backend>(
+        &self,
+        b: &mut B,
+        n_ctx: usize,
+        n_batch: usize,
+        mtp: bool,
+    ) -> Result<State<B>> {
+        let c = &self.config;
         Ok(match &self.arch {
-            Arch::Qwen3(_) => State::Qwen3(qwen3::Qwen3::new_state(b, &self.config, n_ctx)?),
-            Arch::Qwen35(m) => State::Qwen35(m.new_state(b, &self.config, n_ctx)?),
+            Arch::Qwen3(_) => State::Qwen3(qwen3::Qwen3::new_state(b, c, n_ctx, n_batch)?),
+            Arch::Qwen35(m) => State::Qwen35(m.new_state(b, c, n_ctx, n_batch, mtp)?),
         })
     }
 
-    /// Runs `token` at position `pos` on `b`, writing the next-token logits
-    /// when asked.
-    pub(crate) fn forward<B: Backend>(
+    /// One draft step of the MTP head (the state has its state): `token`
+    /// at `pos`, the position after the state's, paired with the trunk's
+    /// last hidden state (`first`) or the head's output at the step before;
+    /// writes the logits of the token after it to `logits`.
+    pub(crate) fn draft<B: Backend>(
         &self,
         b: &mut B,
         state: &mut State<B>,
         token: u32,
         pos: usize,
-        logits: Option<&mut [f32]>,
+        first: bool,
+        logits: &mut [f32],
     ) -> Result<()> {
         let c = &self.config;
         match (&self.arch, state) {
-            (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(b, c, s, token, pos, logits),
-            (Arch::Qwen35(m), State::Qwen35(s)) => m.forward(b, c, s, token, pos, logits),
+            (Arch::Qwen35(m), State::Qwen35(s)) => m.draft(b, c, s, token, pos, first, logits),
+            _ => unreachable!("drafting on a model without an MTP head"),
+        }
+    }
+
+    /// Runs `tokens` (at most the state's `n_batch`) at positions from `pos`
+    /// on, on `b`, writing the logits asked for.
+    pub(crate) fn forward<B: Backend>(
+        &self,
+        b: &mut B,
+        state: &mut State<B>,
+        tokens: &[u32],
+        pos: usize,
+        logits: Option<Logits<'_>>,
+    ) -> Result<()> {
+        debug_assert!(logits.as_ref().is_none_or(|l| {
+            l.rows.end <= tokens.len()
+                && l.rows.len() <= MAX_LOGIT_ROWS
+                && l.out.len() >= l.rows.len() * self.config.n_vocab
+        }));
+        let c = &self.config;
+        match (&self.arch, state) {
+            (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(b, c, s, tokens, pos, logits),
+            (Arch::Qwen35(m), State::Qwen35(s)) => m.forward(b, c, s, tokens, pos, logits),
             _ => unreachable!("session state belongs to a different architecture"),
         }
     }
 
-    /// Rewinds `state` to its first `n_pos` positions. Returns false when the
-    /// architecture cannot rewind (recurrent state), in which case the caller
-    /// must rebuild the state from a [`Snapshot`] or by evaluating the kept
-    /// tokens again.
+    /// Rewinds `state` from `from` to its first `to` positions. Returns
+    /// false, changing nothing, when the architecture cannot (recurrent
+    /// state, except into the pending tokens of a short last batch), in
+    /// which case the caller must rebuild the state from a [`Snapshot`] or
+    /// by evaluating the kept tokens again.
     pub(crate) fn truncate_state<B: Backend>(
         &self,
         b: &mut B,
         state: &mut State<B>,
-        n_pos: usize,
+        from: usize,
+        to: usize,
     ) -> Result<bool> {
         match state {
             State::Qwen3(s) => {
-                s.truncate(b, n_pos)?;
+                s.truncate(b, to)?;
                 Ok(true)
             }
-            // DeltaNet's recurrent state cannot be rewound.
-            State::Qwen35(_) => Ok(false),
+            State::Qwen35(s) => s.rewind(b, from, to),
         }
     }
 
@@ -285,18 +332,18 @@ impl Model {
         state: &State<B>,
         snapshot: &mut Option<Snapshot>,
     ) -> Result<bool> {
-        match state {
-            State::Qwen3(_) => Ok(false),
-            State::Qwen35(s) => {
+        match (&self.arch, state) {
+            (Arch::Qwen35(m), State::Qwen35(s)) => {
                 if let Some(Snapshot::Qwen35(target)) = snapshot {
-                    s.save(b, target)?;
+                    s.save(b, m.dims(), target)?;
                 } else {
                     let mut target = qwen35::Snapshot::default();
-                    s.save(b, &mut target)?;
+                    s.save(b, m.dims(), &mut target)?;
                     *snapshot = Some(Snapshot::Qwen35(target));
                 }
                 Ok(true)
             }
+            _ => Ok(false),
         }
     }
 
@@ -306,14 +353,23 @@ impl Model {
         &self,
         b: &mut B,
         state: &mut State<B>,
-        snapshot: &Snapshot,
+        snapshot: &mut Snapshot,
         n_pos: usize,
     ) -> Result<()> {
-        match (state, snapshot) {
-            (State::Qwen35(s), Snapshot::Qwen35(saved)) => s.restore(b, saved, n_pos),
+        match (&self.arch, state, snapshot) {
+            (Arch::Qwen35(m), State::Qwen35(s), Snapshot::Qwen35(saved)) => {
+                s.restore(b, m.dims(), saved, n_pos)
+            }
             _ => unreachable!("snapshot belongs to a different architecture"),
         }
     }
+}
+
+/// The logits a forward pass computes: those of the batch rows `rows` (at
+/// most [`crate::backend::MAX_LOGIT_ROWS`]), one after another in `out`.
+pub(crate) struct Logits<'a> {
+    pub(crate) rows: Range<usize>,
+    pub(crate) out: &'a mut [f32],
 }
 
 /// The parts of a [`State`] that cannot be rewound (recurrent layers), as

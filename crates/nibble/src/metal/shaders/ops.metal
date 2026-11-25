@@ -48,6 +48,17 @@ kernel void swiglu(
     }
 }
 
+// `dst = src`, `n` values.
+kernel void copy_f32(
+        constant CountArgs & a [[buffer(0)]],
+        device const float * src [[buffer(1)]],
+        device float * dst [[buffer(2)]],
+        uint i [[thread_position_in_grid]]) {
+    if (i < a.n) {
+        dst[i] = src[i];
+    }
+}
+
 struct AttentionArgs {
     uint n_pos;
     uint head_dim;
@@ -372,8 +383,11 @@ struct DeltaArgs {
     uint d_v;
     uint key_dim;
     uint conv_dim;
+    uint taps;
     uint rows;
     uint oldest;
+    uint store;
+    uint pending;
     float eps;
     float scale;
 };
@@ -382,10 +396,11 @@ struct DeltaArgs {
 #define DELTA_MAX_CHUNKS 4
 
 // Channel `c` of the causal convolution, with SiLU. The history is a ring
-// of `rows` rows: `rows - 1` inputs from row `oldest` on, and a spare row.
+// of `rows` rows: the token's window is the `taps - 1` inputs from row
+// `oldest` on, and its own input `x` goes to the row after them.
 static inline float conv_channel(constant DeltaArgs & a, device const float * history,
         device const float * taps, device const float * x, uint c) {
-    const uint len = a.rows - 1;
+    const uint len = a.taps - 1;
     float sum = 0.0f;
     for (uint t = 0; t < len; ++t) {
         const uint row = (a.oldest + t) % a.rows;
@@ -400,12 +415,15 @@ static inline float conv_channel(constant DeltaArgs & a, device const float * hi
 
 // One token through a Gated DeltaNet layer for rows `tgpig.y * nsg *
 // DELTA_ROWS` on of value head `tgpig.x`: the convolution of the head's q
-// and k channels and of the rows' v channels (each channel's new input is
-// stored by one threadgroup, in the spare row, which no threadgroup reads),
-// L2-normalized q and k, and the gated delta rule on those rows of the
-// head's state (`d_v` rows of `d_k`, ggml's transposed layout; each lane
-// holds four values of a row at a time). Writes the rows' outputs, before
-// the gated RMSNorm of `delta_norm`.
+// and k channels and of the rows' v channels (with `store`, each channel's
+// new input is stored by one threadgroup, in the row after the window,
+// which no threadgroup reads), L2-normalized q and k, and the gated delta
+// rule on those rows of the head's state (`d_v` rows of `d_k`, ggml's
+// transposed layout; each lane holds four values of a row at a time), read
+// from `state` and written to `state_out` (the same buffer, or a work copy
+// for a pending token, whose beta and alpha go to `pending_ba` with
+// `pending`). Writes the rows' outputs, before the gated RMSNorm of
+// `delta_norm`.
 kernel void delta_net(
         constant DeltaArgs & a [[buffer(0)]],
         device const float * x [[buffer(1)]],
@@ -415,8 +433,10 @@ kernel void delta_net(
         device const float * alpha [[buffer(5)]],
         device const float * dt_bias [[buffer(6)]],
         device const float * a_log [[buffer(7)]],
-        device float * state [[buffer(8)]],
+        device const float * state [[buffer(8)]],
         device float * out [[buffer(9)]],
+        device float * state_out [[buffer(10)]],
+        device float * pending_ba [[buffer(11)]],
         threadgroup float * shared [[threadgroup(0)]],
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort2 tid2 [[thread_position_in_threadgroup]],
@@ -439,7 +459,7 @@ kernel void delta_net(
     threadgroup float * qn = shared;
     threadgroup float * kn = qn + dk;
     threadgroup float * vv = kn + dk;
-    const uint spare = ((a.oldest + a.rows - 1) % a.rows) * a.conv_dim;
+    const uint spare = ((a.oldest + a.taps - 1) % a.rows) * a.conv_dim;
 
     const uint n4 = dk / 4;
     const uint jr = j0 + sgitg * DELTA_ROWS;
@@ -470,14 +490,19 @@ kernel void delta_net(
     }
     sq = threadgroup_sum(sq, buf, tiisg, sgitg, nsg);
     sk = threadgroup_sum(sk, buf, tiisg, sgitg, nsg);
-    // The spare row is written after every read of the history above.
-    for (uint i = tid; i < dk && owns_qk; i += ntg) {
+    // The input's row is written after every read of the history above.
+    for (uint i = tid; i < dk && owns_qk && a.store != 0; i += ntg) {
         history[spare + kh * dk + i] = x[kh * dk + i];
         history[spare + a.key_dim + kh * dk + i] = x[a.key_dim + kh * dk + i];
     }
-    if (tid < rows_per_group && j0 + tid < dv) {
+    if (a.store != 0 && tid < rows_per_group && j0 + tid < dv) {
         const uint cv = 2 * a.key_dim + h * dv + j0 + tid;
         history[spare + cv] = x[cv];
+    }
+    if (a.pending != 0 && tgpig.y == 0 && tid == 0) {
+        const uint nh = (a.conv_dim - 2 * a.key_dim) / dv;
+        pending_ba[h] = beta_in[h];
+        pending_ba[nh + h] = alpha[h];
     }
     // As llama.cpp: an RMSNorm with `eps / d_k`, then a scale by `1 / sqrt(d_k)`.
     const float inv_sqrt_n = 1.0f / sqrt(float(dk));
@@ -508,7 +533,7 @@ kernel void delta_net(
         }
         const float delta = (vv[j - j0] - simd_sum(kd)) * beta;
         float o = 0.0f;
-        device float4 * row = (device float4 *) (state + ((uint64_t) h * dv + j) * dk);
+        device float4 * row = (device float4 *) (state_out + ((uint64_t) h * dv + j) * dk);
         FOR_UNROLL (short c = 0; c < DELTA_MAX_CHUNKS; ++c) {
             const uint i = tiisg + c * N_SIMDWIDTH;
             if (i < n4) {

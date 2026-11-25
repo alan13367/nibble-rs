@@ -44,4 +44,7 @@ pub use error::{Error, Result};
 pub use model::{Architecture, Model, ModelConfig};
 pub use nibble_gguf as gguf;
 pub use nibble_json as json;
-pub use session::{CHECKPOINT_TAIL, MAX_CHECKPOINTS, Session, SessionOptions, StopReason};
+pub use session::{
+    CHECKPOINT_TAIL, DEFAULT_BATCH, DraftStats, MAX_CHECKPOINTS, MAX_EVAL_ALL, Session,
+    SessionOptions, StopReason,
+};

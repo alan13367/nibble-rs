@@ -78,12 +78,13 @@ impl Args {
     }
 }
 
-/// `-m`, `-c`, `-t`, `--backend`, `--read`.
+/// `-m`, `-c`, `-t`, `--backend`, `--draft`, `--read`.
 pub(crate) struct ModelOptions {
     pub(crate) path: Option<PathBuf>,
     pub(crate) n_ctx: usize,
     pub(crate) threads: usize,
     pub(crate) backend: BackendKind,
+    pub(crate) draft: usize,
     pub(crate) mmap: bool,
 }
 
@@ -93,6 +94,9 @@ pub(crate) const MODEL_HELP: &str = "  -m, --model FILE         GGUF model file 
                            else one per physical core)
       --backend B          auto, cpu or metal (default auto: Metal where
                            available, else the CPU)
+      --draft N            Draft up to N tokens after each one with the model's
+                           MTP head and check them in one pass (speculative
+                           decoding; same output). Default 0 = off
       --read               Read the model into memory instead of memory-mapping it
 ";
 
@@ -111,6 +115,7 @@ impl ModelOptions {
             n_ctx: 4096,
             threads: 0,
             backend: BackendKind::Auto,
+            draft: 0,
             mmap: true,
         }
     }
@@ -127,6 +132,7 @@ impl ModelOptions {
                     format!("unknown backend `{name}` (expected auto, cpu or metal)")
                 })?;
             }
+            "--draft" => self.draft = args.parse(flag)?,
             "--read" => self.mmap = false,
             _ => return Ok(false),
         }
@@ -176,6 +182,8 @@ impl ModelOptions {
             n_ctx: self.n_ctx,
             threads: self.threads,
             backend: self.backend,
+            n_batch: 0,
+            draft_max: self.draft,
         }
     }
 }

@@ -9,11 +9,13 @@
 //!   kernels' argument structs and their dispatch geometry.
 //!
 //! The ops of [`Backend`] encode dispatches into a compute encoder,
-//! separated by memory barriers where one reads what another wrote. A token
+//! separated by memory barriers where one reads what another wrote. A batch
 //! is a few command buffers: the first is committed after a few dispatches,
-//! so the GPU starts while the rest of the token is encoded, and the last
-//! when the token ends. Tokens whose logits are not needed are not waited
-//! for, so a prompt streams to the GPU. The model file's memory map is
+//! so the GPU starts while the rest of the batch is encoded, and the last
+//! when the batch ends. Batches whose logits are not needed are not waited
+//! for, so a prompt streams to the GPU. For now an op over a batch encodes
+//! the dispatch of each token in turn, at that token's rows of the vectors:
+//! each token gets exactly its result in a batch of its own. The model file's memory map is
 //! wrapped in a buffer without a copy; activations are f32, and the KV
 //! cache is f16.
 //!
@@ -32,12 +34,14 @@ mod tests;
 mod weights;
 
 use std::collections::VecDeque;
+use std::ops::Range;
 
 use device::{Buffer, Commands, Device, Size};
 use kernels::{AttentionArgs, CountArgs, DeltaArgs, EmbedArgs, MatvecArgs, Pipelines, RmsArgs};
 
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, DeviceVector, ModelData, Param, QkNorm,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_LOGIT_ROWS, MAX_PENDING, ModelData,
+    Param, QkNorm,
 };
 use crate::cpu::Weight;
 use crate::error::{Error, Result};
@@ -101,12 +105,6 @@ pub(crate) struct MetalVector {
     len: usize,
 }
 
-impl DeviceVector for MetalVector {
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
 /// One attention layer's f16 keys and values, both by position.
 #[derive(Debug)]
 pub(crate) struct MetalKvCache {
@@ -127,6 +125,21 @@ pub(crate) enum Output<'a> {
     SwiGlu(&'a Weight),
 }
 
+/// The buffers of one token of a DeltaNet layer, with their byte offsets.
+struct DeltaStep<'a> {
+    /// The token's input (the projection of q, k and v).
+    x: (&'a Buffer, usize),
+    beta: (&'a Buffer, usize),
+    alpha: (&'a Buffer, usize),
+    /// Where the state is read from and written to.
+    ssm: (&'a Buffer, &'a Buffer),
+    out: (&'a Buffer, usize),
+    /// The output gate for the gated norm, when the output is used.
+    z: Option<(&'a Buffer, usize)>,
+    /// The token's row of the pending projections.
+    pending_at: usize,
+}
+
 /// The Metal backend of one session.
 pub(crate) struct MetalBackend<'m> {
     model: ModelData<'m>,
@@ -138,9 +151,14 @@ pub(crate) struct MetalBackend<'m> {
     logits: Buffer,
     /// Each attention chunk's output, maximum score and sum of exponentials.
     partials: Buffer,
+    /// One DeltaNet layer's state, which a batch that stays pending runs
+    /// on, and the unused outputs of pending tokens applied before a batch;
+    /// allocated by the first batch that needs them.
+    delta_work: Option<(Buffer, Buffer)>,
     attention: AttentionPlan,
     n_ctx: usize,
-    pos: usize,
+    /// Tokens in the batch being encoded.
+    n: usize,
     /// The token being encoded.
     commands: Option<Commands>,
     /// Dispatches encoded into `commands`.
@@ -217,7 +235,7 @@ impl<'m> MetalBackend<'m> {
         // SAFETY: the buffer is new; no command uses it yet.
         unsafe { store(&mut params, model.params) };
         let c = model.config;
-        let logits = floats(c.n_vocab)?;
+        let logits = floats(MAX_LOGIT_ROWS * c.n_vocab)?;
         // Checked here so that `Auto` falls back to the CPU for a model the
         // kernels do not cover.
         let attention = Self::attention_plan(&device, &pipelines, c).ok_or_else(|| {
@@ -239,9 +257,10 @@ impl<'m> MetalBackend<'m> {
             params,
             logits,
             partials,
+            delta_work: None,
             attention,
             n_ctx,
-            pos: 0,
+            n: 0,
             commands: None,
             dispatches: 0,
             chunks: 0,
@@ -405,6 +424,55 @@ impl<'m> MetalBackend<'m> {
         4 * p.range().start
     }
 
+    /// Encodes one token of a DeltaNet layer (see `delta_net` in the
+    /// shaders) into the state's ring `conv` and `pending_ba`. False after
+    /// a failure.
+    fn encode_delta_step(
+        &mut self,
+        d: DeltaNetDims,
+        p: DeltaNetParams,
+        args: &DeltaArgs,
+        (conv, pending_ba): (&Buffer, &Buffer),
+        step: &DeltaStep<'_>,
+    ) -> bool {
+        if !self.reserve(2) {
+            return false;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return false;
+        };
+        let params = &self.params;
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.delta_net);
+        commands.set_bytes(0, args);
+        commands.set_buffer(1, step.x.0, step.x.1);
+        commands.set_buffer(2, conv, 0);
+        commands.set_buffer(3, params, Self::param_offset(p.conv));
+        commands.set_buffer(4, step.beta.0, step.beta.1);
+        commands.set_buffer(5, step.alpha.0, step.alpha.1);
+        commands.set_buffer(6, params, Self::param_offset(p.dt_bias));
+        commands.set_buffer(7, params, Self::param_offset(p.a));
+        commands.set_buffer(8, step.ssm.0, 0);
+        commands.set_buffer(9, step.out.0, step.out.1);
+        commands.set_buffer(10, step.ssm.1, 0);
+        commands.set_buffer(11, pending_ba, step.pending_at);
+        commands.set_threadgroup_memory(0, 4 * (2 * d.d_k + DELTA_GROUP_ROWS));
+        commands.dispatch(
+            Size::new(d.n_v_heads, d.d_v.div_ceil(DELTA_GROUP_ROWS), 1),
+            Size::new(32 * DELTA_SIMDGROUPS, 1, 1),
+        );
+        if let Some(z) = step.z {
+            commands.barrier();
+            commands.set_pipeline(&self.pipelines.delta_norm);
+            commands.set_bytes(0, args);
+            commands.set_buffer(1, step.out.0, step.out.1);
+            commands.set_buffer(2, z.0, z.1);
+            commands.set_buffer(3, params, Self::param_offset(p.norm));
+            commands.dispatch(Size::new(d.n_v_heads, 1, 1), Size::new(128, 1, 1));
+        }
+        true
+    }
+
     /// Threadgroups of [`THREADS`] covering `n` threads.
     fn groups(n: usize) -> (Size, Size) {
         (
@@ -441,8 +509,8 @@ impl<'m> MetalBackend<'m> {
         commands.dispatch(groups, threads);
     }
 
-    /// Encodes the product of `w` and `x` into `out`, after a barrier if
-    /// `barrier`.
+    /// Encodes the product of `w` and every token's row of `x` into its row
+    /// of `out`; the first after a barrier if `barrier`.
     fn encode_matvec(
         &mut self,
         w: &Weight,
@@ -451,29 +519,42 @@ impl<'m> MetalBackend<'m> {
         output: Output<'_>,
         barrier: bool,
     ) {
-        if !self.reserve(1) {
-            return;
-        }
-        let Some(commands) = self.commands.as_mut() else {
-            return;
-        };
-        if barrier {
-            commands.barrier();
-        }
-        if let Err(e) = encode_matvec(commands, &self.pipelines, &self.weights, w, x, out, output) {
-            self.fail(e);
+        for t in 0..self.n {
+            if !self.reserve(1) {
+                return;
+            }
+            let Some(commands) = self.commands.as_mut() else {
+                return;
+            };
+            if barrier && t == 0 {
+                commands.barrier();
+            }
+            let at = (4 * t * w.cols, 4 * t * w.rows);
+            let result = encode_matvec(
+                commands,
+                &self.pipelines,
+                &self.weights,
+                w,
+                (x, at.0),
+                (out, at.1),
+                output,
+            );
+            if let Err(e) = result {
+                return self.fail(e);
+            }
         }
     }
 }
 
-/// Encodes `out = w · x` (or as `output` says) into `commands`.
+/// Encodes `out = w · x` (or as `output` says) into `commands`, for the
+/// vectors at the byte offsets given with their buffers.
 fn encode_matvec(
     commands: &mut Commands,
     pipelines: &Pipelines,
     weights: &Weights<'_>,
     w: &Weight,
-    x: &Buffer,
-    out: &Buffer,
+    (x, x_at): (&Buffer, usize),
+    (out, out_at): (&Buffer, usize),
     output: Output<'_>,
 ) -> std::result::Result<(), String> {
     let mv = pipelines
@@ -502,7 +583,7 @@ fn encode_matvec(
         pad: 0,
     };
     commands.set_pipeline(mv.pipeline());
-    commands.set_buffer(2, x, 0);
+    commands.set_buffer(2, x, x_at);
     let locate = |w: &Weight| {
         weights
             .locate(w)
@@ -512,7 +593,7 @@ fn encode_matvec(
     let (w2_buffer, w2_offset) = locate(w2)?;
     commands.set_bytes(0, &args);
     commands.set_buffer(1, w_buffer, w_offset);
-    commands.set_buffer(3, out, 0);
+    commands.set_buffer(3, out, out_at);
     commands.set_buffer(4, w2_buffer, w2_offset);
     if mv.smem() > 0 {
         commands.set_threadgroup_memory(0, mv.smem());
@@ -593,8 +674,9 @@ impl Backend for MetalBackend<'_> {
         Ok(())
     }
 
-    fn begin(&mut self, pos: usize) -> Result<()> {
-        self.pos = pos;
+    fn begin(&mut self, _pos: usize, n: usize) -> Result<()> {
+        // Positions come from the caches and states the ops update.
+        self.n = n;
         self.error = None;
         self.dispatches = 0;
         self.chunks = 0;
@@ -603,50 +685,63 @@ impl Backend for MetalBackend<'_> {
     }
 
     fn end(&mut self) -> Result<()> {
-        // Tokens queue up in order; only the latest is kept, to wait for.
+        // Batches queue up in order; only the latest is kept, to wait for.
         self.commit()
     }
 
-    fn logits(&mut self, w: &Weight, x: &MetalVector, out: &mut [f32]) -> Result<()> {
-        if w.rows > self.model.config.n_vocab {
-            self.fail(format!("{} logits do not fit the vocabulary", w.rows));
+    fn logits(
+        &mut self,
+        w: &Weight,
+        x: &MetalVector,
+        rows: Range<usize>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if w.rows > self.model.config.n_vocab || rows.len() > MAX_LOGIT_ROWS {
+            self.fail(format!(
+                "{} rows of {} logits do not fit the logits buffer",
+                rows.len(),
+                w.rows
+            ));
         }
         // The logits are encoded into the last commands, which `commit`
         // takes: no `reserve`, which could commit them early.
         if let Some(commands) = self.commands.as_mut().filter(|_| self.error.is_none()) {
             commands.barrier();
-            if let Err(e) = encode_matvec(
-                commands,
-                &self.pipelines,
-                &self.weights,
-                w,
-                &x.buffer,
-                &self.logits,
-                Output::Store,
-            ) {
-                self.fail(e);
+            for (i, r) in rows.clone().enumerate() {
+                let result = encode_matvec(
+                    commands,
+                    &self.pipelines,
+                    &self.weights,
+                    w,
+                    (&x.buffer, 4 * r * w.cols),
+                    (&self.logits, 4 * i * w.rows),
+                    Output::Store,
+                );
+                if let Err(e) = result {
+                    self.fail(e);
+                    break;
+                }
             }
         }
         self.commit()?;
         self.sync()?;
         // SAFETY: the commands that wrote the logits have completed.
-        unsafe { load(&self.logits, &mut out[..w.rows]) };
+        unsafe { load(&self.logits, &mut out[..rows.len() * w.rows]) };
         Ok(())
     }
 
-    fn embed(&mut self, w: &Weight, token: u32, x: &mut MetalVector) {
+    fn embed(&mut self, w: &Weight, tokens: &[u32], x: &mut MetalVector) {
         let Some((_, per_thread)) = self.pipelines.embed(w.ty) else {
             return self.fail(format!("no embedding kernel for {} weights", w.ty));
         };
-        let args = match (|| {
-            Ok::<_, String>(EmbedArgs {
-                cols: u32_of(w.cols, "the embedding size")?,
-                row: token,
-                row_bytes: u32_of(w.row_bytes, "an embedding row")?,
-                pad: 0,
-            })
-        })() {
-            Ok(a) => a,
+        let sizes = (|| {
+            Ok::<_, String>((
+                u32_of(w.cols, "the embedding size")?,
+                u32_of(w.row_bytes, "an embedding row")?,
+            ))
+        })();
+        let (cols, row_bytes) = match sizes {
+            Ok(s) => s,
             Err(e) => return self.fail(e),
         };
         if self.weights.locate(w).is_none() {
@@ -655,43 +750,129 @@ impl Backend for MetalBackend<'_> {
                 w.offset
             ));
         }
-        if !self.reserve(1) {
-            return;
+        for (t, &token) in tokens.iter().enumerate() {
+            if !self.reserve(1) {
+                return;
+            }
+            let (Some(commands), Some((weights, offset)), Some((pipeline, _))) = (
+                self.commands.as_mut(),
+                self.weights.locate(w),
+                self.pipelines.embed(w.ty),
+            ) else {
+                return;
+            };
+            // The rows are independent: one barrier before them all.
+            if t == 0 {
+                commands.barrier();
+            }
+            commands.set_pipeline(pipeline);
+            commands.set_bytes(
+                0,
+                &EmbedArgs {
+                    cols,
+                    row: token,
+                    row_bytes,
+                    pad: 0,
+                },
+            );
+            commands.set_buffer(1, weights, offset);
+            commands.set_buffer(2, &x.buffer, 4 * t * w.cols);
+            let (groups, threads) = Self::groups(w.cols.div_ceil(per_thread));
+            commands.dispatch(groups, threads);
         }
-        let (Some(commands), Some((weights, offset)), Some((pipeline, _))) = (
-            self.commands.as_mut(),
-            self.weights.locate(w),
-            self.pipelines.embed(w.ty),
-        ) else {
-            return;
-        };
-        commands.barrier();
-        commands.set_pipeline(pipeline);
-        commands.set_bytes(0, &args);
-        commands.set_buffer(1, weights, offset);
-        commands.set_buffer(2, &x.buffer, 0);
-        let (groups, threads) = Self::groups(w.cols.div_ceil(per_thread));
-        commands.dispatch(groups, threads);
     }
 
     fn rmsnorm(&mut self, x: &MetalVector, w: Param, eps: f32, out: &mut MetalVector) {
         let args = RmsArgs {
-            n: x.len as u32,
+            n: w.len() as u32,
             eps,
         };
-        if !self.reserve(1) {
+        for t in 0..self.n {
+            if !self.reserve(1) {
+                return;
+            }
+            let Some(commands) = self.commands.as_mut() else {
+                return;
+            };
+            // The rows are independent: one barrier before them all.
+            if t == 0 {
+                commands.barrier();
+            }
+            let at = 4 * t * w.len();
+            commands.set_pipeline(&self.pipelines.rmsnorm);
+            commands.set_bytes(0, &args);
+            commands.set_buffer(1, &x.buffer, at);
+            commands.set_buffer(2, &self.params, Self::param_offset(w));
+            commands.set_buffer(3, &out.buffer, at);
+            commands.dispatch(Size::new(1, 1, 1), Size::new(THREADS, 1, 1));
+        }
+    }
+
+    fn norm_pair(
+        &mut self,
+        a: &MetalVector,
+        wa: Param,
+        b: &MetalVector,
+        wb: Param,
+        eps: f32,
+        out: &mut MetalVector,
+    ) {
+        let (da, db) = (wa.len(), wb.len());
+        // Every norm reads and writes rows of its own: one barrier first.
+        for t in 0..self.n {
+            let halves = [
+                (&a.buffer, wa, 4 * t * da, 0),
+                (&b.buffer, wb, 4 * t * db, 4 * da),
+            ];
+            for (i, (x, w, x_at, out_at)) in halves.into_iter().enumerate() {
+                if !self.reserve(1) {
+                    return;
+                }
+                let Some(commands) = self.commands.as_mut() else {
+                    return;
+                };
+                if t == 0 && i == 0 {
+                    commands.barrier();
+                }
+                commands.set_pipeline(&self.pipelines.rmsnorm);
+                commands.set_bytes(
+                    0,
+                    &RmsArgs {
+                        n: w.len() as u32,
+                        eps,
+                    },
+                );
+                commands.set_buffer(1, x, x_at);
+                commands.set_buffer(2, &self.params, Self::param_offset(w));
+                commands.set_buffer(3, &out.buffer, 4 * t * (da + db) + out_at);
+                commands.dispatch(Size::new(1, 1, 1), Size::new(THREADS, 1, 1));
+            }
+        }
+    }
+
+    fn copy_rows(
+        &mut self,
+        src: &MetalVector,
+        from: usize,
+        dst: &mut MetalVector,
+        to: usize,
+        rows: usize,
+        len: usize,
+    ) {
+        let n = rows * len;
+        if n == 0 || !self.reserve(1) {
             return;
         }
         let Some(commands) = self.commands.as_mut() else {
             return;
         };
         commands.barrier();
-        commands.set_pipeline(&self.pipelines.rmsnorm);
-        commands.set_bytes(0, &args);
-        commands.set_buffer(1, &x.buffer, 0);
-        commands.set_buffer(2, &self.params, Self::param_offset(w));
-        commands.set_buffer(3, &out.buffer, 0);
-        commands.dispatch(Size::new(1, 1, 1), Size::new(THREADS, 1, 1));
+        commands.set_pipeline(&self.pipelines.copy);
+        commands.set_bytes(0, &CountArgs { n: n as u32 });
+        commands.set_buffer(1, &src.buffer, 4 * from * len);
+        commands.set_buffer(2, &dst.buffer, 4 * to * len);
+        let (groups, threads) = Self::groups(n);
+        commands.dispatch(groups, threads);
     }
 
     fn residual(
@@ -735,7 +916,8 @@ impl Backend for MetalBackend<'_> {
         }
         self.encode_matvec(gate, x, &out.buffer, Output::Store, true);
         self.encode_matvec(up, x, &up_out.buffer, Output::Store, false);
-        self.elementwise(|p| &p.swiglu, out.len, &[&out.buffer, &up_out.buffer]);
+        let n = self.n * gate.rows;
+        self.elementwise(|p| &p.swiglu, n, &[&out.buffer, &up_out.buffer]);
     }
 
     fn attention(
@@ -752,74 +934,85 @@ impl Backend for MetalBackend<'_> {
         let kv_dim = c.n_head_kv * hd;
         let q_stride = if norm.gated { 2 * hd } else { hd };
         let plan = self.attention;
-        let shapes_ok = q.len == c.n_head * q_stride
-            && k.len == kv_dim
-            && v.len == kv_dim
+        let n = self.n;
+        let shapes_ok = q.len >= n * c.n_head * q_stride
+            && k.len >= n * kv_dim
+            && v.len >= n * kv_dim
+            && out.len >= n * c.n_head * hd
             && cache.capacity <= self.n_ctx;
         if !shapes_ok {
             return self.fail("unsupported attention shape".to_owned());
         }
-        if cache.len >= cache.capacity {
+        if cache.len + n > cache.capacity {
             return self.fail(format!("KV cache of {} positions is full", cache.capacity));
         }
-        cache.len += 1;
-        let chunk = plan.chunk(cache.len, c.n_head_kv);
-        let n_chunks = cache.len.div_ceil(chunk);
         let group = c.n_head / c.n_head_kv;
-        let args = AttentionArgs {
-            n_pos: cache.len as u32,
-            head_dim: hd as u32,
-            group: group as u32,
-            kv_dim: kv_dim as u32,
-            q_stride: q_stride as u32,
-            gated: u32::from(norm.gated),
-            n_rot: c.rope_dims as u32,
-            norm: u32::from(norm.weights.is_some()),
-            chunk: chunk as u32,
-            n_chunks: n_chunks as u32,
-            scale: 1.0 / (hd as f32).sqrt(),
-            base: c.rope_base,
-            eps: norm.eps,
-            pad: 0,
-        };
         let (q_norm, k_norm) = norm.weights.map_or((0, 0), |(q, k)| {
             (Self::param_offset(q), Self::param_offset(k))
         });
-        if !self.reserve(2) {
-            return;
-        }
-        let Some(commands) = self.commands.as_mut() else {
-            return;
-        };
-        let p = &self.pipelines;
-        let Some((pipeline, _)) = p.attention(group, hd) else {
-            return;
-        };
-        commands.barrier();
-        commands.set_pipeline(pipeline);
-        commands.set_bytes(0, &args);
-        commands.set_buffer(1, &q.buffer, 0);
-        commands.set_buffer(2, &k.buffer, 0);
-        commands.set_buffer(3, &v.buffer, 0);
-        commands.set_buffer(4, &self.params, q_norm);
-        commands.set_buffer(5, &self.params, k_norm);
-        commands.set_buffer(6, &cache.k, 0);
-        commands.set_buffer(7, &cache.v, 0);
-        commands.set_buffer(8, &self.partials, 0);
-        commands.set_buffer(9, &out.buffer, 0);
-        commands.set_threadgroup_memory(0, 4 * plan.floats(hd, chunk));
-        commands.dispatch(
-            Size::new(c.n_head_kv, n_chunks, 1),
-            Size::new(32 * ATTENTION_SIMDGROUPS, 1, 1),
-        );
-        if n_chunks > 1 {
+        for t in 0..n {
+            // Each token appends its key and value, then attends to every
+            // position up to its own.
+            cache.len += 1;
+            let chunk = plan.chunk(cache.len, c.n_head_kv);
+            let n_chunks = cache.len.div_ceil(chunk);
+            let args = AttentionArgs {
+                n_pos: cache.len as u32,
+                head_dim: hd as u32,
+                group: group as u32,
+                kv_dim: kv_dim as u32,
+                q_stride: q_stride as u32,
+                gated: u32::from(norm.gated),
+                n_rot: c.rope_dims as u32,
+                norm: u32::from(norm.weights.is_some()),
+                chunk: chunk as u32,
+                n_chunks: n_chunks as u32,
+                scale: 1.0 / (hd as f32).sqrt(),
+                base: c.rope_base,
+                eps: norm.eps,
+                pad: 0,
+            };
+            if !self.reserve(2) {
+                return;
+            }
+            let Some(commands) = self.commands.as_mut() else {
+                return;
+            };
+            let p = &self.pipelines;
+            let Some((pipeline, _)) = p.attention(group, hd) else {
+                return;
+            };
+            let (q_at, kv_at, out_at) = (
+                4 * t * c.n_head * q_stride,
+                4 * t * kv_dim,
+                4 * t * c.n_head * hd,
+            );
             commands.barrier();
-            commands.set_pipeline(&p.attention_reduce);
+            commands.set_pipeline(pipeline);
             commands.set_bytes(0, &args);
-            commands.set_buffer(1, &q.buffer, 0);
-            commands.set_buffer(2, &self.partials, 0);
-            commands.set_buffer(3, &out.buffer, 0);
-            commands.dispatch(Size::new(c.n_head, 1, 1), Size::new(hd.min(256), 1, 1));
+            commands.set_buffer(1, &q.buffer, q_at);
+            commands.set_buffer(2, &k.buffer, kv_at);
+            commands.set_buffer(3, &v.buffer, kv_at);
+            commands.set_buffer(4, &self.params, q_norm);
+            commands.set_buffer(5, &self.params, k_norm);
+            commands.set_buffer(6, &cache.k, 0);
+            commands.set_buffer(7, &cache.v, 0);
+            commands.set_buffer(8, &self.partials, 0);
+            commands.set_buffer(9, &out.buffer, out_at);
+            commands.set_threadgroup_memory(0, 4 * plan.floats(hd, chunk));
+            commands.dispatch(
+                Size::new(c.n_head_kv, n_chunks, 1),
+                Size::new(32 * ATTENTION_SIMDGROUPS, 1, 1),
+            );
+            if n_chunks > 1 {
+                commands.barrier();
+                commands.set_pipeline(&p.attention_reduce);
+                commands.set_bytes(0, &args);
+                commands.set_buffer(1, &q.buffer, q_at);
+                commands.set_buffer(2, &self.partials, 0);
+                commands.set_buffer(3, &out.buffer, out_at);
+                commands.dispatch(Size::new(c.n_head, 1, 1), Size::new(hd.min(256), 1, 1));
+            }
         }
     }
 
@@ -836,57 +1029,99 @@ impl Backend for MetalBackend<'_> {
         alpha: &mut MetalVector,
         out: &mut MetalVector,
     ) {
-        let rows = d.conv_kernel;
+        let n = self.n;
+        let rows = d.conv_rows();
         if !Self::delta_net_supported(d)
             || state.conv.len != d.conv_len()
-            || qkv.len != d.conv_dim()
+            || state.pending_ba.len != d.pending_len()
+            || qkv.len < n * d.conv_dim()
+            || out.len < n * d.value_dim()
             || p.norm.len() != d.d_v
         {
             return self.fail(format!("unsupported DeltaNet head size {}", d.d_k));
         }
-        let args = DeltaArgs {
+        let pending = (2..=MAX_PENDING).contains(&n);
+        if (pending || state.keep > 0) && self.delta_work.is_none() {
+            let floats = |n: usize| self.device.buffer(4 * n).map_err(backend_error);
+            match floats(d.state_len()).and_then(|w| Ok((w, floats(d.value_dim())?))) {
+                Ok(buffers) => self.delta_work = Some(buffers),
+                Err(e) => return self.fail(e.to_string()),
+            }
+        }
+        let args = |oldest: usize, store: bool, pending: bool| DeltaArgs {
             n_k_heads: d.n_k_heads as u32,
             d_k: d.d_k as u32,
             d_v: d.d_v as u32,
             key_dim: d.key_dim() as u32,
             conv_dim: d.conv_dim() as u32,
+            taps: d.conv_kernel as u32,
             rows: rows as u32,
-            oldest: state.oldest as u32,
+            oldest: (oldest % rows) as u32,
+            store: u32::from(store),
+            pending: u32::from(pending),
             eps,
             scale: 1.0 / (d.d_v as f32).sqrt(),
         };
-        state.oldest = (state.oldest + 1) % rows;
-        if !self.reserve(2) {
+        let row_at = |row: usize| 4 * (row % rows) * d.conv_dim();
+        let ba_at = |i: usize| 4 * i * 2 * d.n_v_heads;
+        let alpha_at = |i: usize| ba_at(i) + 4 * d.n_v_heads;
+        // Taken while the steps are encoded, which borrow `self` mutably.
+        let work = self.delta_work.take();
+        let ring = (&state.conv.buffer, &state.pending_ba.buffer);
+        let ssm = &state.ssm.buffer;
+
+        // The pending tokens still in the sequence: their inputs follow the
+        // committed window in the ring, and their outputs are not needed.
+        let mut ok = true;
+        if let Some((_, unused)) = &work {
+            for i in 0..state.keep {
+                let step = DeltaStep {
+                    x: (ring.0, row_at(state.oldest + i + d.conv_kernel - 1)),
+                    beta: (ring.1, ba_at(i)),
+                    alpha: (ring.1, alpha_at(i)),
+                    ssm: (ssm, ssm),
+                    out: (unused, 0),
+                    z: None,
+                    pending_at: 0,
+                };
+                let a = args(state.oldest + i, false, false);
+                ok = ok && self.encode_delta_step(d, p, &a, ring, &step);
+            }
+        }
+        let oldest = (state.oldest + state.keep) % rows;
+
+        for t in 0..n {
+            let value_at = 4 * t * d.value_dim();
+            let heads_at = 4 * t * d.n_v_heads;
+            let step = DeltaStep {
+                x: (&qkv.buffer, 4 * t * d.conv_dim()),
+                beta: (&beta.buffer, heads_at),
+                alpha: (&alpha.buffer, heads_at),
+                ssm: match &work {
+                    Some((work, _)) if pending && t == 0 => (ssm, work),
+                    Some((work, _)) if pending => (work, work),
+                    _ => (ssm, ssm),
+                },
+                out: (&out.buffer, value_at),
+                z: Some((&z.buffer, value_at)),
+                // Only a pending token writes its row.
+                pending_at: if pending { ba_at(t) } else { 0 },
+            };
+            let a = args(oldest + t, true, pending);
+            ok = ok && self.encode_delta_step(d, p, &a, ring, &step);
+        }
+        self.delta_work = work;
+        if !ok {
             return;
         }
-        let Some(commands) = self.commands.as_mut() else {
-            return;
-        };
-        let params = &self.params;
-        commands.barrier();
-        commands.set_pipeline(&self.pipelines.delta_net);
-        commands.set_bytes(0, &args);
-        commands.set_buffer(1, &qkv.buffer, 0);
-        commands.set_buffer(2, &state.conv.buffer, 0);
-        commands.set_buffer(3, params, Self::param_offset(p.conv));
-        commands.set_buffer(4, &beta.buffer, 0);
-        commands.set_buffer(5, &alpha.buffer, 0);
-        commands.set_buffer(6, params, Self::param_offset(p.dt_bias));
-        commands.set_buffer(7, params, Self::param_offset(p.a));
-        commands.set_buffer(8, &state.ssm.buffer, 0);
-        commands.set_buffer(9, &out.buffer, 0);
-        commands.set_threadgroup_memory(0, 4 * (2 * d.d_k + DELTA_GROUP_ROWS));
-        commands.dispatch(
-            Size::new(d.n_v_heads, d.d_v.div_ceil(DELTA_GROUP_ROWS), 1),
-            Size::new(32 * DELTA_SIMDGROUPS, 1, 1),
-        );
-
-        commands.barrier();
-        commands.set_pipeline(&self.pipelines.delta_norm);
-        commands.set_bytes(0, &args);
-        commands.set_buffer(1, &out.buffer, 0);
-        commands.set_buffer(2, &z.buffer, 0);
-        commands.set_buffer(3, params, Self::param_offset(p.norm));
-        commands.dispatch(Size::new(d.n_v_heads, 1, 1), Size::new(128, 1, 1));
+        if pending {
+            state.oldest = oldest;
+            state.pending = n;
+            state.keep = n;
+        } else {
+            state.oldest = (oldest + n) % rows;
+            state.pending = 0;
+            state.keep = 0;
+        }
     }
 }

@@ -128,6 +128,16 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
         gen_secs,
         generated as f64 / gen_secs.max(1e-9),
     );
+    let d = session.draft_stats();
+    if d.verifications > 0 {
+        eprintln!(
+            "nibble: drafts: {} of {} accepted ({:.0}%), {:.2} tokens per pass",
+            d.accepted,
+            d.drafted,
+            100.0 * d.accepted as f64 / d.drafted.max(1) as f64,
+            1.0 + d.accepted as f64 / d.verifications as f64,
+        );
+    }
     Ok(())
 }
 

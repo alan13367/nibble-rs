@@ -165,7 +165,16 @@ fn matvec_matches_cpu_reference() {
                 }
                 let out = floats(&device, &initial);
                 let mut commands = device.commands().unwrap();
-                encode_matvec(&mut commands, &pipelines, &wbuf, &w, &xbuf, &out, output).unwrap();
+                encode_matvec(
+                    &mut commands,
+                    &pipelines,
+                    &wbuf,
+                    &w,
+                    (&xbuf, 0),
+                    (&out, 0),
+                    output,
+                )
+                .unwrap();
                 commands.commit();
                 commands.wait().unwrap();
                 let got = read(&out, rows);
@@ -298,7 +307,7 @@ fn attention_matches_the_cpu_backend() {
             q.copy_from_slice(qi);
             k.copy_from_slice(ki);
             v.copy_from_slice(vi);
-            cpu.begin(pos).unwrap();
+            cpu.begin(pos, 1).unwrap();
             cpu.attention(&mut q, &mut k, &v, norm, &mut cache, &mut out);
             cpu.end().unwrap();
             expected.push(out.clone());
@@ -321,7 +330,7 @@ fn attention_matches_the_cpu_backend() {
                 metal.write(&mut q, qi).unwrap();
                 metal.write(&mut k, ki).unwrap();
                 metal.write(&mut v, vi).unwrap();
-                metal.begin(pos).unwrap();
+                metal.begin(pos, 1).unwrap();
                 metal.attention(&mut q, &mut k, &v, norm, &mut cache, &mut out);
                 metal.end().unwrap();
                 metal.read(&out, &mut got).unwrap();
