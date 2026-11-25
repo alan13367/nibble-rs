@@ -73,9 +73,10 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     options.api_key = api_key;
     options.session = model_opts.session_options();
 
-    // A throwaway session reports the context, threads and kernels the
+    // A throwaway session reports the context and the hardware the
     // server's own session will use; its buffers are not touched.
-    let probe = model.session(options.session);
+    let probe = model.session(options.session)?;
+    crate::args::report_fallback(&probe);
     let banner = Banner {
         model_id: &model_id,
         model: &model,
@@ -86,8 +87,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
             .map(|m| m.len()),
         load_time,
         n_ctx: probe.n_ctx(),
-        threads: probe.threads(),
-        kernel: probe.kernel(),
+        compute: probe.compute(),
         addr,
         api_key: options.api_key.is_some(),
     };
@@ -104,8 +104,8 @@ struct Banner<'a> {
     file_bytes: Option<u64>,
     load_time: Duration,
     n_ctx: usize,
-    threads: usize,
-    kernel: &'static str,
+    /// What runs the sessions: threads and kernels, or the GPU.
+    compute: String,
     addr: SocketAddr,
     api_key: bool,
 }
@@ -152,10 +152,7 @@ impl Banner<'_> {
             s.dim(&format!("  (model maximum {})", c.n_ctx_train))
         };
         out.push_str(&row("context", format!("{} tokens{max}", self.n_ctx)));
-        out.push_str(&row(
-            "compute",
-            format!("{} threads{dot}{} kernels", self.threads, self.kernel),
-        ));
+        out.push_str(&row("compute", self.compute.clone()));
         let auth = if self.api_key {
             "API key required".to_owned()
         } else {

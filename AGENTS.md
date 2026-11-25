@@ -128,10 +128,11 @@ combining marks, emoji sequences, and special tokens.
 
 ### Model and numerics changes
 
-Compare greedy output with llama.cpp:
+Compare greedy output with llama.cpp (`--backend cpu`: the default, `auto`,
+picks Metal on a Mac):
 
 ```sh
-nibble run -m models/MODEL.gguf -f prompt.txt -n 64 --greedy -c 512
+nibble run -m models/MODEL.gguf -f prompt.txt -n 64 --greedy -c 512 --backend cpu
 tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 64 \
     --temp 0 -no-cnv --no-display-prompt -c 512 \
     -ngl 0 --device none -fa off --no-repack -b 512 -ub 1
@@ -244,6 +245,25 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
 - **CUDA kernels are compiled offline** with nvcc into an artifact that is
   committed. `cargo build` must not need the CUDA toolkit. Test CUDA changes on
   a local NVIDIA GPU.
-- **Metal code cannot be tested on the Windows development machine.** Write it
-  carefully, run `cargo check --target aarch64-apple-darwin` if that target is
-  installed, and label the work as untested on real hardware when you report it.
+- **Metal is tested on an Apple Silicon Mac.** Compare greedy output with
+  llama.cpp's Metal path, which has the same numerics, and expect the CPU
+  path to differ only after near-ties:
+
+  ```sh
+  nibble run -m models/MODEL.gguf -f prompt.txt -n 64 --greedy -c 512 --backend metal
+  tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 64 \
+      --temp 0 -no-cnv --no-display-prompt -c 512 -ngl 99 -fa off -b 512 -ub 1
+  ```
+
+  Metal kernels transcribe ggml-metal's for the matvecs, and every kernel is
+  checked against the CPU reference in `metal/tests.rs`. Also compare after
+  a prompt of several thousand tokens (`-c 8192 -b 8192`): attention is
+  split into chunks only past a few dozen positions. Without a Mac, run
+  `cargo check --target aarch64-apple-darwin` and label the work as
+  untested on real hardware.
+- **`auto` is the default backend.** It picks Metal unless the device, the
+  shaders or the model's shapes are not covered (the backend checks shapes
+  when a session starts), and then the CPU. Tests of CPU behavior set
+  `backend: BackendKind::Cpu`. `NIBBLE_METAL_MAX_BUFFER=<bytes>` caps the
+  size of each Metal weight buffer, to test a model split across buffers
+  on a Mac that would not need it.

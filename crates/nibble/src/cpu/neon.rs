@@ -23,8 +23,8 @@ use nibble_gguf::GgmlType;
 
 use super::scalar::{self, DeltaStep};
 use crate::quant::{
-    self, DotType, Q3_K_BLOCK_BYTES, Q4_K_BLOCK_BYTES, Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
-    Q8_0_BLOCK_BYTES, Q8_K_BLOCK_BYTES, QK_K, QK8_0,
+    self, DotType, IQ4_XS_BLOCK_BYTES, Q3_K_BLOCK_BYTES, Q4_K_BLOCK_BYTES, Q5_K_BLOCK_BYTES,
+    Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, Q8_K_BLOCK_BYTES, QK_K, QK8_0,
 };
 
 /// Calls a NEON kernel. The comment sits on the `unsafe` block so every
@@ -127,6 +127,13 @@ impl Neon {
                     neon_call!(dot_q3_rows(rows, row_bytes, xq, out))
                 } else {
                     neon_call!(dot_q3_rows_mul(rows, row_bytes, xq, out))
+                }
+            }
+            GgmlType::Iq4Xs => {
+                if self.dotprod {
+                    neon_call!(dot_iq4_xs_rows(rows, row_bytes, xq, out))
+                } else {
+                    neon_call!(dot_iq4_xs_rows_mul(rows, row_bytes, xq, out))
                 }
             }
             _ => scalar(out),
@@ -881,6 +888,61 @@ macro_rules! define_q4_rows {
 define_q4_rows!(dot_q4_rows, "neon,dotprod", i8_dot16);
 define_q4_rows!(dot_q4_rows_mul, "neon", i8_dot16_mul);
 
+macro_rules! define_iq4_xs_rows {
+    ($name:ident, $feat:literal, $dot:ident) => {
+        /// ggml's NEON `ggml_vec_dot_iq4_xs_q8_K`: the nibbles through the
+        /// value table (`vqtbl1q_s8`), each group's exact integer dot times
+        /// its scale, and one fused `sumf += d * d8 * isum` per super-block.
+        #[target_feature(enable = $feat)]
+        fn $name(rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f32]) {
+            let xs = xq.as_chunks::<Q8_K_BLOCK_BYTES>().0;
+            let values = load_i8(&quant::KVALUES_IQ4NL.map(|v| v as u8));
+            let m4b = vdupq_n_u8(0x0f);
+            let zero = vdupq_n_s32(0);
+            for (o, row) in out.iter_mut().zip(rows.chunks_exact(row_bytes)) {
+                let mut sum = 0.0f32;
+                for (w, x) in row.as_chunks::<IQ4_XS_BLOCK_BYTES>().0.iter().zip(xs) {
+                    let xd = f32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+                    let d = quant::f16_to_f32(u16::from_le_bytes([w[0], w[1]]));
+                    let mut h = u16::from_le_bytes([w[2], w[3]]);
+                    let qs = &w[8..];
+                    let xqs = &x[4..260];
+                    let mut sumi1 = 0i32;
+                    let mut sumi2 = 0i32;
+                    for ib in 0..4 {
+                        let q0 = load_u8(at16(qs, ib * 32));
+                        let q1 = load_u8(at16(qs, ib * 32 + 16));
+                        let b0 = vqtbl1q_s8(values, vandq_u8(q0, m4b));
+                        let b1 = vqtbl1q_s8(values, vshrq_n_u8::<4>(q0));
+                        let b2 = vqtbl1q_s8(values, vandq_u8(q1, m4b));
+                        let b3 = vqtbl1q_s8(values, vshrq_n_u8::<4>(q1));
+                        let p1 = $dot(
+                            $dot(zero, b0, load_i8(at16(xqs, ib * 64))),
+                            b1,
+                            load_i8(at16(xqs, ib * 64 + 16)),
+                        );
+                        let p2 = $dot(
+                            $dot(zero, b2, load_i8(at16(xqs, ib * 64 + 32))),
+                            b3,
+                            load_i8(at16(xqs, ib * 64 + 48)),
+                        );
+                        let ls1 = i32::from((w[4 + ib] & 0xf) | ((h << 4) & 0x30) as u8) - 32;
+                        let ls2 = i32::from((w[4 + ib] >> 4) | ((h << 2) & 0x30) as u8) - 32;
+                        h >>= 4;
+                        sumi1 += vaddvq_s32(p1) * ls1;
+                        sumi2 += vaddvq_s32(p2) * ls2;
+                    }
+                    sum = (d * xd).mul_add((sumi1 + sumi2) as f32, sum);
+                }
+                *o = sum;
+            }
+        }
+    };
+}
+
+define_iq4_xs_rows!(dot_iq4_xs_rows, "neon,dotprod", i8_dot16);
+define_iq4_xs_rows!(dot_iq4_xs_rows_mul, "neon", i8_dot16_mul);
+
 macro_rules! define_q5_rows {
     ($name:ident, $feat:literal, $dot:ident) => {
         #[target_feature(enable = $feat)]
@@ -1272,8 +1334,9 @@ mod tests {
                 GgmlType::Q4K,
                 GgmlType::Q5K,
                 GgmlType::Q6K,
+                GgmlType::Iq4Xs,
             ] {
-                let quantized = K_QUANTS.contains(&ty);
+                let quantized = K_QUANTS.contains(&ty) || ty == GgmlType::Iq4Xs;
                 // Three super-blocks per K-quant row, so the block loop runs
                 // over a zero and a negative scale; an odd number of Q8_0 blocks.
                 let (n, rows) = match ty {

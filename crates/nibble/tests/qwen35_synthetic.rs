@@ -448,10 +448,13 @@ impl Weights {
 }
 
 fn session(model: &Model) -> nibble::Session<'_> {
-    model.session(SessionOptions {
-        n_ctx: 32,
-        threads: 2,
-    })
+    model
+        .session(SessionOptions {
+            n_ctx: 32,
+            threads: 2,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap()
 }
 
 #[test]
@@ -495,13 +498,13 @@ fn truncate_replays_recurrent_state() {
     let model = Weights::new().model();
     let mut s = session(&model);
     s.eval(&[1, 2, 3, 4]).unwrap();
-    s.truncate(2);
+    s.truncate(2).unwrap();
     assert_eq!(s.tokens(), [1, 2]);
     let after = s.eval(&[9]).unwrap().to_vec();
     let mut fresh = session(&model);
     assert_eq!(fresh.eval(&[1, 2, 9]).unwrap(), &after[..]);
 
-    s.clear();
+    s.clear().unwrap();
     assert!(s.tokens().is_empty());
     assert_eq!(s.eval(&[1, 2, 9]).unwrap(), &after[..]);
 }
@@ -520,21 +523,21 @@ fn checkpoints_spare_most_of_the_replay() {
 
     // Diverging after the checkpoint replays only the tokens past it.
     let keep = checkpoint + 2;
-    assert_eq!(s.truncate(keep), keep - checkpoint);
+    assert_eq!(s.truncate(keep).unwrap(), keep - checkpoint);
     let after = s.eval(&[1, 2]).unwrap().to_vec();
     let mut fresh = session(&model);
     let expected: Vec<u32> = prompt[..keep].iter().copied().chain([1, 2]).collect();
     assert_eq!(fresh.eval(&expected).unwrap(), &after[..]);
 
     // Exactly at the checkpoint nothing is replayed.
-    assert_eq!(s.truncate(checkpoint), 0);
+    assert_eq!(s.truncate(checkpoint).unwrap(), 0);
     let at = s.eval(&[7]).unwrap().to_vec();
     let mut fresh = session(&model);
     let expected: Vec<u32> = prompt[..checkpoint].iter().copied().chain([7]).collect();
     assert_eq!(fresh.eval(&expected).unwrap(), &at[..]);
 
     // Before every checkpoint, the whole prefix is replayed.
-    assert_eq!(s.truncate(3), 3);
+    assert_eq!(s.truncate(3).unwrap(), 3);
     let early = s.eval(&[4]).unwrap().to_vec();
     assert_eq!(session(&model).eval(&[17, 99, 258, 4]).unwrap(), &early[..]);
 }
@@ -559,4 +562,22 @@ fn generation_is_deterministic() {
         out
     };
     assert_eq!(run(), run());
+}
+
+#[test]
+fn metal_matches_a_naive_reference_and_rewinds() {
+    let w = Weights::new();
+    let model = w.model();
+    let Some(mut s) = common::metal_session(&model, N_CTX) else {
+        return;
+    };
+    let tokens = [17u32, 99, 258, 3, 200, 65, 66];
+    let logits = s.eval(&tokens).unwrap();
+    assert_close(logits, &w.reference_logits(&tokens), 3e-3);
+    // Back to the checkpoint taken 4 tokens before the end, and on.
+    s.truncate(4).unwrap();
+    let logits = s.eval(&[1, 2]).unwrap();
+    let mut expected = tokens[..4].to_vec();
+    expected.extend([1, 2]);
+    assert_close(logits, &w.reference_logits(&expected), 3e-3);
 }

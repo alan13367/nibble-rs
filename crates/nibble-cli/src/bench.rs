@@ -12,9 +12,12 @@
 //!   `test_gen`).
 //! - Tokens come from a fixed-seed generator, as llama-bench's unseeded
 //!   `rand()`, so nothing is sampled or printed while timing.
+//! - `-d N` runs each test after `N` tokens already in the context
+//!   (llama-bench's `@ dN`): they are evaluated once, untimed, and the
+//!   session is rewound to them before each repetition.
 //! - One untimed warm-up precedes the repetitions, the session is cleared
-//!   (untimed) before each one, and the table shows the mean tokens/s over
-//!   the repetitions with its sample standard deviation.
+//!   (or rewound) untimed before each one, and the table shows the mean
+//!   tokens/s over the repetitions with its sample standard deviation.
 
 use std::time::Instant;
 
@@ -28,7 +31,8 @@ pub(crate) fn help() -> String {
          Tests (as llama-bench):\n  \
          -p, --prompt N           Prompt tokens per repetition, `ppN` (default 512, 0 = skip)\n  \
          -n, --gen N              Tokens to decode per repetition, `tgN` (default 128, 0 = skip)\n  \
-         -r, --reps N             Repetitions per test (default 5)\n      \
+         -r, --reps N             Repetitions per test (default 5)\n  \
+         -d, --depth N            Tokens already in the context, `@ dN` (default 0)\n      \
          --seed N             Seed for the random tokens (default 1)\n\n\
          Model:\n{MODEL_HELP}"
     )
@@ -37,6 +41,7 @@ pub(crate) fn help() -> String {
 pub(crate) fn run(mut args: Args) -> CliResult<()> {
     let mut model_opts = ModelOptions::new();
     let (mut pp, mut tg, mut reps, mut seed) = (512usize, 128usize, 5usize, 1u64);
+    let mut depth = 0usize;
     while let Some(arg) = args.next()? {
         match arg {
             Arg::Flag(f) if model_opts.parse(&f, &mut args)? => {}
@@ -44,6 +49,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
                 "-p" | "--prompt" => pp = args.parse(&f)?,
                 "-n" | "--gen" => tg = args.parse(&f)?,
                 "-r" | "--reps" => reps = args.parse(&f)?,
+                "-d" | "--depth" => depth = args.parse(&f)?,
                 "--seed" => seed = args.parse(&f)?,
                 "-h" | "--help" => {
                     print!("{}", help());
@@ -70,12 +76,13 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     let model = model_opts.load()?;
     // Each repetition fills the session from empty: raise a smaller `-c` to
     // fit the longer test (0 already means the model's maximum).
-    let needed = pp.max(tg);
+    let needed = depth + pp.max(tg);
     let mut options = model_opts.session_options();
     if options.n_ctx != 0 {
         options.n_ctx = options.n_ctx.max(needed);
     }
-    let mut session = model.session(options);
+    let mut session = model.session(options)?;
+    crate::args::report_fallback(&session);
     if session.n_ctx() < needed {
         return Err(format!(
             "a test of {needed} tokens does not fit the model's context of {}",
@@ -86,12 +93,11 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
 
     let c = model.config();
     eprintln!(
-        "nibble bench: {} ({}, {}), {} threads, {}, {reps} repetitions, seed {seed}",
+        "nibble bench: {} ({}, {}), {}, {reps} repetitions, seed {seed}",
         c.name.as_deref().unwrap_or("model"),
         c.architecture,
         c.weight_type,
-        session.threads(),
-        session.kernel(),
+        session.compute(),
     );
     if pp > 0 {
         eprintln!(
@@ -100,40 +106,60 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     }
 
     let mut tokens = RandomTokens::new(seed, c.n_vocab);
+    let context: Vec<u32> = (0..depth).map(|_| tokens.next()).collect();
+    let at = if depth > 0 {
+        format!(" @ d{depth}")
+    } else {
+        String::new()
+    };
     println!("| test | t/s | stdev | ms/token |");
     println!("|------|----:|------:|---------:|");
     if pp > 0 {
         let prompt: Vec<u32> = (0..pp).map(|_| tokens.next()).collect();
-        let samples = repeat(&mut session, reps, |s| {
+        let samples = repeat(&mut session, &context, reps, |s| {
             s.eval(&prompt)?;
             Ok(())
         })?;
-        print_row(&format!("pp{pp}"), &samples, pp);
+        print_row(&format!("pp{pp}{at}"), &samples, pp);
     }
     if tg > 0 {
-        let samples = repeat(&mut session, reps, |s| {
+        let samples = repeat(&mut session, &context, reps, |s| {
             for _ in 0..tg {
                 s.eval(&[tokens.next()])?;
             }
             Ok(())
         })?;
-        print_row(&format!("tg{tg}"), &samples, tg);
+        print_row(&format!("tg{tg}{at}"), &samples, tg);
     }
     Ok(())
 }
 
-/// Seconds taken by each of `reps` runs of `test` on a cleared session,
-/// after one untimed warm-up run.
+/// Seconds taken by each of `reps` runs of `test` on a session holding just
+/// `context`, after one untimed warm-up run.
 fn repeat(
     session: &mut Session<'_>,
+    context: &[u32],
     reps: usize,
     mut test: impl FnMut(&mut Session<'_>) -> CliResult<()>,
 ) -> CliResult<Vec<f64>> {
-    session.clear();
+    let setup = |s: &mut Session<'_>| -> CliResult<()> {
+        // Rewinding replays at most a checkpoint's tail; evaluating the
+        // context again would take as long as a prompt of that length.
+        if !context.is_empty() && s.tokens().starts_with(context) {
+            s.truncate(context.len())?;
+        } else {
+            s.clear()?;
+            if !context.is_empty() {
+                s.eval(context)?;
+            }
+        }
+        Ok(())
+    };
+    setup(session)?;
     test(session)?;
     let mut samples = Vec::with_capacity(reps);
     for _ in 0..reps {
-        session.clear();
+        setup(session)?;
         let start = Instant::now();
         test(session)?;
         samples.push(start.elapsed().as_secs_f64());

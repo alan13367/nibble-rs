@@ -128,3 +128,26 @@ pub(crate) fn assert_close(got: &[f32], expected: &[f64], rel: f64) {
         "max error {max_err} exceeds {rel} of scale {scale}"
     );
 }
+
+/// A Metal session on `model`, or `None` (with a note) where Metal is not
+/// available.
+pub(crate) fn metal_session(model: &nibble::Model, n_ctx: usize) -> Option<nibble::Session<'_>> {
+    let options = nibble::SessionOptions {
+        n_ctx,
+        backend: nibble::BackendKind::Metal,
+        ..nibble::SessionOptions::default()
+    };
+    match model.session(options) {
+        Ok(s) => Some(s),
+        // Only a missing device or framework skips: on a Mac with a GPU,
+        // a backend that fails to start (a shader that does not compile,
+        // say) is a bug.
+        Err(nibble::Error::Backend(e))
+            if !cfg!(target_os = "macos") || e.contains("no Metal device") =>
+        {
+            eprintln!("skipping: {e}");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
+}

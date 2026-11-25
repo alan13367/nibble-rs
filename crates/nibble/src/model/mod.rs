@@ -5,7 +5,8 @@
 //!
 //! 1. add a variant to [`Architecture`] (and to `Architecture::ALL`);
 //! 2. write a module with a model type (`load`, `new_state`, `forward`) and a
-//!    state type, built from the blocks in `layers`;
+//!    state type, built from the blocks in `layers` and generic over the
+//!    [`Backend`] it runs on;
 //! 3. add arms to `Arch` and `State` and the dispatch functions below.
 //!
 //! Sessions, the CLI and the server never match on architectures.
@@ -22,8 +23,8 @@ use nibble_gguf::{Gguf, Storage};
 
 pub use config::ModelConfig;
 
+use crate::backend::{Backend, ModelData, Params};
 use crate::chat::ChatTemplate;
-use crate::cpu::Cpu;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionOptions};
 use crate::tokenizer::Tokenizer;
@@ -64,26 +65,17 @@ impl std::fmt::Display for Architecture {
     }
 }
 
-/// What a forward pass needs besides weights and state.
-#[derive(Clone, Copy)]
-pub(crate) struct Ctx<'a> {
-    /// The model bytes that weight offsets point into.
-    pub(crate) bytes: &'a [u8],
-    pub(crate) config: &'a ModelConfig,
-    /// The session's threads and kernels.
-    pub(crate) cpu: &'a Cpu,
-}
-
 /// The architecture-specific weights and forward pass.
 enum Arch {
     Qwen3(qwen3::Qwen3),
     Qwen35(qwen35::Qwen35),
 }
 
-/// Per-session state of an architecture (KV caches, recurrent state, scratch).
-pub(crate) enum State {
-    Qwen3(qwen3::State),
-    Qwen35(qwen35::State),
+/// Per-session state of an architecture (KV caches, recurrent state, scratch)
+/// on backend `B`.
+pub(crate) enum State<B: Backend> {
+    Qwen3(qwen3::State<B>),
+    Qwen35(qwen35::State<B>),
 }
 
 /// A loaded model: weights (memory-mapped or in memory), tokenizer and config.
@@ -92,6 +84,10 @@ pub(crate) enum State {
 pub struct Model {
     storage: Storage,
     config: ModelConfig,
+    /// The small `f32` parameters (norm weights and the like) of every layer.
+    params: Vec<f32>,
+    /// Bytes of the largest tensor.
+    largest_tensor: usize,
     arch: Arch,
     tokenizer: Tokenizer,
     chat_template: Option<ChatTemplate>,
@@ -139,15 +135,23 @@ impl Model {
     ///
     /// As [`Model::load`].
     pub fn from_storage(storage: Storage) -> Result<Self> {
-        let (config, arch, tokenizer, chat_template) = {
+        let (config, params, largest_tensor, arch, tokenizer, chat_template) = {
             let g = Gguf::parse(&storage)?;
+            let largest_tensor = g
+                .tensors()
+                .iter()
+                .filter_map(|t| t.data().map(<[u8]>::len))
+                .max()
+                .unwrap_or(0);
             let name = g.architecture().unwrap_or("(missing)");
             let architecture = Architecture::from_name(name)
                 .ok_or_else(|| Error::UnsupportedArchitecture(name.to_owned()))?;
             let config = config::read(&g, architecture)?;
+            let mut params = Params::default();
+            let p = &mut params;
             let arch = match architecture {
-                Architecture::Qwen3 => Arch::Qwen3(qwen3::Qwen3::load(&g, &config)?),
-                Architecture::Qwen35 => Arch::Qwen35(qwen35::Qwen35::load(&g, &config)?),
+                Architecture::Qwen3 => Arch::Qwen3(qwen3::Qwen3::load(&g, &config, p)?),
+                Architecture::Qwen35 => Arch::Qwen35(qwen35::Qwen35::load(&g, &config, p)?),
             };
             let tokenizer = Tokenizer::from_gguf(&g)?;
             if tokenizer.vocab_size() < config.n_vocab {
@@ -161,11 +165,20 @@ impl Model {
                 .get("tokenizer.chat_template")
                 .and_then(|v| v.as_str())
                 .and_then(ChatTemplate::detect);
-            (config, arch, tokenizer, chat_template)
+            (
+                config,
+                params.into_vec(),
+                largest_tensor,
+                arch,
+                tokenizer,
+                chat_template,
+            )
         };
         Ok(Self {
             storage,
             config,
+            params,
+            largest_tensor,
             arch,
             tokenizer,
             chat_template,
@@ -197,37 +210,48 @@ impl Model {
     }
 
     /// Starts an inference session (its own cache) on this model.
-    #[must_use]
-    pub fn session(&self, options: SessionOptions) -> Session<'_> {
+    ///
+    /// # Errors
+    ///
+    /// Fails if the backend asked for cannot start (no Metal device, for
+    /// instance) or cannot allocate the session's buffers.
+    pub fn session(&self, options: SessionOptions) -> Result<Session<'_>> {
         Session::new(self, options)
     }
 
-    /// Fresh per-session state for up to `n_ctx` positions.
-    pub(crate) fn new_state(&self, n_ctx: usize) -> State {
-        match &self.arch {
-            Arch::Qwen3(_) => State::Qwen3(qwen3::Qwen3::new_state(&self.config, n_ctx)),
-            Arch::Qwen35(m) => State::Qwen35(m.new_state(&self.config, n_ctx)),
+    /// What backends read from this model.
+    pub(crate) fn data(&self) -> ModelData<'_> {
+        ModelData {
+            bytes: &self.storage,
+            mapped: self.storage.is_mapped(),
+            params: &self.params,
+            config: &self.config,
+            largest_tensor: self.largest_tensor,
         }
     }
 
-    /// Runs `token` at position `pos` on `cpu`, writing the next-token logits
+    /// Fresh per-session state on `b` for up to `n_ctx` positions.
+    pub(crate) fn new_state<B: Backend>(&self, b: &mut B, n_ctx: usize) -> Result<State<B>> {
+        Ok(match &self.arch {
+            Arch::Qwen3(_) => State::Qwen3(qwen3::Qwen3::new_state(b, &self.config, n_ctx)?),
+            Arch::Qwen35(m) => State::Qwen35(m.new_state(b, &self.config, n_ctx)?),
+        })
+    }
+
+    /// Runs `token` at position `pos` on `b`, writing the next-token logits
     /// when asked.
-    pub(crate) fn forward(
+    pub(crate) fn forward<B: Backend>(
         &self,
-        cpu: &Cpu,
-        state: &mut State,
+        b: &mut B,
+        state: &mut State<B>,
         token: u32,
         pos: usize,
         logits: Option<&mut [f32]>,
-    ) {
-        let ctx = Ctx {
-            bytes: &self.storage,
-            config: &self.config,
-            cpu,
-        };
+    ) -> Result<()> {
+        let c = &self.config;
         match (&self.arch, state) {
-            (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(&ctx, s, token, pos, logits),
-            (Arch::Qwen35(m), State::Qwen35(s)) => m.forward(&ctx, s, token, pos, logits),
+            (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(b, c, s, token, pos, logits),
+            (Arch::Qwen35(m), State::Qwen35(s)) => m.forward(b, c, s, token, pos, logits),
             _ => unreachable!("session state belongs to a different architecture"),
         }
     }
@@ -236,41 +260,57 @@ impl Model {
     /// architecture cannot rewind (recurrent state), in which case the caller
     /// must rebuild the state from a [`Snapshot`] or by evaluating the kept
     /// tokens again.
-    pub(crate) fn truncate_state(&self, state: &mut State, n_pos: usize) -> bool {
+    pub(crate) fn truncate_state<B: Backend>(
+        &self,
+        b: &mut B,
+        state: &mut State<B>,
+        n_pos: usize,
+    ) -> Result<bool> {
         match state {
             State::Qwen3(s) => {
-                s.truncate(n_pos);
-                true
+                s.truncate(b, n_pos)?;
+                Ok(true)
             }
             // DeltaNet's recurrent state cannot be rewound.
-            State::Qwen35(_) => false,
+            State::Qwen35(_) => Ok(false),
         }
     }
 
     /// Copies the parts of `state` that cannot be rewound into `snapshot`,
     /// reusing its buffers. Returns false, leaving `snapshot` as it is, for
     /// architectures whose state rewinds without one.
-    pub(crate) fn save_state(&self, state: &State, snapshot: &mut Option<Snapshot>) -> bool {
+    pub(crate) fn save_state<B: Backend>(
+        &self,
+        b: &mut B,
+        state: &State<B>,
+        snapshot: &mut Option<Snapshot>,
+    ) -> Result<bool> {
         match state {
-            State::Qwen3(_) => false,
+            State::Qwen3(_) => Ok(false),
             State::Qwen35(s) => {
                 if let Some(Snapshot::Qwen35(target)) = snapshot {
-                    s.save(target);
+                    s.save(b, target)?;
                 } else {
                     let mut target = qwen35::Snapshot::default();
-                    s.save(&mut target);
+                    s.save(b, &mut target)?;
                     *snapshot = Some(Snapshot::Qwen35(target));
                 }
-                true
+                Ok(true)
             }
         }
     }
 
     /// Returns `state` to the moment `snapshot` was taken, `n_pos` tokens
     /// in: the saved parts are copied back and the caches truncated.
-    pub(crate) fn restore_state(&self, state: &mut State, snapshot: &Snapshot, n_pos: usize) {
+    pub(crate) fn restore_state<B: Backend>(
+        &self,
+        b: &mut B,
+        state: &mut State<B>,
+        snapshot: &Snapshot,
+        n_pos: usize,
+    ) -> Result<()> {
         match (state, snapshot) {
-            (State::Qwen35(s), Snapshot::Qwen35(saved)) => s.restore(saved, n_pos),
+            (State::Qwen35(s), Snapshot::Qwen35(saved)) => s.restore(b, saved, n_pos),
             _ => unreachable!("snapshot belongs to a different architecture"),
         }
     }

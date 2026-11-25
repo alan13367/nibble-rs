@@ -60,6 +60,8 @@ pub enum Error {
     /// A conversation the chat template cannot render, such as tool-call
     /// arguments that are not a JSON object.
     InvalidChat(String),
+    /// The backend asked for cannot run here, or failed while running.
+    Backend(String),
 }
 
 impl fmt::Display for Error {
@@ -104,6 +106,7 @@ impl fmt::Display for Error {
             Self::InvalidToken(id) => write!(f, "token id {id} is outside the vocabulary"),
             Self::EmptyInput => write!(f, "no tokens to evaluate"),
             Self::InvalidChat(msg) => write!(f, "cannot render the chat: {msg}"),
+            Self::Backend(msg) => write!(f, "backend: {msg}"),
         }
     }
 }

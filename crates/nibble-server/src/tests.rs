@@ -108,6 +108,7 @@ fn start_with(chat_template: &str, api_key: Option<&str>) -> SocketAddr {
     options.session = SessionOptions {
         n_ctx: 2048,
         threads: 1,
+        backend: nibble::BackendKind::Cpu,
     };
     let model = tiny_model(chat_template);
     std::thread::spawn(move || serve(listener, model, options));

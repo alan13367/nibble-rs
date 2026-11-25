@@ -294,10 +294,13 @@ fn first_token_matches_a_naive_reference() {
     let w = Weights::new();
     let model = w.model();
     for token in [w.id("a"), w.id("abc"), 7] {
-        let mut session = model.session(SessionOptions {
-            n_ctx: 8,
-            threads: 2,
-        });
+        let mut session = model
+            .session(SessionOptions {
+                n_ctx: 8,
+                threads: 2,
+                backend: nibble::BackendKind::Cpu,
+            })
+            .unwrap();
         let logits = session.eval(&[token]).unwrap();
         let expected = w.reference_first_logits(token);
         let scale = expected.iter().fold(0.0f64, |m, v| m.max(v.abs()));
@@ -319,15 +322,21 @@ fn incremental_and_batched_evaluation_agree() {
     let w = Weights::new();
     let model = w.model();
     let tokens = [5u32, 77, 200, 3, 258];
-    let mut batched = model.session(SessionOptions {
-        n_ctx: 16,
-        threads: 3,
-    });
+    let mut batched = model
+        .session(SessionOptions {
+            n_ctx: 16,
+            threads: 3,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap();
     let batched_logits = batched.eval(&tokens).unwrap().to_vec();
-    let mut stepped = model.session(SessionOptions {
-        n_ctx: 16,
-        threads: 1,
-    });
+    let mut stepped = model
+        .session(SessionOptions {
+            n_ctx: 16,
+            threads: 1,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap();
     for &t in &tokens {
         stepped.eval(&[t]).unwrap();
     }
@@ -339,19 +348,25 @@ fn incremental_and_batched_evaluation_agree() {
 fn truncate_restores_an_earlier_state() {
     let w = Weights::new();
     let model = w.model();
-    let mut session = model.session(SessionOptions {
-        n_ctx: 16,
-        threads: 2,
-    });
+    let mut session = model
+        .session(SessionOptions {
+            n_ctx: 16,
+            threads: 2,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap();
     session.eval(&[1, 2, 3, 4]).unwrap();
-    session.truncate(2);
+    session.truncate(2).unwrap();
     assert!(session.logits().is_none());
     let after_truncate = session.eval(&[9]).unwrap().to_vec();
 
-    let mut fresh = model.session(SessionOptions {
-        n_ctx: 16,
-        threads: 2,
-    });
+    let mut fresh = model
+        .session(SessionOptions {
+            n_ctx: 16,
+            threads: 2,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap();
     assert_eq!(fresh.eval(&[1, 2, 9]).unwrap(), &after_truncate[..]);
 }
 
@@ -360,10 +375,13 @@ fn generation_is_deterministic_and_respects_limits() {
     let w = Weights::new();
     let model = w.model();
     let run = |config: SamplerConfig| {
-        let mut session = model.session(SessionOptions {
-            n_ctx: 32,
-            threads: 2,
-        });
+        let mut session = model
+            .session(SessionOptions {
+                n_ctx: 32,
+                threads: 2,
+                backend: nibble::BackendKind::Cpu,
+            })
+            .unwrap();
         let mut sampler = Sampler::new(config);
         let mut out = Vec::new();
         let stop = session
@@ -397,10 +415,13 @@ fn generation_is_deterministic_and_respects_limits() {
 fn evaluation_errors() {
     let w = Weights::new();
     let model = w.model();
-    let mut session = model.session(SessionOptions {
-        n_ctx: 4,
-        threads: 1,
-    });
+    let mut session = model
+        .session(SessionOptions {
+            n_ctx: 4,
+            threads: 1,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap();
     assert!(matches!(session.eval(&[]), Err(Error::EmptyInput)));
     assert!(matches!(
         session.eval(&[260]),
@@ -417,8 +438,10 @@ fn evaluation_errors() {
         model
             .session(SessionOptions {
                 n_ctx: 1 << 20,
-                threads: 1
+                threads: 1,
+                backend: nibble::BackendKind::Cpu,
             })
+            .unwrap()
             .n_ctx(),
         N_CTX
     );
@@ -486,4 +509,55 @@ fn load_errors_name_the_problem() {
             "{name}: {err}"
         );
     }
+}
+
+#[test]
+fn metal_matches_the_cpu_over_a_sequence() {
+    let w = Weights::new();
+    let model = w.model();
+    let Some(mut metal) = common::metal_session(&model, N_CTX) else {
+        return;
+    };
+    let mut cpu = model
+        .session(SessionOptions {
+            n_ctx: N_CTX,
+            backend: nibble::BackendKind::Cpu,
+            ..SessionOptions::default()
+        })
+        .unwrap();
+    let tokens = [w.id("a"), w.id("abc"), 7, 3, 9];
+    for (i, &t) in tokens.iter().enumerate() {
+        let expected: Vec<f64> = cpu
+            .eval(&[t])
+            .unwrap()
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect();
+        let got = metal.eval(&[t]).unwrap();
+        // Both caches are f16; the products round differently.
+        common::assert_close(got, &expected, 2e-3);
+        if i == 2 {
+            metal.truncate(1).unwrap();
+            cpu.truncate(1).unwrap();
+        }
+    }
+}
+
+/// The default backend is Metal on a Mac with a GPU, the CPU elsewhere.
+#[test]
+fn the_default_backend_is_metal_where_available() {
+    let w = Weights::new();
+    let model = w.model();
+    let session = model.session(SessionOptions::default()).unwrap();
+    let metal = common::metal_session(&model, N_CTX).is_some();
+    let want = if metal {
+        nibble::BackendKind::Metal
+    } else {
+        nibble::BackendKind::Cpu
+    };
+    assert_eq!(session.backend(), want);
+    assert_eq!(
+        session.fallback_reason().is_some(),
+        cfg!(target_os = "macos") && !metal
+    );
 }

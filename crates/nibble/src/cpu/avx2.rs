@@ -330,10 +330,10 @@ fn dot_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f
                 *o = dot_f32_le(row, xq);
             }
         }
-        // AVX2 kernels for the K-quants will be added and tested on an x86
-        // machine. Until then the scalar reference keeps those types correct
-        // on x86 too, instead of refusing them.
-        GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+        // AVX2 kernels for the K-quants and `IQ4_XS` will be added and tested
+        // on an x86 machine. Until then the scalar reference keeps those types
+        // correct on x86 too, instead of refusing them.
+        GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs => {
             for (o, row) in out.iter_mut().zip(rows) {
                 *o = quant::dot_row(ty, row, xq);
             }

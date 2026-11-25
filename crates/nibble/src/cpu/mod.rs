@@ -15,8 +15,10 @@
 //! or heads, and each output value is computed by one kernel call, whichever
 //! thread makes it.
 
+mod attention;
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+mod backend;
 mod kernels;
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod neon;
@@ -28,6 +30,7 @@ use std::ops::Range;
 
 use nibble_gguf::GgmlType;
 
+pub(crate) use backend::CpuBackend;
 pub(crate) use kernels::Kernels;
 pub(crate) use pool::ThreadPool;
 pub(crate) use scalar::DeltaStep;
@@ -425,7 +428,7 @@ mod tests {
     fn push_weight(bytes: &mut Vec<u8>, ty: GgmlType, row: &[f32]) {
         if matches!(
             ty,
-            GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+            GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs
         ) {
             let n = ty.layout().unwrap().type_size as usize;
             for b in 0..row.len() / 256 {
@@ -447,6 +450,7 @@ mod tests {
                         }
                     }
                     GgmlType::Q3K => block[108..110].copy_from_slice(&scale),
+                    GgmlType::Iq4Xs => block[..2].copy_from_slice(&scale),
                     _ => {}
                 }
                 bytes.extend(block);
@@ -475,6 +479,7 @@ mod tests {
             GgmlType::Q3K,
             GgmlType::Q5K,
             GgmlType::Q6K,
+            GgmlType::Iq4Xs,
         ] {
             let cols = if ty == GgmlType::Q8_0 { 512 } else { 256 };
             let m = matrices(&[(ty, cols, 1000)]);

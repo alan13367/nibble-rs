@@ -43,6 +43,15 @@ pub(crate) const Q5_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2;
 pub(crate) const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
 /// Bytes per `Q3_K` block: high-bit mask, 2-bit quants, 6-bit scales, f16 scale.
 pub(crate) const Q3_K_BLOCK_BYTES: usize = QK_K / 8 + QK_K / 4 + 12 + 2;
+/// Bytes per `IQ4_XS` block: f16 scale, the high 2 bits of the eight 6-bit
+/// group scales, their low 4 bits, then 128 bytes of nibbles that index
+/// [`KVALUES_IQ4NL`].
+pub(crate) const IQ4_XS_BLOCK_BYTES: usize = 2 + 2 + QK_K / 64 + QK_K / 2;
+
+/// The 16 values an `IQ4_NL`/`IQ4_XS` nibble stands for (`kvalues_iq4nl`).
+pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
 
 /// Converts IEEE half-precision bits to `f32` (exact).
 #[must_use]
@@ -128,6 +137,7 @@ pub(crate) const SUPPORTED: &[GgmlType] = &[
     GgmlType::Q4K,
     GgmlType::Q5K,
     GgmlType::Q6K,
+    GgmlType::Iq4Xs,
 ];
 
 /// Whether the CPU reference path can compute with this weight type.
@@ -169,6 +179,7 @@ pub(crate) fn dequantize_row(ty: GgmlType, row: &[u8], out: &mut [f32]) {
         GgmlType::Q5K => dequantize_q5_k(row, out),
         GgmlType::Q6K => dequantize_q6_k(row, out),
         GgmlType::Q3K => dequantize_q3_k(row, out),
+        GgmlType::Iq4Xs => dequantize_iq4_xs(row, out),
         other => unreachable!("dequantize_row called with unsupported type {other}"),
     }
 }
@@ -180,7 +191,7 @@ pub(crate) enum DotType {
     F32,
     Bf16,
     Q8_0,
-    /// `Q8_K`, shared by `Q3_K`, `Q4_K`, `Q5_K` and `Q6_K`.
+    /// `Q8_K`, shared by the K-quants and `IQ4_XS`.
     Q8K,
 }
 
@@ -200,7 +211,9 @@ impl DotType {
             GgmlType::F32 | GgmlType::F16 => Self::F32,
             GgmlType::Bf16 => Self::Bf16,
             GgmlType::Q8_0 => Self::Q8_0,
-            GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => Self::Q8K,
+            GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs => {
+                Self::Q8K
+            }
             other => unreachable!("no dot type for unsupported weight type {other}"),
         }
     }
@@ -335,8 +348,64 @@ pub(crate) fn dot_row(ty: GgmlType, row: &[u8], xq: &[u8]) -> f32 {
         GgmlType::Q5K => dot_q5_k(row, xq),
         GgmlType::Q6K => dot_q6_k(row, xq),
         GgmlType::Q3K => dot_q3_k(row, xq),
+        GgmlType::Iq4Xs => dot_iq4_xs(row, xq),
         other => unreachable!("dot_row called with unsupported type {other}"),
     }
+}
+
+// --- IQ4_XS ----------------------------------------------------------------
+//
+// ggml's `block_iq4_xs`: 8 groups of 32 with 6-bit scales (bias 32), each
+// nibble an index into a fixed non-linear table. Byte `j` of a group's 16
+// holds value `j` in its low nibble and value `j + 16` in its high nibble.
+
+/// The scale of group `g` (`0..8`), with its bias removed.
+fn iq4_xs_scale(block: &[u8; IQ4_XS_BLOCK_BYTES], g: usize) -> i32 {
+    let high = u16::from_le_bytes([block[2], block[3]]);
+    let low = (block[4 + g / 2] >> (4 * (g % 2))) & 0xF;
+    i32::from(low | (((high >> (2 * g)) & 3) as u8) << 4) - 32
+}
+
+/// `dequantize_row_iq4_xs`: `(d * scale) * value`.
+fn dequantize_iq4_xs(row: &[u8], out: &mut [f32]) {
+    let blocks = row.as_chunks::<IQ4_XS_BLOCK_BYTES>().0;
+    for (out, block) in out.as_chunks_mut::<QK_K>().0.iter_mut().zip(blocks) {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for (g, out) in out.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+            let dl = d * iq4_xs_scale(block, g) as f32;
+            let qs = &block[8 + 16 * g..8 + 16 * g + 16];
+            for (j, &q) in qs.iter().enumerate() {
+                out[j] = dl * f32::from(KVALUES_IQ4NL[usize::from(q & 0xF)]);
+                out[j + 16] = dl * f32::from(KVALUES_IQ4NL[usize::from(q >> 4)]);
+            }
+        }
+    }
+}
+
+/// `ggml_vec_dot_iq4_xs_q8_K`, NEON path: each group's integer dot times its
+/// scale, summed exactly over the super-block, then
+/// `sumf += d * d8 * isum` (one fused operation).
+fn dot_iq4_xs(row: &[u8], xq: &[u8]) -> f32 {
+    let mut sum = 0.0f32;
+    let blocks = row.as_chunks::<IQ4_XS_BLOCK_BYTES>().0;
+    let xs = xq.as_chunks::<Q8_K_BLOCK_BYTES>().0;
+    for (block, x) in blocks.iter().zip(xs) {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let (xd, xqs, _) = q8k_block(x);
+        let mut isum = 0i32;
+        for g in 0..8 {
+            let qs = &block[8 + 16 * g..8 + 16 * g + 16];
+            let q8 = &xqs[32 * g..32 * g + 32];
+            let mut dot = 0i32;
+            for (j, &q) in qs.iter().enumerate() {
+                dot += i32::from(KVALUES_IQ4NL[usize::from(q & 0xF)]) * i32::from(q8[j] as i8);
+                dot += i32::from(KVALUES_IQ4NL[usize::from(q >> 4)]) * i32::from(q8[j + 16] as i8);
+            }
+            isum += dot * iq4_xs_scale(block, g);
+        }
+        sum = (d * xd).mul_add(isum as f32, sum);
+    }
+    sum
 }
 
 // --- K-quants --------------------------------------------------------------
@@ -744,9 +813,9 @@ pub(crate) mod test_data {
         values(n, seed).into_iter().map(|v| v * scale).collect()
     }
 
-    /// A K-quant row of `blocks` super-blocks of random bytes, except that
-    /// block `i` has the f16 scale `scales[i % 3]` and, for `Q4_K`/`Q5_K`,
-    /// the min scale `dmin`.
+    /// A K-quant (or `IQ4_XS`) row of `blocks` super-blocks of random bytes,
+    /// except that block `i` has the f16 scale `scales[i % 3]` and, for
+    /// `Q4_K`/`Q5_K`, the min scale `dmin`.
     pub(crate) fn k_row_with(
         ty: GgmlType,
         blocks: usize,
@@ -772,6 +841,7 @@ pub(crate) mod test_data {
                 }
                 GgmlType::Q6K => block[208..210].copy_from_slice(&scale),
                 GgmlType::Q3K => block[108..110].copy_from_slice(&scale),
+                GgmlType::Iq4Xs => block[..2].copy_from_slice(&scale),
                 _ => unreachable!("{ty} is not a K-quant"),
             }
         }
@@ -1243,6 +1313,40 @@ mod tests {
                 let got = dot_row(ty, &k_row(ty, 3, 10 + r as u32), &xq);
                 assert_eq!(got.to_bits(), want, "{ty} row {r}: {got}");
             }
+        }
+    }
+
+    /// `IQ4_XS` against ggml's `to_float` and NEON `vec_dot` (gguf-py has no
+    /// `IQ4_XS` quantizer to compare with): the dequantized rows with exact
+    /// and rounding scales, and four dots with a `Q8_K` activation.
+    #[test]
+    fn iq4_xs_matches_ggml() {
+        let exact = k_row_with(GgmlType::Iq4Xs, 3, 30, [0x2C00, 0x0000, 0xAC00], 0x2800);
+        let samples = [-42.75, -178.0, 28.25, 17.1875, -0.0, -0.0, 190.5, 111.125];
+        for (row, hash) in [
+            (exact, 0xF139_B264_6FF0_FBD6),
+            (k_row(GgmlType::Iq4Xs, 3, 20), 0xD5F9_178C_AEEA_EFBD),
+        ] {
+            let mut out = vec![0.0; 3 * QK_K];
+            dequantize_row(GgmlType::Iq4Xs, &row, &mut out);
+            assert_eq!(fnv1a(&f32_bytes(&out)), hash);
+            if hash == 0xF139_B264_6FF0_FBD6 {
+                for (&i, want) in [0, 37, 100, 255, 300, 511, 600, 767].iter().zip(samples) {
+                    assert_eq!(out[i].to_bits(), f32::to_bits(want), "[{i}]");
+                }
+            }
+        }
+        let xq = encoded(DotType::Q8K, &test_data::values(3 * QK_K, 3));
+        for (r, want) in [0x44FE_12B0u32, 0xC49D_E191, 0xC49F_43E0, 0x44E6_DA04]
+            .into_iter()
+            .enumerate()
+        {
+            let got = dot_row(
+                GgmlType::Iq4Xs,
+                &k_row(GgmlType::Iq4Xs, 3, 10 + r as u32),
+                &xq,
+            );
+            assert_eq!(got.to_bits(), want, "row {r}: {got}");
         }
     }
 

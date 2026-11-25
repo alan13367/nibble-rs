@@ -67,13 +67,14 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
 
     let model = model_opts.load()?;
     let tokens = prompt_tokens(&model, &prompt, chat, system, think)?;
-    let mut session = model.session(model_opts.session_options());
+    let mut session = model.session(model_opts.session_options())?;
+    crate::args::report_fallback(&session);
     let mut sampler = Sampler::new(sampling.config());
     eprintln!(
-        "nibble: {} prompt tokens, context {}, {} threads, seed {}",
+        "nibble: {} prompt tokens, context {}, {}, seed {}",
         tokens.len(),
         session.n_ctx(),
-        session.threads(),
+        session.compute(),
         sampler.config().seed
     );
 

@@ -57,10 +57,13 @@ fn load_tokenizer(file: &str) -> Tokenizer {
 fn greedy(model: &Model, prompt: &str, max_tokens: usize) -> (String, StopReason) {
     let tok = model.tokenizer();
     let tokens = tok.encode(prompt, true);
-    let mut session = model.session(SessionOptions {
-        n_ctx: 512,
-        threads: 0,
-    });
+    let mut session = model
+        .session(SessionOptions {
+            n_ctx: 512,
+            threads: 0,
+            backend: nibble::BackendKind::Cpu,
+        })
+        .unwrap();
     let mut sampler = Sampler::new(SamplerConfig::greedy());
     let mut decoder = StreamDecoder::new();
     let mut text = String::new();
@@ -259,6 +262,27 @@ fn qwen35_q4_k_m_greedy_matches_llama_cpp() {
     assert_eq!(
         text,
         " 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,"
+    );
+}
+
+/// A larger `qwen35` (32 value heads sharing 16 key heads) with `IQ4_XS`
+/// weights among its K-quants (Unsloth's "UD" mix).
+#[test]
+#[ignore = "needs models/Qwen3.5-9B-UD-Q4_K_XL.gguf"]
+fn qwen35_9b_ud_q4_k_xl_greedy_matches_llama_cpp() {
+    let model = load_model("Qwen3.5-9B-UD-Q4_K_XL.gguf");
+
+    let (text, stop) = greedy(&model, "The capital of France is", 64);
+    assert_eq!(text, " Paris.\nThe capital of France is".repeat(8));
+    assert_eq!(stop, StopReason::MaxTokens);
+
+    let prompt = "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n";
+    let (text, _) = greedy(&model, prompt, 64);
+    assert_eq!(
+        text,
+        "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n    \
+         else:\n        return fibonacci(n - 1) + fibonacci(n - 2)\n\n# Example usage:\n\
+         print(fibonacci(10))  # Output: "
     );
 }
 

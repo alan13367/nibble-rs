@@ -6,3 +6,5 @@
 
 # Reference tools (llama.cpp release builds), not part of the repo.
 /tools
+
+.DS_Store

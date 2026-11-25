@@ -82,9 +82,18 @@ pub(crate) enum Event {
 
 /// Serves jobs until every sender is dropped.
 pub(crate) fn run(model: &Model, options: SessionOptions, jobs: &Receiver<Job>) {
-    let mut session = model.session(options);
-    for job in jobs {
-        serve(&mut session, job);
+    match model.session(options) {
+        Ok(mut session) => {
+            for job in jobs {
+                serve(&mut session, job);
+            }
+        }
+        Err(e) => {
+            let message = format!("cannot start a session: {e}");
+            for job in jobs {
+                let _ = job.events.send(Event::Error(message.clone()));
+            }
+        }
     }
 }
 
@@ -111,7 +120,10 @@ fn serve(session: &mut Session<'_>, job: Job) {
         .take_while(|(a, b)| a == b)
         .count();
     let keep = common.min(job.prompt.len() - 1);
-    session.truncate(keep);
+    if let Err(e) = session.truncate(keep) {
+        let _ = job.events.send(Event::Error(e.to_string()));
+        return;
+    }
 
     let tokenizer = session.model().tokenizer();
     let mut sampler = Sampler::new(job.sampler);

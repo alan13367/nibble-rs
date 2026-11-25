@@ -56,7 +56,8 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
         .chat_template()
         .ok_or("this model's chat template is not supported yet")?;
     let tok = model.tokenizer();
-    let mut session = model.session(model_opts.session_options());
+    let mut session = model.session(model_opts.session_options())?;
+    crate::args::report_fallback(&session);
     let mut sampler = Sampler::new(sampling.config());
     let options = ChatOptions {
         add_generation_prompt: true,
@@ -83,7 +84,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
             "/exit" | "/quit" => return Ok(()),
             "/clear" => {
                 messages = start_messages.clone();
-                session.clear();
+                session.clear()?;
                 eprintln!("nibble: conversation cleared");
                 continue;
             }
@@ -91,7 +92,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
         }
         messages.push(Message::user(input));
         let prompt = tok.encode(&template.render(&messages, options)?, true);
-        let new_tokens = reuse_prefix(&mut session, &prompt);
+        let new_tokens = reuse_prefix(&mut session, &prompt)?;
 
         let start = Instant::now();
         let mut reply = String::new();
@@ -119,7 +120,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
             Err(e) => {
                 eprintln!("nibble: {e}");
                 messages.pop();
-                session.clear();
+                session.clear()?;
                 continue;
             }
         }
@@ -132,7 +133,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
 
 /// Keeps the longest cached prefix of `prompt` and returns the tokens still to evaluate.
 /// At least one token is always re-evaluated, to get fresh logits.
-fn reuse_prefix<'p>(session: &mut Session<'_>, prompt: &'p [u32]) -> &'p [u32] {
+fn reuse_prefix<'p>(session: &mut Session<'_>, prompt: &'p [u32]) -> CliResult<&'p [u32]> {
     let common = session
         .tokens()
         .iter()
@@ -140,6 +141,6 @@ fn reuse_prefix<'p>(session: &mut Session<'_>, prompt: &'p [u32]) -> &'p [u32] {
         .take_while(|(a, b)| a == b)
         .count();
     let keep = common.min(prompt.len().saturating_sub(1));
-    session.truncate(keep);
-    &prompt[keep..]
+    session.truncate(keep)?;
+    Ok(&prompt[keep..])
 }

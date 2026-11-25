@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nibble::sampler::SamplerConfig;
-use nibble::{Model, SessionOptions};
+use nibble::{BackendKind, Model, Session, SessionOptions};
 
 pub(crate) type CliResult<T> = Result<T, Box<dyn Error>>;
 
@@ -78,11 +78,12 @@ impl Args {
     }
 }
 
-/// `-m`, `-c`, `-t`, `--read`.
+/// `-m`, `-c`, `-t`, `--backend`, `--read`.
 pub(crate) struct ModelOptions {
     pub(crate) path: Option<PathBuf>,
     pub(crate) n_ctx: usize,
     pub(crate) threads: usize,
+    pub(crate) backend: BackendKind,
     pub(crate) mmap: bool,
 }
 
@@ -90,8 +91,18 @@ pub(crate) const MODEL_HELP: &str = "  -m, --model FILE         GGUF model file 
   -c, --ctx N              Context size in tokens (default 4096, 0 = model maximum)
   -t, --threads N          Threads (default: performance cores on Apple Silicon,
                            else one per physical core)
+      --backend B          auto, cpu or metal (default auto: Metal where
+                           available, else the CPU)
       --read               Read the model into memory instead of memory-mapping it
 ";
+
+/// Says on stderr why a session asked to use the GPU where available runs
+/// on the CPU.
+pub(crate) fn report_fallback(session: &Session<'_>) {
+    if let Some(reason) = session.fallback_reason() {
+        eprintln!("nibble: not using the GPU ({reason}); running on the CPU");
+    }
+}
 
 impl ModelOptions {
     pub(crate) fn new() -> Self {
@@ -99,6 +110,7 @@ impl ModelOptions {
             path: None,
             n_ctx: 4096,
             threads: 0,
+            backend: BackendKind::Auto,
             mmap: true,
         }
     }
@@ -109,6 +121,12 @@ impl ModelOptions {
             "-m" | "--model" => self.path = Some(args.value(flag)?.into()),
             "-c" | "--ctx" => self.n_ctx = args.parse(flag)?,
             "-t" | "--threads" => self.threads = args.parse(flag)?,
+            "--backend" => {
+                let name = args.string(flag)?;
+                self.backend = BackendKind::from_name(&name).ok_or_else(|| {
+                    format!("unknown backend `{name}` (expected auto, cpu or metal)")
+                })?;
+            }
             "--read" => self.mmap = false,
             _ => return Ok(false),
         }
@@ -157,6 +175,7 @@ impl ModelOptions {
         SessionOptions {
             n_ctx: self.n_ctx,
             threads: self.threads,
+            backend: self.backend,
         }
     }
 }

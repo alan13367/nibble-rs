@@ -6,20 +6,23 @@ everywhere, an OpenAI-compatible server, and a library + CLI.
 
 This is a living document: update it when a decision changes.
 
-## Status (2026-11-24)
+## Status (2026-11-25)
 
 | Area | State |
 |---|---|
 | GGUF reader, mmap, writer, `nibble inspect` | Done |
-| CPU engine | `qwen3` and `qwen35` on F32/F16/BF16/Q8_0 and Q3_K/Q4_K/Q5_K/Q6_K. AVX2 kernels on x86 (K-quant dots still scalar there; Rosetta can check new ones for correctness, speed needs a real x86 machine), NEON kernels on AArch64 (`dotprod` and `fp16` when the CPU has them, ggml's `vmull` fallback otherwise), a persistent thread pool per session, grouped and fused matvecs, parallel DeltaNet and attention heads. On Apple Silicon the default thread count is the performance cores (`hw.perflevel0.physicalcpu`) |
+| CPU engine | `qwen3` and `qwen35` on F32/F16/BF16/Q8_0, Q3_K/Q4_K/Q5_K/Q6_K and IQ4_XS (NEON kernel; scalar on x86). AVX2 kernels on x86 (K-quant dots still scalar there; Rosetta can check new ones for correctness, speed needs a real x86 machine), NEON kernels on AArch64 (`dotprod` and `fp16` when the CPU has them, ggml's `vmull` fallback otherwise), a persistent thread pool per session, grouped and fused matvecs, parallel DeltaNet and attention heads. On Apple Silicon the default thread count is the performance cores (`hw.perflevel0.physicalcpu`) |
 | Correctness | Tokenizer ids identical to llama.cpp on 7 tricky strings for both models. Greedy output identical to llama.cpp b12359 (release builds, CPU, `-fa off --no-repack -ub 1`) on 29 of 30 prompt/model pairs on an M4 Max (6 prompts × the 5 local files, 64 tokens); the other is a BF16 near-tie (logit gap 0.003) caused by nibble's faster bf16 dot. The x86 AVX2 path, run under Rosetta, is identical to the macOS x64 release on all 18 BF16/Q8_0 pairs. Kernels, RoPE and the activation encoders are checked bit for bit against ggml's own functions. The 5600X comparison (21/24 against b12675) predates the attention and fused-multiply-add fixes and has to be rerun |
 | Speed (5600X, 6 threads, tg128) | Faster than llama.cpp b12675 on every local file: Qwen3-0.6B Q8_0 59.0 tok/s (llama.cpp 56.0), Qwen3.5-0.8B Q8_0 47.6 (41.0), Qwen3-0.6B BF16 34.6 (33.7), Qwen3.5-0.8B BF16 27.1 (25.2). Measured before the attention and fused-multiply-add fixes; to be rerun |
 | Speed (M4 Max, 10 performance cores, tg128, 5 reps) | Against the b12359 release build on the CPU (`llama-bench -ngl 0 -dev none -fa 0`, repacking on as by default): Qwen3-0.6B BF16 172.4 tok/s (llama.cpp 28.9), Q8_0 240.4 (238.3 ± 7.8, a tie), Qwen3.5-0.8B Q8_0 192.1 (184.2), Q4_K_M 233.4 (212.5), Q3_K_M 250.6 (208.9). Making the numerics exactly ggml's left decode speed unchanged. Before NEON the scalar kernels were 23.5 / 63.7 / 54.2 on the three files that ran. 14 threads (P+E) is slower than 10 on both engines, so the default is the 10 performance cores |
-| CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench` |
-| OpenAI server | Complete for Phase 3: tools, logprobs, recurrent-state checkpoints. Verified with curl, socket tests, and the official OpenAI Python client (3.58) on both models. Open WebUI not tried |
-| Tests | 204 pass in `cargo test --workspace` (no model files needed), and 202 as x86_64 under Rosetta (the SIMD tests differ by architecture); 8 llama.cpp reference tests on real models (7 pass here with `--ignored`, natively and under Rosetta; `qwen35_bf16` needs a file that is not on this machine) |
-| Not started | AVX2 kernels for the K-quants (scalar on x86 until an x86 machine can test them), GPU backends, batched prompt processing |
-| Git | Three commits; Phase 4 and its review fixes are uncommitted |
+| Metal backend | Done (Phase 6) and the default (`auto`): `qwen3` and `qwen35` on every supported weight type, zero-copy weights (split across buffers past the device limit), a few command buffers per token. Greedy output identical to llama.cpp b12359's Metal path (`-ngl 99 -fa off -ub 1`) on 29 of 30 short prompt/model pairs, all 7 local files after a 4,557-token prompt, and all 12 runs of the two 9B files on an M4 Max. The exception is a tie on Qwen3-0.6B BF16 (top two logits 0.001 apart) where llama.cpp's own CPU path takes nibble's side. Against nibble's CPU path the tokens differ only where llama.cpp's CPU and Metal paths differ too; see Phase 6. Tested on the M4 Max only |
+| Speed (M4 Max GPU, 32 cores, tg128, 3 reps) | Faster than `llama-bench -ngl 99` (b12359) on every local file, flash attention off / on, at an empty context and at 4096 tokens (`nibble bench -d 4096`, llama-bench `-d 4096`). Empty: Qwen3-0.6B BF16 244.4 tok/s (202.5 / 215.0), Q8_0 373.7 (267.0 / 300.9), Qwen3.5-0.8B Q8_0 318.1 (244.6 / 241.6), Q4_K_M 392.9 (249.9 / 267.1), Q3_K_M 394.4 (265.2 / 256.0), Qwen3.5-9B UD-Q4_K_XL 59.4 (49.3 / 45.2), 9B Q8_0 33.2 (31.6 / 32.7). At 4096: 178.1 (126.0 / 167.5), 237.9 (154.3 / 228.0), 270.6 (217.2 / 224.0), 322.0 (245.7 / 255.8), 323.1 (236.2 / 244.1), 51.6 (49.0 / 43.9), 35.7 (31.1 / 32.6). The 9B Q4 file reads about 326 GB/s, 84% of the measured ~390 GB/s; the 0.6–0.8B files 46–71%, bound by the chain of about 180 dependent dispatches per token (4–6 µs each) |
+| Qwen3.5-9B (UD-Q4_K_XL 5.6 GiB and Q8_0 8.9 GiB, M4 Max) | Both run on both backends (UD-Q4_K_XL mixes IQ4_XS into its K-quants; 32 value heads share 16 key heads). Greedy output identical to llama.cpp b12359 on all 6 comparison prompts for both files on the CPU (`--no-repack -ub 1`) and on Metal (`-ngl 99 -fa off -ub 1`), and after a 4,557-token prompt on Metal. Metal decode in the row above. CPU decode (UD-Q4_K_XL) 27.1 tok/s at 10 threads (llama.cpp 35.6 with repacking): the CPU gap at this size is not investigated yet. Prompt: 65.7 tok/s on Metal one token at a time (llama.cpp 685 batched) |
+| CLI | `inspect`, `tokenize`, `run` (with `--probs N`), `chat`, `serve`, `bench`; `--backend auto\|cpu\|metal` (default auto: Metal where available, with the reason printed when it falls back to the CPU) |
+| OpenAI server | Complete for Phase 3: tools, logprobs, recurrent-state checkpoints. Verified with curl, socket tests, and the official OpenAI Python client (3.58 on both models on the CPU; 3.59 on Metal with Qwen3-0.6B, Qwen3.5-0.8B and the 9B: models, multi-turn chat, reasoning, streaming with usage, tool calls and results, streamed tool calls, logprobs, stop, length, completions, seeded sampling, 6 concurrent async requests, context overflow). Where the CPU and Metal answers differ (a tool call on Qwen3.5-0.8B), llama-server's CPU and Metal paths give the same first-token log-probabilities as nibble's to 0.001. Open WebUI not tried |
+| Tests | 216 pass in `cargo test --workspace` (no model files needed; the Metal tests skip where no Metal device exists and fail on a Mac whose GPU cannot start the backend); 202 as x86_64 under Rosetta before IQ4_XS (not rerun since); 9 llama.cpp reference tests on real models (8 pass here with `--ignored`; `qwen35_bf16` needs a file that is not on this machine) |
+| Not started | AVX2 kernels for the K-quants (scalar on x86 until an x86 machine can test them), CUDA, batched prompt processing |
+| Git | Four commits; the `Backend` refactor, the Metal backend and IQ4_XS are uncommitted |
 
 ## Decisions
 
@@ -34,7 +37,8 @@ This is a living document: update it when a decision changes.
 | Rust | Latest stable: edition 2024, MSRV **1.100** (checked in CI) |
 | CI | GitHub Actions on pull requests and manual dispatch only, not on every push |
 | Repository | No helper or generator scripts; only their output is committed |
-| Delegation | Simple, well-specified tasks go to GLM-5.3 through opencode (`opencode-go/glm-5.3#max`) in an isolated directory; the result is reviewed before it is integrated |
+| Delegation | Simple, well-specified tasks go to GLM-5.3 through opencode (`opencode-go/glm-5.3#max`) in an isolated directory; the result is reviewed before it is integrated. The Metal K-quant kernels (`metal/shaders/kquants.metal`) were written this way against a test harness, then checked end to end against llama.cpp |
+| GPU correctness | A GPU backend matches llama.cpp's backend for the same API (Metal ↔ ggml-metal, CUDA ↔ ggml-cuda) token for token, with the same numerics (f32 activations into the weight-type matvecs). Against nibble's CPU path, which quantizes activations as ggml-cpu does, tokens may differ after near-ties, where llama.cpp's own CPU and GPU paths differ too |
 | Correctness oracle | llama.cpp on the same GGUF file: greedy tokens, logits, and per-layer tensor dumps |
 
 ## Dependency policy
@@ -67,15 +71,22 @@ GPU code needs a compiler only at development time, never in `cargo build`:
 ## Backends
 
 The forward pass is written once against an op-level `Backend` trait
-(`matvec`, `rmsnorm`, `rope`, `attention`, `conv1d_step`, `gated_delta_step`,
-`logits`, ...). Each backend implements the ops on its own buffers. The CPU
-backend is both the fallback and the correctness oracle for the GPU backends.
+(`backend.rs`: `matvecs`, `swiglu`, `add_rmsnorm`, `attention`, `delta_net`,
+`logits`, ...), generic over the backend's vector and KV-cache types. Each
+backend implements the ops on its own buffers. Ops are coarse where a GPU
+can fuse them: `attention` covers the Q/K norms, RoPE, the cache append and
+the gate, `delta_net` the convolution, the delta rule and the gated norm.
+The CPU implementation of each op is exactly the sequence of CPU kernels it
+replaced (checked: greedy output and the top-3 logits at every step
+unchanged on 30 runs). The CPU backend is the fallback everywhere.
 
-`Backend::Auto` picks, in order:
+`BackendKind::Auto`, the default, picks in order (only Metal and the CPU
+exist so far):
 
 1. **Metal** on Apple Silicon.
 2. **CUDA** if the NVIDIA driver library loads and a device of compute capability 7.5+ exists.
-3. **CPU** otherwise. It logs why each GPU backend was skipped.
+3. **CPU** otherwise. The session keeps why each GPU backend was skipped
+   (`Session::fallback_reason`), and the CLI prints it.
 
 `--backend cpu|cuda|metal` forces a choice. A binary built anywhere starts on
 any machine: GPU libraries are opened at runtime, never linked.
@@ -112,11 +123,71 @@ any machine: GPU libraries are opened at runtime, never linked.
   `.metallib` files only if startup time matters.
 - **Zero-copy weights:** with unified memory, `newBufferWithBytesNoCopy` wraps
   the memory-mapped file directly. There is no upload and no second copy.
-- simdgroup reductions for matvec, `simdgroup_matrix` for prompt GEMM, one command buffer per token.
-- **Testing:** the Metal backend is written without being run, because the dev
-  machine is Windows and GitHub macOS runners may not expose a usable GPU. CI
-  compiles it and runs the CPU tests on macOS. Correctness and speed runs happen
-  later on an Apple Silicon Mac, before the phase counts as done.
+  A buffer holds at most `maxBufferLength` bytes (22.6 GB on the 36 GB M4
+  Max), so a larger file is wrapped as several buffers that overlap by its
+  largest tensor, as llama.cpp does; every tensor lies whole in one
+  (`metal/weights.rs`). A model read into memory is copied the same way.
+  `NIBBLE_METAL_MAX_BUFFER` lowers the limit to test the split: the 9B file
+  in 1 GiB pieces gives the same tokens at the same speed.
+- simdgroup reductions for matvec, `simdgroup_matrix` for prompt GEMM.
+- **Runtime loading:** `libobjc`, Foundation, CoreGraphics (without it
+  `MTLCreateSystemDefaultDevice` returns nil in command-line programs) and
+  Metal are opened with `dlopen`; nothing is linked.
+- **Kernels** (`metal/shaders/*.metal`, concatenated and compiled when a
+  session starts) transcribe ggml-metal's: the matvecs keep its simdgroup
+  layout, rows per threadgroup and reduction order, so greedy output matches
+  llama.cpp's Metal path exactly. Each matvec kernel can also add its result
+  to the output (the residual connection) or compute a gate and up row pair
+  and write their SwiGLU, which changes no row's arithmetic. The other
+  kernels are nibble's own, fused per op (see Backends). Attention: one
+  threadgroup per key head and chunk of positions computes the norm, RoPE,
+  cache store, scores, softmax and value sum for all the query heads that
+  share the key head, so each cached key and value is read once per token
+  (`half4` loads); chunks of 32–256 positions aim at about 512
+  threadgroups, and past one chunk a reduce dispatch combines them. It is
+  instantiated for up to 8 query heads per key head and heads of up to 512
+  values (256 with 8 query heads). DeltaNet: the state update split over
+  row groups, then the gated norm.
+- **Encoding:** a concurrent compute encoder with a buffer barrier before
+  each dependent dispatch; grouped matvecs share one barrier. A token's
+  first command buffer is committed after 8 dispatches, so the GPU starts
+  while the rest is encoded, then one every 64. Tokens whose logits are not
+  needed are committed without waiting; a wait polls for up to 20 ms before
+  it blocks (waking from `waitUntilCompleted` cost about 8% of decode
+  speed). Every committed command buffer is kept until it is seen to have
+  finished (at most 64, the queue's default limit), and the first failure
+  is returned by the next op that returns a result. An op that cannot be
+  encoded records an error that the end of the token returns; shapes the
+  kernels do not cover are refused when the session starts, so `Auto` falls
+  back to the CPU, and the CLI says why.
+- **Testing:** on the M4 Max only (macOS 27.2); other Apple GPUs are
+  untested. `metal/tests.rs` checks every matvec mode and embedding kernel
+  against the CPU reference on random rows, also with the weights split
+  across buffers, and the attention kernels against the CPU backend over
+  300 positions for 5 head layouts and 3 chunkings; the synthetic
+  `qwen3`/`qwen35` tests run on Metal too (skipped without a device, and
+  failing on a Mac whose GPU cannot start the backend).
+- **Where decode time goes** (Qwen3.5-0.8B Q4_K_M, 2.6 ms per token): the
+  GPU is busy about 90% of it; the rest is the gap between tokens (wake,
+  submit latency). On the GPU the logits take 0.55 ms at full bandwidth, and
+  each layer about 70 µs against 35 µs of weight streaming: eight dependent
+  steps of 4–6 µs each. Tried and measured slower or no faster, so not kept:
+  each matvec threadgroup normalizing its input itself (the prologue delays
+  every threadgroup's weight loads: 375 → 307 tok/s); the last threadgroup
+  of a residual product computing the next norm with device-scope atomics
+  and fences (bit-exact, but 375 → 343); four rows per simdgroup instead of
+  two; other simdgroup counts; barriers on named buffers instead of scope
+  barriers; a serial encoder.
+- **Long contexts:** attention used to read the cache once per query head;
+  sharing each key head's reads among its query heads took Qwen3-0.6B Q8_0
+  from 119.5 to 238 tok/s at 4096 positions (its KV cache is 19 MB per
+  layer there, about as much as its weights).
+- **Next:** what is left is fewer dependent steps or cheaper ones. The norms
+  (two per layer) and the DeltaNet gated norm are the candidates; a norm
+  scale computed from per-threadgroup partial sums and applied as the next
+  product loads its input would remove the norm dispatches at the cost of
+  last-bit differences from llama.cpp. Bigger models are less bound by
+  synchronization: their products are long enough to run at bandwidth.
 
 ### Later: Vulkan
 
@@ -283,10 +354,13 @@ crates/
     chat/          ChatML / Qwen3 / Qwen3.5 templates with tools (qwen.rs), tool-call parser (tool_calls.rs)
     sampler.rs     greedy, temperature, top-k/top-p/min-p, penalties, logprobs
     session.rs     Session: tokens, cache, recurrent-state checkpoints, generation loop
-    backend.rs     (planned) the op-level Backend trait and backend selection
+    backend.rs     the op-level Backend trait, BackendKind, the parameter arena
     cpu/neon.rs    NEON kernels. simd128 for WASM is still planned
     cuda/          (planned) driver API loader + bindings, memory, graphs; kernels/*.cu + nibble.fatbin
-    metal/         (planned) objc runtime bindings, device, buffers, pipelines; shaders/*.metal
+    cpu/backend.rs the CPU Backend (cpu/attention.rs: the f16 KV cache and attention)
+    metal/         objc.rs (runtime loading, typed objc_msgSend), device.rs (device, buffers,
+                   pipelines, command buffers), kernels.rs (argument structs, dispatch),
+                   mod.rs (the Metal Backend), shaders/*.metal
   nibble-server/   http.rs, openai.rs, worker.rs, server.rs, text.rs (stop sequences, reasoning split)
   nibble-cli/      inspect, tokenize, run, chat, serve, bench
 ```
@@ -316,9 +390,9 @@ Design rules:
 | **3. OpenAI server** ✅ | `nibble-server` (std-only HTTP/1.1 + SSE, JSON in `nibble-json`), chat/completions/models/health, streaming with usage, `reasoning_content`, stop sequences, API key, CORS, FIFO worker with prefix reuse, tool calling, logprobs, recurrent-state checkpoints; `nibble serve` | Verified with curl, socket tests and the official OpenAI Python client on Qwen3 and Qwen3.5 (chat, streaming, reasoning, logprobs, tool round trips streamed and not, completions, errors). Open WebUI not tried |
 | **4. CPU speed** (x86 AVX2 and Apple Silicon NEON done) | AVX2 kernels for F32/F16/BF16/Q8_0, NEON kernels for those plus Q3_K/Q4_K/Q5_K/Q6_K (and `Q8_K` activations), persistent thread pool, grouped and fused matvecs, parallel DeltaNet and attention heads, performance-core default on Apple Silicon; `nibble bench`. Still to do: AVX2 K-quant kernels, measured on x86 | Met on the 5600X (Q8_0 tg128 5–16% faster than llama.cpp, BF16 3–8% faster, before the numerics fixes) and on an M4 Max (NEON tg128 faster than llama.cpp b12359 on the CPU on four of the five local files and tied on Qwen3-0.6B Q8_0, at 10 performance cores; output identical to it on 29 of 30 comparison runs) |
 | **5. CUDA backend** | Loader, bindings, memory, fatbin kernels, CUDA graphs, CPU fallback | Same greedy tokens as CPU; decode at least as fast as llama.cpp CUDA on the 3070 Ti |
-| **6. Metal backend** | objc bindings, zero-copy weights, MSL kernels, one command buffer per token | Same greedy tokens as CPU on Apple Silicon; decode at least as fast as llama.cpp Metal |
+| **6. Metal backend** (done) | objc bindings, zero-copy weights (split across buffers past `maxBufferLength`), MSL kernels, a few command buffers per token, every one checked for errors; `qwen3`/`qwen35` on every supported type with the residual, SwiGLU, attention and DeltaNet fusions; attention that reads each cached key and value once per token for all query heads sharing it; `auto` as the default. Left for later: other Apple chips and older macOS versions (untested; `auto` falls back to the CPU and prints why when the backend does not start), fewer dependent steps per token on small models | Same greedy tokens as llama.cpp's Metal path (met: 29/30 short with one 0.001 tie, 7/7 after a long prompt, 12/12 on the 9B files), and as the CPU except at near-ties; decode at least as fast as llama.cpp Metal (met on every local file, flash attention off and on, at an empty context and at 4096 tokens) |
 | **7. Prompt processing** | Batched matmul on every backend (CPU tiles, CUDA tensor cores, Metal simdgroup matrices), chunked DeltaNet, parallel server slots | pp512 within 25% of llama.cpp on each backend |
-| **8. Breadth** | Qwen3.5 2B/4B/9B (check V-head/K-head grouping), IQ4_XS, `llama` and further dense archs, MTP speculative decoding, Vulkan for AMD/Intel. Q3_K/Q4_K/Q5_K/Q6_K already run on the CPU, including the local Q4_K_M and Q3_K_M files | The local 4B/9B `qwen35` files run correctly on every backend |
+| **8. Breadth** | Qwen3.5 2B/4B, `llama` and further dense archs, MTP speculative decoding, Vulkan for AMD/Intel, an AVX2 IQ4_XS kernel. Done: IQ4_XS (CPU and Metal) and the local Qwen3.5-9B UD-Q4_K_XL file, whose 32 value heads share 16 key heads (the grouping matches llama.cpp) | The local 4B/9B `qwen35` files run correctly on every backend |
 | **9. Packaging** | Stable Rust API, C ABI (`cdylib` + header), WASM (simd128, in-memory weights), prebuilt release binaries | — |
 
 ## Validation
@@ -401,6 +475,26 @@ Design rules:
 - **Metal:** `newBufferWithBytesNoCopy` needs a page-aligned pointer and a
   page-multiple length (16 KiB pages on Apple Silicon). Map the whole file and
   round the length up.
+- **Metal barriers dominate small models:** a serial encoder is no faster
+  than concurrent dispatch with barriers, nor are barriers on named
+  buffers, nor device-scope atomics between threadgroups; only fewer
+  dependent stages help. A kernel with a serial loop per thread (attention
+  over every position) or few threadgroups (one per DeltaNet head) costs
+  tens of µs per layer: split such work across threadgroups.
+- **Compare speed at the same depth.** `nibble run` with a long prompt
+  measures past its end, llama-bench `-d` at exactly that depth: use
+  `nibble bench -d N`, which rewinds to the same `N` tokens before each
+  repetition.
+- **Benchmark in the real model.** Microbenchmarks of one layer on the GPU
+  were bimodal between processes (the same kernels measured 81 or 99 µs),
+  and skipping an op to time it overstates its cost. Alternate A/B runs of
+  `nibble bench` were stable to about 1%.
+- **GPU convolution history:** a step must not overwrite a history row that
+  another threadgroup still reads (key heads are shared by several value
+  heads in larger Qwen3.5 models). The history ring has one spare row per
+  layer, `conv_kernel` rows in all, and each step writes the spare.
+- **llama.cpp's `-f` strips one trailing newline** also for GPU runs: add one
+  to prompt files that end with a newline before comparing.
 
 ## Open questions
 

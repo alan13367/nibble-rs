@@ -2,6 +2,7 @@
 
 use nibble_gguf::Gguf;
 
+use crate::backend::{Param, Params};
 use crate::cpu::Weight;
 use crate::error::{Error, Result};
 use crate::quant;
@@ -66,7 +67,7 @@ pub(crate) fn tensor_f32(g: &Gguf<'_>, name: &str, shape: &[usize]) -> Result<Ve
     Ok(out)
 }
 
-/// Reads a 1-D tensor of `len` elements as `f32`.
-pub(crate) fn vector(g: &Gguf<'_>, name: &str, len: usize) -> Result<Vec<f32>> {
-    tensor_f32(g, name, &[len])
+/// Reads a 1-D tensor of `len` elements as `f32` into the parameter arena.
+pub(crate) fn vector(g: &Gguf<'_>, p: &mut Params, name: &str, len: usize) -> Result<Param> {
+    Ok(p.push(&tensor_f32(g, name, &[len])?))
 }
