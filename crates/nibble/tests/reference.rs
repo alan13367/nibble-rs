@@ -480,3 +480,48 @@ fn qwen3_cache_types_match_llama_cpp() {
         assert_eq!(text, expected, "{backend} K {k} V {v}");
     }
 }
+
+/// PrismML's Ternary Bonsai 2.5 27B: a `qwen35` file whose Q2_0 weights
+/// have a Hadamard rotation folded in, with an MTP head (Q4_0). Expected
+/// text from llama.cpp b12722 on the CPU (as above), which its Metal path
+/// (`-ngl 99 -fa off`) also gives; trailing newlines are not compared.
+/// nibble's Metal path and drafting give the same text.
+#[test]
+#[ignore = "needs models/Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf"]
+fn bonsai_q2_0_greedy_matches_llama_cpp() {
+    let model = load_model("Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf");
+    assert!(model.has_mtp());
+    let chat = "<|im_start|>user\nExplain in two sentences why the sky is blue.<|im_end|>\n\
+                <|im_start|>assistant\n<think>\n";
+    let story = "Once upon a time, in a village at the edge of a great forest, there lived an \
+                 old clockmaker named";
+    let cases = [
+        (
+            chat,
+            "The user wants a two-sentence explanation of why the sky is blue. Let me think \
+             about the key physics: sunlight contains all colors (wavelengths), and when it \
+             enters Earth's atmosphere, it interacts with gas molecules. Shorter wavelengths \
+             (blue/violet) scatter more than longer wavelengths (red/orange)",
+        ),
+        (
+            story,
+            " Elias. He had spent his entire life crafting timepieces, and his workshop was \
+             filled with the soft ticking of a hundred clocks, each one a small heartbeat of \
+             the world.\n\nElias was not a man of many words, but he was a man of great \
+             patience. He could sit for hours, adjusting a single",
+        ),
+    ];
+    let mut backends = vec![nibble::BackendKind::Cpu];
+    if cfg!(target_os = "macos") {
+        backends.push(nibble::BackendKind::Metal);
+    }
+    for backend in backends {
+        for (prompt, want) in cases {
+            let (text, _, _) = greedy_on(&model, prompt, 64, backend, 0);
+            assert_eq!(text.trim_end(), want, "{backend}");
+        }
+        let (text, _, stats) = greedy_on(&model, chat, 64, backend, 3);
+        assert_eq!(text.trim_end(), cases[0].1, "{backend}, drafting");
+        assert!(stats.accepted * 3 > stats.drafted, "{backend}: {stats:?}");
+    }
+}

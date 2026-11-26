@@ -12,7 +12,9 @@
 //! Sessions, the CLI and the server never match on architectures.
 
 mod bind;
+mod bonsai;
 mod config;
+mod hadamard;
 mod layers;
 mod qwen3;
 mod qwen35;
@@ -73,6 +75,8 @@ impl std::fmt::Display for Architecture {
 enum Arch {
     Qwen3(qwen3::Qwen3),
     Qwen35(qwen35::Qwen35),
+    /// A `qwen35` file with folded weights (PrismML's Ternary Bonsai).
+    Bonsai(Box<bonsai::Bonsai>),
 }
 
 /// Per-session state of an architecture (KV caches, recurrent state, scratch)
@@ -80,6 +84,7 @@ enum Arch {
 pub(crate) enum State<B: Backend> {
     Qwen3(qwen3::State<B>),
     Qwen35(qwen35::State<B>),
+    Bonsai(bonsai::State<B>),
 }
 
 /// A loaded model: weights (memory-mapped or in memory), tokenizer and config.
@@ -154,7 +159,18 @@ impl Model {
             let mut params = Params::default();
             let p = &mut params;
             let arch = match architecture {
+                // Folded weights would compute wrong results unrotated; only
+                // dense `qwen35` files have a model that rotates them.
+                Architecture::Qwen3 | Architecture::Qwen35Moe if bonsai::is_folded(&g) => {
+                    return Err(Error::InvalidMetadata {
+                        key: "prism.hadamard.version".into(),
+                        reason: format!("folded weights are not supported for {architecture}"),
+                    });
+                }
                 Architecture::Qwen3 => Arch::Qwen3(qwen3::Qwen3::load(&g, &config, p)?),
+                Architecture::Qwen35 if bonsai::is_folded(&g) => {
+                    Arch::Bonsai(Box::new(bonsai::Bonsai::load(&g, &config, p)?))
+                }
                 Architecture::Qwen35 | Architecture::Qwen35Moe => {
                     Arch::Qwen35(qwen35::Qwen35::load(&g, &config, p)?)
                 }
@@ -216,6 +232,7 @@ impl Model {
         match &self.arch {
             Arch::Qwen3(_) => false,
             Arch::Qwen35(m) => m.has_mtp(),
+            Arch::Bonsai(m) => m.has_mtp(),
         }
     }
 
@@ -261,6 +278,7 @@ impl Model {
         Ok(match &self.arch {
             Arch::Qwen3(_) => State::Qwen3(qwen3::Qwen3::new_state(b, c, n_ctx, n_batch)?),
             Arch::Qwen35(m) => State::Qwen35(m.new_state(b, c, n_ctx, n_batch, mtp)?),
+            Arch::Bonsai(m) => State::Bonsai(m.new_state(b, c, n_ctx, n_batch, mtp)?),
         })
     }
 
@@ -277,6 +295,7 @@ impl Model {
         let c = &self.config;
         match (&self.arch, state) {
             (Arch::Qwen35(m), State::Qwen35(s)) => m.draft_chain(b, c, s, token, pos, drafts),
+            (Arch::Bonsai(m), State::Bonsai(s)) => m.draft_chain(b, c, s, token, pos, drafts),
             _ => unreachable!("drafting on a model without an MTP head"),
         }
     }
@@ -297,6 +316,7 @@ impl Model {
         let c = &self.config;
         match (&self.arch, state) {
             (Arch::Qwen35(m), State::Qwen35(s)) => m.draft(b, c, s, token, pos, first, logits),
+            (Arch::Bonsai(m), State::Bonsai(s)) => m.draft(b, c, s, token, pos, first, logits),
             _ => unreachable!("drafting on a model without an MTP head"),
         }
     }
@@ -320,6 +340,7 @@ impl Model {
         match (&self.arch, state) {
             (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(b, c, s, tokens, pos, logits),
             (Arch::Qwen35(m), State::Qwen35(s)) => m.forward(b, c, s, tokens, pos, logits),
+            (Arch::Bonsai(m), State::Bonsai(s)) => m.forward(b, c, s, tokens, pos, logits),
             _ => unreachable!("session state belongs to a different architecture"),
         }
     }
@@ -342,6 +363,7 @@ impl Model {
                 Ok(true)
             }
             State::Qwen35(s) => s.rewind(b, from, to),
+            State::Bonsai(s) => s.base.rewind(b, from, to),
         }
     }
 
@@ -354,19 +376,20 @@ impl Model {
         state: &State<B>,
         snapshot: &mut Option<Snapshot>,
     ) -> Result<bool> {
-        match (&self.arch, state) {
-            (Arch::Qwen35(m), State::Qwen35(s)) => {
-                if let Some(Snapshot::Qwen35(target)) = snapshot {
-                    s.save(b, m.dims(), target)?;
-                } else {
-                    let mut target = qwen35::Snapshot::default();
-                    s.save(b, m.dims(), &mut target)?;
-                    *snapshot = Some(Snapshot::Qwen35(target));
-                }
-                Ok(true)
-            }
-            _ => Ok(false),
+        // A Bonsai model's recurrent state is Qwen3.5's.
+        let (dims, s) = match (&self.arch, state) {
+            (Arch::Qwen35(m), State::Qwen35(s)) => (m.dims(), s),
+            (Arch::Bonsai(m), State::Bonsai(s)) => (m.dims(), &s.base),
+            _ => return Ok(false),
+        };
+        if let Some(Snapshot::Qwen35(target)) = snapshot {
+            s.save(b, dims, target)?;
+        } else {
+            let mut target = qwen35::Snapshot::default();
+            s.save(b, dims, &mut target)?;
+            *snapshot = Some(Snapshot::Qwen35(target));
         }
+        Ok(true)
     }
 
     /// Returns `state` to the moment `snapshot` was taken, `n_pos` tokens
@@ -381,6 +404,9 @@ impl Model {
         match (&self.arch, state, snapshot) {
             (Arch::Qwen35(m), State::Qwen35(s), Snapshot::Qwen35(saved)) => {
                 s.restore(b, m.dims(), saved, n_pos)
+            }
+            (Arch::Bonsai(m), State::Bonsai(s), Snapshot::Qwen35(saved)) => {
+                s.base.restore(b, m.dims(), saved, n_pos)
             }
             _ => unreachable!("snapshot belongs to a different architecture"),
         }

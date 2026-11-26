@@ -13,7 +13,7 @@ use super::{
 };
 use crate::backend::{
     Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvTypes, MAX_LOGIT_ROWS, MAX_PENDING,
-    ModelData, Param, QkNorm,
+    ModelData, Param, QkNorm, Rotation,
 };
 use crate::error::Result;
 
@@ -184,6 +184,40 @@ impl Backend for CpuBackend<'_> {
     fn read_slots(&mut self, out: &mut [u32]) -> Result<()> {
         out.copy_from_slice(&self.slots[..out.len()]);
         Ok(())
+    }
+
+    fn rotate(&mut self, x: &Vec<f32>, r: Rotation, out: &mut Vec<f32>) {
+        let len = r.len;
+        let (x, out) = (&x[..self.n * len], &mut out[..self.n * len]);
+        for (x, out) in x.chunks_exact(len).zip(out.chunks_exact_mut(len)) {
+            match r.heads {
+                Some(h) => {
+                    for (i, &v) in x.iter().enumerate() {
+                        out[h.target(i)] = v;
+                    }
+                }
+                None => out.copy_from_slice(x),
+            }
+            if let Some(signs) = r.signs {
+                for (o, &s) in out.iter_mut().zip(self.param(signs)) {
+                    *o *= s;
+                }
+            }
+        }
+        self.cpu.hadamard(out, r.block);
+    }
+
+    fn unrotate(&mut self, x: &mut Vec<f32>, r: Rotation) {
+        let x = &mut x[..self.n * r.len];
+        self.cpu.hadamard(x, r.block);
+        if let Some(signs) = r.signs {
+            let signs = self.param(signs);
+            for row in x.chunks_exact_mut(r.len) {
+                for (v, &s) in row.iter_mut().zip(signs) {
+                    *v *= s;
+                }
+            }
+        }
     }
 
     fn rmsnorm(&mut self, x: &Vec<f32>, w: Param, eps: f32, out: &mut Vec<f32>) {

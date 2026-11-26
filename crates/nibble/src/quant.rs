@@ -23,6 +23,7 @@ use nibble_gguf::GgmlType;
 pub(crate) mod blocks32;
 pub(crate) mod iq_grids;
 pub(crate) mod iquants;
+pub(crate) mod q2_0;
 
 pub(crate) use blocks32::Q8_1_BLOCK_BYTES;
 
@@ -160,6 +161,7 @@ pub(crate) const SUPPORTED: &[GgmlType] = &[
     GgmlType::Iq3S,
     GgmlType::Iq1S,
     GgmlType::Iq1M,
+    GgmlType::Q2_0,
 ];
 
 /// The formats of 32-weight blocks in [`blocks32`].
@@ -230,6 +232,7 @@ pub(crate) fn dequantize_row(ty: GgmlType, row: &[u8], out: &mut [f32]) {
         GgmlType::Q3K => dequantize_q3_k(row, out),
         GgmlType::Iq4Xs => dequantize_iq4_xs(row, out),
         GgmlType::Q2K => dequantize_q2_k(row, out),
+        GgmlType::Q2_0 => q2_0::dequantize(row, out),
         ty if is_block32(ty) => blocks32::dequantize(ty, row, out),
         ty if is_codebook(ty) => iquants::dequantize(ty, row, out),
         other => unreachable!("dequantize_row called with unsupported type {other}"),
@@ -268,7 +271,8 @@ impl DotType {
             | GgmlType::Q4_0
             | GgmlType::Q5_0
             | GgmlType::Iq4Nl
-            | GgmlType::Mxfp4 => Self::Q8_0,
+            | GgmlType::Mxfp4
+            | GgmlType::Q2_0 => Self::Q8_0,
             GgmlType::Q4_1 | GgmlType::Q5_1 => Self::Q8_1,
             GgmlType::Q2K
             | GgmlType::Q3K
@@ -415,6 +419,7 @@ pub(crate) fn dot_row(ty: GgmlType, row: &[u8], xq: &[u8]) -> f32 {
         GgmlType::Q3K => dot_q3_k(row, xq),
         GgmlType::Iq4Xs => dot_iq4_xs(row, xq),
         GgmlType::Q2K => dot_q2_k(row, xq),
+        GgmlType::Q2_0 => q2_0::dot_row(row, xq),
         ty if is_block32(ty) => blocks32::dot_row(ty, row, xq),
         ty if is_codebook(ty) => iquants::dot_row(ty, row, xq),
         other => unreachable!("dot_row called with unsupported type {other}"),
@@ -1504,14 +1509,14 @@ mod tests {
     /// `IQ4_XS` quantizer to compare with): the dequantized rows with exact
     /// and rounding scales, and four dots with a `Q8_K` activation.
     /// The formats added after the K-quants against llama.cpp b12722's
-    /// `libggml-cpu` on this generator's rows (`k_row`, 25 blocks of 32 or 3
-    /// of 256 weights): the hash of `to_float` of seed 20's row, the hash of
+    /// `libggml-cpu` on this generator's rows (`k_row`, 25 blocks of 32 or 64,
+    /// or 3 of 256 weights): the hash of `to_float` of seed 20's row, the hash of
     /// the encoded activation `values(n, 3)`, and the NEON `vec_dot` of seeds
     /// 10..14 with it, bit for bit.
     #[test]
     fn other_formats_match_ggml() {
         #[rustfmt::skip]
-        let cases: [(GgmlType, usize, u64, u64, [u32; 4]); 14] = [
+        let cases: [(GgmlType, usize, u64, u64, [u32; 4]); 15] = [
             (GgmlType::Q4_0, 800, 0x1ee9d9faac8153da, 0x5e0b1604af85b5d4, [0x40e71b06, 0xc074d6fc, 0xc07dd5d5, 0x408233b7]),
             (GgmlType::Q4_1, 800, 0xeb924466f8bd6817, 0x3e3d3596683bccaf, [0xc090eb64, 0x4084df68, 0xc0da5d3f, 0xc1226862]),
             (GgmlType::Q5_0, 800, 0x032b143f6889f3fc, 0x5e0b1604af85b5d4, [0x403aa6ee, 0xbfbae96a, 0xbfefe64e, 0x410a971e]),
@@ -1526,6 +1531,7 @@ mod tests {
             (GgmlType::Iq3S, 768, 0x966c8c20d9dbae6b, 0xc1a464cbf99c8d6a, [0xc33c1d55, 0x40278b27, 0xc2b6606b, 0x431c334e]),
             (GgmlType::Iq1S, 768, 0xce25648b91356315, 0xc1a464cbf99c8d6a, [0x415876cf, 0xc06bc0eb, 0x40121ce0, 0x411472ab]),
             (GgmlType::Iq1M, 768, 0x36896040413b36af, 0xc1a464cbf99c8d6a, [0xc0c277ee, 0x403b7f66, 0x41040252, 0xc12b73b4]),
+            (GgmlType::Q2_0, 1600, 0x8cea794ddae39871, 0xac8a4648015d1b10, [0xc03d7c5b, 0xc04fe646, 0xbec05c0e, 0xc04f20de]),
         ];
         for (ty, n, deq_hash, xq_hash, dots) in cases {
             let blocks = n / ty.layout().unwrap().block_size as usize;

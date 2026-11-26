@@ -90,6 +90,10 @@ kernel_args! {
     /// Decode row `row` of a matrix.
     struct EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     struct RmsArgs { n: u32, eps: f32 }
+    /// A Hadamard rotation of rows (`rotate`).
+    struct RotateArgs {
+        len: u32, block: u32, signs: u32, head_dim: u32, n_k: u32, rep: u32, inverse: u32,
+    }
     /// The experts of a slot (`MoeArgs` in `shaders/common.metal`).
     struct MoeArgs { k: u32, per_slot: u32, expert_rows: u32, count: u32 }
     struct RouteArgs { n_expert: u32, k: u32 }
@@ -234,6 +238,7 @@ const MATVECS: &[MatvecSpec] = &[
     (GgmlType::Iq4Nl, "matvec_iq4_nl", Some(2), 2, true, 32 * 4),
     (GgmlType::Mxfp4, "matvec_mxfp4", Some(2), 2, true, 32 * 4),
     (GgmlType::Q2K, "matvec_q2_K", Some(2), 4, true, 0),
+    (GgmlType::Q2_0, "matvec_q2_0", Some(2), 8, true, 0),
     // The codebooks some kernels copy to threadgroup memory: 256 or 512
     // grid entries and the 128 sign bytes.
     (GgmlType::Iq2Xxs, "matvec_iq2_xxs", Some(2), 4, true, 256 * 8 + 128),
@@ -251,6 +256,7 @@ const MATMULS: &[(GgmlType, &str)] = &[
     (GgmlType::F32, "matmul_f32"),
     (GgmlType::F16, "matmul_f16"),
     (GgmlType::Bf16, "matmul_bf16"),
+    (GgmlType::Q2_0, "matmul_q2_0"),
     (GgmlType::Q4_0, "matmul_q4_0"),
     (GgmlType::Q4_1, "matmul_q4_1"),
     (GgmlType::Q5_0, "matmul_q5_0"),
@@ -299,6 +305,7 @@ const EMBEDS: &[(GgmlType, &str, usize)] = &[
     (GgmlType::Iq4Nl, "embed_iq4_nl", 32),
     (GgmlType::Mxfp4, "embed_mxfp4", 32),
     (GgmlType::Q2K, "embed_q2_K", 8),
+    (GgmlType::Q2_0, "embed_q2_0", 64),
     (GgmlType::Iq2Xxs, "embed_iq2_xxs", 8),
     (GgmlType::Iq2Xs, "embed_iq2_xs", 8),
     (GgmlType::Iq2S, "embed_iq2_s", 8),
@@ -379,6 +386,7 @@ pub(crate) struct Pipelines {
     matmuls: Vec<(GgmlType, Pipeline, Pipeline)>,
     embeds: Vec<(GgmlType, Pipeline, usize)>,
     pub(crate) rmsnorm: Pipeline,
+    pub(crate) rotate: Pipeline,
     pub(crate) swiglu: Pipeline,
     pub(crate) copy: Pipeline,
     pub(crate) argmax: Pipeline,
@@ -446,6 +454,7 @@ impl Pipelines {
             matmuls,
             embeds,
             rmsnorm: get("rmsnorm")?,
+            rotate: get("rotate")?,
             swiglu: get("swiglu")?,
             copy: get("copy_f32")?,
             argmax: get("argmax")?,

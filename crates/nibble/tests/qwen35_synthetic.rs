@@ -1,9 +1,10 @@
 //! End-to-end tests on a tiny random Qwen3.5 model built in memory: one
 //! Gated DeltaNet layer, one gated attention layer and an MTP head, checked
-//! against an independent f64 implementation over whole sequences; and the
-//! same model with mixture-of-experts feed-forwards (`qwen35moe`).
+//! against an independent f64 implementation over whole sequences; the
+//! same model with mixture-of-experts feed-forwards (`qwen35moe`); and with
+//! a Hadamard rotation folded into its weights (`prism.hadamard`).
 
-use nibble::gguf::{GgmlType, GgufWriter, Storage};
+use nibble::gguf::{GgmlType, GgufWriter, OwnedValue, Storage, ValueType};
 use nibble::sampler::{Sampler, SamplerConfig};
 use nibble::{Architecture, Model, SessionOptions, StopReason};
 
@@ -208,6 +209,98 @@ struct Weights {
     dn: DeltaNet,
     attn: Attention,
     mtp: Mtp,
+    /// The folding of the weights, for a folded model.
+    prism: Option<Prism>,
+}
+
+/// The block of the folded model's Hadamard transform: it divides every
+/// width a folded weight reads (32 and 48).
+const FOLD_BLOCK: usize = 16;
+
+/// How a model is folded: the `prism.hadamard` options.
+#[derive(Clone, Copy, Debug)]
+struct FoldMode {
+    /// Version 2: the output head is the token embedding (stored rotated);
+    /// else version 1, with an `output.weight` of its own.
+    tied: bool,
+    /// Explicit signs (`sign_mode = "explicit"`), else none (`"identity"`).
+    explicit: bool,
+    /// `gdn_v_grouped`: `ssm_out` was folded with its value heads grouped.
+    grouped: bool,
+}
+
+impl FoldMode {
+    /// PrismML's Ternary Bonsai files: version 1, explicit signs, grouped heads.
+    const PRISM: Self = Self {
+        tied: false,
+        explicit: true,
+        grouped: true,
+    };
+    const ALL: [Self; 3] = [
+        Self::PRISM,
+        Self {
+            tied: true,
+            explicit: true,
+            grouped: true,
+        },
+        Self {
+            tied: false,
+            explicit: false,
+            grouped: false,
+        },
+    ];
+}
+
+/// The `prism.hadamard` metadata of a folded model.
+struct Prism {
+    mode: FoldMode,
+    /// The ±1 signs for each input width (all +1 without explicit signs).
+    signs: Vec<(usize, Vec<f32>)>,
+    names: Vec<String>,
+}
+
+/// `H · (D · P x)` in f64, with `P` the DeltaNet head order `(head size,
+/// key heads, repeats)` if given: what a folded weight's input goes through,
+/// and so how its rows are folded (`W · x = (W P' D H) · (H D P x)`, and row
+/// `r` of `W P' D H` is `H D P w_r`).
+fn fold(x: &[f64], signs: &[f32], heads: Option<(usize, usize, usize)>) -> Vec<f64> {
+    let mut y = vec![0.0; x.len()];
+    for (i, &v) in x.iter().enumerate() {
+        let at = match heads {
+            // Value head `k + n_k r` goes to place `r + rep k`.
+            Some((hd, nk, rep)) => i % hd + hd * (i / hd / nk + rep * (i / hd % nk)),
+            None => i,
+        };
+        y[at] = v;
+    }
+    for (v, &s) in y.iter_mut().zip(signs) {
+        *v *= f64::from(s);
+    }
+    for block in y.as_chunks_mut::<FOLD_BLOCK>().0 {
+        let mut len = 1;
+        while len < FOLD_BLOCK {
+            for pair in block.chunks_exact_mut(2 * len) {
+                let (lo, hi) = pair.split_at_mut(len);
+                for (a, b) in lo.iter_mut().zip(hi) {
+                    (*a, *b) = (*a + *b, *a - *b);
+                }
+            }
+            len *= 2;
+        }
+        let scale = 1.0 / (FOLD_BLOCK as f64).sqrt();
+        block.iter_mut().for_each(|v| *v *= scale);
+    }
+    y
+}
+
+/// Replaces each row of `cols` values of `m` with its [`fold`].
+fn fold_rows(m: &mut [f32], cols: usize, signs: &[f32], heads: Option<(usize, usize, usize)>) {
+    for row in m.chunks_exact_mut(cols) {
+        let x: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+        for (o, v) in row.iter_mut().zip(fold(&x, signs, heads)) {
+            *o = v as f32;
+        }
+    }
 }
 
 /// An attention layer's cached keys and values, by position.
@@ -419,7 +512,70 @@ impl Weights {
             attn,
             mtp,
             vocab,
+            prism: None,
         }
+    }
+
+    /// The model folded as PrismML's files are ([`Weights::folded_as`]).
+    fn folded() -> Self {
+        Self::folded_as(FoldMode::PRISM)
+    }
+
+    /// The same model with a rotation folded into the weights llama.cpp
+    /// folds (those of the trunk, as in PrismML's files) and the token
+    /// embedding stored rotated, which with `mode.tied` is also the output
+    /// head (else `output.weight` holds the same rows). Its logits are those
+    /// of [`Weights::new`].
+    fn folded_as(mode: FoldMode) -> Self {
+        let mut w = Self::new();
+        let mut rng = Rng(0x5167_0001);
+        let mut signs = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    if mode.explicit && rng.next() < 0.0 {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+                })
+                .collect()
+        };
+        let (e, ff) = (signs(N_EMBD), signs(N_FF));
+        let mut names = Vec::new();
+        let dn = &mut w.dn;
+        fold_rows(&mut dn.qkv, N_EMBD, &e, None);
+        fold_rows(&mut dn.gate, N_EMBD, &e, None);
+        // Value heads are 8 long, two key heads, two value heads each.
+        let heads = mode.grouped.then_some((D, N_K, N_V / N_K));
+        fold_rows(&mut dn.out, VALUE_DIM, &e, heads);
+        names.extend(["attn_qkv", "attn_gate", "ssm_out"].map(|n| format!("blk.0.{n}.weight")));
+        let at = &mut w.attn;
+        for m in [&mut at.wq, &mut at.wk, &mut at.wv] {
+            fold_rows(m, N_EMBD, &e, None);
+        }
+        fold_rows(&mut at.wo, N_HEAD * HEAD_DIM, &e, None);
+        names.extend(
+            ["attn_q", "attn_k", "attn_v", "attn_output"].map(|n| format!("blk.1.{n}.weight")),
+        );
+        for (layer, ffn) in [(0, &mut w.dn.ffn), (1, &mut w.attn.ffn)] {
+            fold_rows(&mut ffn.gate, N_EMBD, &e, None);
+            fold_rows(&mut ffn.up, N_EMBD, &e, None);
+            fold_rows(&mut ffn.down, N_FF, &ff, None);
+            names.extend(
+                ["ffn_gate", "ffn_up", "ffn_down"].map(|n| format!("blk.{layer}.{n}.weight")),
+            );
+        }
+        // Latent rows `z = H D e`, so that `D H z = e` and `z · (H D x) = e · x`.
+        fold_rows(&mut w.embd, N_EMBD, &e, None);
+        if !mode.tied {
+            names.push("output.weight".to_owned());
+        }
+        w.prism = Some(Prism {
+            mode,
+            signs: vec![(N_EMBD, e), (N_FF, ff)],
+            names,
+        });
+        w
     }
 
     /// The same model with mixture-of-experts feed-forwards, the MTP head's included.
@@ -475,6 +631,53 @@ impl Weights {
             w.add(key("feed_forward_length"), N_FF as u32);
         }
         add_tokenizer(&mut w, &self.vocab, "qwen35");
+        if let Some(p) = &self.prism {
+            let key = |k: &str| format!("prism.hadamard.{k}");
+            let widths: Vec<i32> = p.signs.iter().map(|(n, _)| *n as i32).collect();
+            let values: Vec<i32> = p
+                .signs
+                .iter()
+                .flat_map(|(_, s)| s.iter().map(|&v| v as i32))
+                .collect();
+            let names = p.names.iter().map(String::as_str);
+            let m = p.mode;
+            w.add(key("version"), if m.tied { 2u32 } else { 1 })
+                .add(key("tied_output"), m.tied)
+                .add(key("block_size"), FOLD_BLOCK as u32)
+                .add(key("transform"), "normalized-sylvester-walsh-hadamard")
+                .add(key("axis"), "input-last-dimension")
+                .add(
+                    key("weight_names"),
+                    OwnedValue::array(ValueType::String, names),
+                )
+                .add(
+                    key("inverse_weight_names"),
+                    OwnedValue::array(ValueType::String, ["token_embd.weight"]),
+                )
+                .add(key("gdn_v_grouped"), m.grouped);
+            if m.explicit {
+                w.add(key("sign_mode"), "explicit")
+                    .add(
+                        key("sign_widths"),
+                        OwnedValue::array(ValueType::I32, widths),
+                    )
+                    .add(
+                        key("sign_values"),
+                        OwnedValue::array(ValueType::I32, values),
+                    );
+            } else {
+                w.add(key("sign_mode"), "identity");
+            }
+            if !m.tied {
+                // The rotated embedding's rows, a head of its own.
+                w.add_tensor(
+                    "output.weight",
+                    GgmlType::F32,
+                    &[e, self.vocab.len() as u64],
+                    f32_bytes(&self.embd),
+                );
+            }
+        }
         w.add_tensor(
             "token_embd.weight",
             GgmlType::F32,
@@ -778,12 +981,27 @@ fn truncate_replays_recurrent_state() {
 /// the checkpoint taken there spares the replay of everything before it.
 #[test]
 fn checkpoints_spare_most_of_the_replay() {
+    let model = Weights::new().model();
+    assert_checkpoints_spare_most_of_the_replay(&model, nibble::BackendKind::Cpu);
+}
+
+fn assert_checkpoints_spare_most_of_the_replay(model: &Model, backend: nibble::BackendKind) {
     use nibble::CHECKPOINT_TAIL;
 
-    let model = Weights::new().model();
+    let options = SessionOptions {
+        n_ctx: 32,
+        threads: 2,
+        backend,
+        n_batch: 0,
+        draft_max: 0,
+        ..Default::default()
+    };
+    let Some(mut s) = common::session_or_skip(model, options) else {
+        return;
+    };
+    let session = || model.session(options).unwrap();
     let prompt = [17u32, 99, 258, 3, 200, 65, 66, 5, 9];
     let checkpoint = prompt.len() - CHECKPOINT_TAIL;
-    let mut s = session(&model);
     s.eval(&prompt).unwrap();
 
     // The tokens after the checkpoint were the last batch, short enough to
@@ -791,21 +1009,21 @@ fn checkpoints_spare_most_of_the_replay() {
     let keep = checkpoint + 2;
     assert_eq!(s.truncate(keep).unwrap(), 0);
     let after = s.eval(&[1, 2]).unwrap().to_vec();
-    let mut fresh = session(&model);
+    let mut fresh = session();
     let expected: Vec<u32> = prompt[..keep].iter().copied().chain([1, 2]).collect();
     assert_eq!(fresh.eval(&expected).unwrap(), &after[..]);
 
     // Exactly at the checkpoint nothing is replayed.
     assert_eq!(s.truncate(checkpoint).unwrap(), 0);
     let at = s.eval(&[7]).unwrap().to_vec();
-    let mut fresh = session(&model);
+    let mut fresh = session();
     let expected: Vec<u32> = prompt[..checkpoint].iter().copied().chain([7]).collect();
     assert_eq!(fresh.eval(&expected).unwrap(), &at[..]);
 
     // Before every checkpoint, the whole prefix is replayed.
     assert_eq!(s.truncate(3).unwrap(), 3);
     let early = s.eval(&[4]).unwrap().to_vec();
-    assert_eq!(session(&model).eval(&[17, 99, 258, 4]).unwrap(), &early[..]);
+    assert_eq!(session().eval(&[17, 99, 258, 4]).unwrap(), &early[..]);
 }
 
 #[test]
@@ -868,6 +1086,87 @@ fn short_evaluations_rewind_without_replay() {
     for backend in [nibble::BackendKind::Cpu, nibble::BackendKind::Metal] {
         common::assert_rewinds_into_short_batches(&model, backend, N_CTX, &tokens);
     }
+}
+
+/// A model with a Hadamard rotation folded into its weights gives the
+/// logits of the model it was folded from, on both backends, for the trunk
+/// and the MTP head (which reads the rotated embedding and the folded
+/// output head), one token at a time and in batches.
+#[test]
+fn folded_model_matches_the_unfolded_reference() {
+    for mode in FoldMode::ALL {
+        let model = Weights::folded_as(mode).model();
+        assert_eq!(model.config().tied_embeddings, mode.tied, "{mode:?}");
+        assert_folded_model_matches(&model);
+    }
+}
+
+fn assert_folded_model_matches(model: &Model) {
+    let w = Weights::new();
+    let tokens = [17u32, 99, 258, 3, 200, 65, 66];
+    for backend in BACKENDS {
+        let Some(mut s) = drafting(model, backend, N_CTX, 0) else {
+            continue;
+        };
+        for n in [1, 2, tokens.len()] {
+            s.clear().unwrap();
+            let logits = s.eval(&tokens[..n]).unwrap();
+            assert_close(logits, &w.reference_logits(&tokens[..n]), 3e-3);
+        }
+        let next = [5u32, 77, 140];
+        for n in 1..=next.len() {
+            let got = s.draft_logits(&next[..n]).unwrap();
+            assert_close(got, &w.reference_draft(&tokens, &next[..n]), 3e-3);
+        }
+    }
+    let n_vocab = model.config().n_vocab as u32;
+    let long: Vec<u32> = (0..23u32).map(|i| (i * 37 + 11) % n_vocab).collect();
+    for backend in BACKENDS {
+        common::assert_batches_match_steps(model, backend, N_CTX, &long, 9);
+    }
+}
+
+/// The folded model's drafting (chosen on the device when greedy) and its
+/// checkpoints, on both backends.
+#[test]
+fn folded_model_drafts_and_rewinds() {
+    let model = Weights::folded().model();
+    assert_drafting_does_not_change_generation(&model);
+    for backend in BACKENDS {
+        assert_checkpoints_spare_most_of_the_replay(&model, backend);
+    }
+}
+
+/// A file that folds a weight nibble multiplies without the rotation (here
+/// `ssm_beta`, which llama.cpp does not fold either), or that lists a weight
+/// it does not have, is refused rather than computed wrongly.
+#[test]
+fn folded_weights_must_be_on_rotating_products() {
+    for name in ["blk.0.ssm_beta.weight", "blk.7.ffn_up.weight"] {
+        let mut w = Weights::folded();
+        w.prism.as_mut().unwrap().names.push(name.to_owned());
+        let err = Model::from_storage(Storage::from_bytes(&w.gguf())).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                nibble::Error::InvalidMetadata { .. } | nibble::Error::MissingTensor(_)
+            ),
+            "{name}: {err}"
+        );
+    }
+    // Folded mixture-of-experts files are refused before their weights load.
+    let mut moe = Weights::moe();
+    moe.prism = Weights::folded().prism;
+    let err = Model::from_storage(Storage::from_bytes(&moe.gguf())).unwrap_err();
+    assert!(err.to_string().contains("prism.hadamard.version"), "{err}");
+    // Folding only some of the weights that read one input.
+    let mut w = Weights::folded();
+    w.prism
+        .as_mut()
+        .unwrap()
+        .names
+        .retain(|n| n != "blk.1.attn_k.weight");
+    assert!(Model::from_storage(Storage::from_bytes(&w.gguf())).is_err());
 }
 
 fn drafting(
@@ -987,7 +1286,10 @@ fn a_head_without_tensors_is_ignored() {
 /// stopping.
 #[test]
 fn drafting_does_not_change_generation() {
-    let model = Weights::new().model();
+    assert_drafting_does_not_change_generation(&Weights::new().model());
+}
+
+fn assert_drafting_does_not_change_generation(model: &Model) {
     let prompt = [10u32, 20, 30, 40, 50];
     let configs = [
         SamplerConfig::greedy(),
@@ -1018,7 +1320,7 @@ fn drafting_does_not_change_generation() {
                         draft_max,
                         ..Default::default()
                     };
-                    let mut s = common::session_or_skip(&model, options)?;
+                    let mut s = common::session_or_skip(model, options)?;
                     let mut sampler = Sampler::new(*config);
                     let mut out = Vec::new();
                     let stop = s

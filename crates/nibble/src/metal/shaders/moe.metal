@@ -405,6 +405,7 @@ kernel void name( \
 MATMUL_ID_KERNEL(matmul_f32_id,     half,   float4x4,      1,     dequantize_f32)
 MATMUL_ID_KERNEL(matmul_f16_id,     half,   half4x4,       1,     dequantize_f16)
 MATMUL_ID_KERNEL(matmul_bf16_id,    bfloat, bfloat4x4,     1,     dequantize_bf16)
+MATMUL_ID_KERNEL(matmul_q2_0_id,    half,   block_q2_0,    4,     dequantize_q2_0)
 MATMUL_ID_KERNEL(matmul_q4_0_id,    half,   block_q4_0,    2,     dequantize_q4_0)
 MATMUL_ID_KERNEL(matmul_q4_1_id,    half,   block_q4_1,    2,     dequantize_q4_1)
 MATMUL_ID_KERNEL(matmul_q5_0_id,    half,   block_q5_0,    2,     dequantize_q5_0)

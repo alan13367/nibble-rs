@@ -86,6 +86,22 @@ void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
+// ggml-metal's `dequantize_q2_0`: weights `16 il..16 il + 16`.
+template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs;
+    const float d = xb->d;
+    float4x4 reg_f;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t b = qs[il * 4 + i];
+        reg_f[i][0] = ((float) ((b >> 0) & 3) - 1.0f) * d;
+        reg_f[i][1] = ((float) ((b >> 2) & 3) - 1.0f) * d;
+        reg_f[i][2] = ((float) ((b >> 4) & 3) - 1.0f) * d;
+        reg_f[i][3] = ((float) ((b >> 6) & 3) - 1.0f) * d;
+    }
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 2);
@@ -656,6 +672,7 @@ kernel void name( \
 MATMUL_KERNEL(matmul_f32,     half,   float4x4,      1,     dequantize_f32)
 MATMUL_KERNEL(matmul_f16,     half,   half4x4,       1,     dequantize_f16)
 MATMUL_KERNEL(matmul_bf16,    bfloat, bfloat4x4,     1,     dequantize_bf16)
+MATMUL_KERNEL(matmul_q2_0,    half,   block_q2_0,    4,     dequantize_q2_0)
 MATMUL_KERNEL(matmul_q4_0,    half,   block_q4_0,    2,     dequantize_q4_0)
 MATMUL_KERNEL(matmul_q4_1,    half,   block_q4_1,    2,     dequantize_q4_1)
 MATMUL_KERNEL(matmul_q5_0,    half,   block_q5_0,    2,     dequantize_q5_0)

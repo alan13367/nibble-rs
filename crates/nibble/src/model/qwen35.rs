@@ -2,7 +2,9 @@
 //! with every `full_attention_interval`-th layer a gated full-attention layer.
 //!
 //! Follows llama.cpp's `src/models/qwen35.cpp` and the CPU op
-//! `ggml_compute_forward_gated_delta_net`.
+//! `ggml_compute_forward_gated_delta_net`. `bonsai.rs` runs these weights
+//! and state with rotated inputs in its own copy of the forward pass, the
+//! drafting and the MTP head: a change to those here belongs there too.
 //!
 //! ```text
 //! x = token_embd[token]
@@ -45,70 +47,70 @@ use crate::cpu::Weight;
 use crate::error::Result;
 
 pub(crate) struct Qwen35 {
-    head: Head,
-    blocks: Vec<Block>,
-    dims: DeltaNetDims,
+    pub(super) head: Head,
+    pub(super) blocks: Vec<Block>,
+    pub(super) dims: DeltaNetDims,
     /// The sizes of the mixture-of-experts feed-forwards (`qwen35moe`).
-    moe: Option<MoeDims>,
+    pub(super) moe: Option<MoeDims>,
     /// Boxed: most models have none, and it is several weights big.
-    mtp: Option<Box<Mtp>>,
+    pub(super) mtp: Option<Box<Mtp>>,
 }
 
 /// The multi-token-prediction (NextN) head after the trunk, which drafts
 /// the token after next from the trunk's hidden state and the next token
 /// (llama.cpp's `graph_mtp`).
-struct Mtp {
+pub(super) struct Mtp {
     /// `[2 · n_embd, n_embd]`: the normalized embedding and hidden state, side by side.
-    eh_proj: Weight,
-    enorm: Param,
-    hnorm: Param,
+    pub(super) eh_proj: Weight,
+    pub(super) enorm: Param,
+    pub(super) hnorm: Param,
     /// `nextn.embed_tokens`, or the trunk's token embeddings.
-    embed: Weight,
-    attn_norm: Param,
-    attn: GatedAttention,
-    post_attention_norm: Param,
-    ffn: Ffn,
+    pub(super) embed: Weight,
+    pub(super) attn_norm: Param,
+    pub(super) attn: GatedAttention,
+    pub(super) post_attention_norm: Param,
+    pub(super) ffn: Ffn,
     /// `nextn.shared_head_norm`, or the trunk's output norm.
-    head_norm: Param,
+    pub(super) head_norm: Param,
     /// `nextn.shared_head_head`, or the trunk's output projection.
-    head: Weight,
+    pub(super) head: Weight,
 }
 
-struct Block {
-    attn_norm: Param,
-    mixer: Mixer,
-    post_attention_norm: Param,
-    ffn: Ffn,
+pub(super) struct Block {
+    pub(super) attn_norm: Param,
+    pub(super) mixer: Mixer,
+    pub(super) post_attention_norm: Param,
+    pub(super) ffn: Ffn,
 }
 
-enum Mixer {
+pub(super) enum Mixer {
     DeltaNet(DeltaNet),
     Attention(GatedAttention),
 }
 
-struct DeltaNet {
+pub(super) struct DeltaNet {
     /// `[n_embd, conv_dim]`: q, k and v before the convolution.
-    qkv: Weight,
+    pub(super) qkv: Weight,
     /// `[n_embd, value_dim]`: the output gate z.
-    gate: Weight,
-    beta: Weight,
-    alpha: Weight,
+    pub(super) gate: Weight,
+    pub(super) beta: Weight,
+    pub(super) alpha: Weight,
     /// The convolution taps are by time: the file stores each channel's
     /// taps together, and transposing them once lets the step vectorize
     /// across channels. `a` is `-exp(A_log)`, as stored by the converter.
-    params: DeltaNetParams,
-    out: Weight,
-    dims: DeltaNetDims,
+    pub(super) params: DeltaNetParams,
+    pub(super) out: Weight,
+    pub(super) dims: DeltaNetDims,
 }
 
-struct GatedAttention {
+pub(super) struct GatedAttention {
     /// `[n_embd, 2 · n_head · head_dim]`: per head, the query then its gate.
-    wq: Weight,
-    wk: Weight,
-    wv: Weight,
-    wo: Weight,
-    q_norm: Param,
-    k_norm: Param,
+    pub(super) wq: Weight,
+    pub(super) wk: Weight,
+    pub(super) wv: Weight,
+    pub(super) wo: Weight,
+    pub(super) q_norm: Param,
+    pub(super) k_norm: Param,
 }
 
 impl Qwen35 {
@@ -670,41 +672,41 @@ impl GatedAttention {
 
 /// Per-session state: DeltaNet recurrent state or a KV cache per layer, plus scratch.
 pub(crate) struct State<B: Backend> {
-    layers: Vec<LayerState<B>>,
-    scratch: Scratch<B>,
-    ffn: FfnBuffers<B>,
-    dn: DeltaNetBuffers<B>,
-    attn: AttentionBuffers<B>,
+    pub(super) layers: Vec<LayerState<B>>,
+    pub(super) scratch: Scratch<B>,
+    pub(super) ffn: FfnBuffers<B>,
+    pub(super) dn: DeltaNetBuffers<B>,
+    pub(super) attn: AttentionBuffers<B>,
     /// The MTP head's state, when the session drafts with it.
-    mtp: Option<MtpState<B>>,
+    pub(super) mtp: Option<MtpState<B>>,
 }
 
 /// The MTP head's KV cache and buffers (its attention and feed-forward
 /// borrow the trunk's, which are free between the trunk's batches).
-struct MtpState<B: Backend> {
-    cache: B::KvCache,
+pub(super) struct MtpState<B: Backend> {
+    pub(super) cache: B::KvCache,
     /// The head's residual stream and its normalized output.
-    scratch: Scratch<B>,
-    embd: B::Vector,
+    pub(super) scratch: Scratch<B>,
+    pub(super) embd: B::Vector,
     /// The hidden state each token of the last catch-up was paired with:
     /// row `r` is the trunk's at the position before token `r`.
-    h: B::Vector,
+    pub(super) h: B::Vector,
     /// Each token's normalized embedding and hidden state, side by side.
-    pair: B::Vector,
+    pub(super) pair: B::Vector,
     /// The trunk's hidden state at the last position, which the next token
     /// pairs with.
-    last_h: B::Vector,
+    pub(super) last_h: B::Vector,
     /// The head's output at the last draft step, which the next draft token
     /// pairs with.
-    draft_h: B::Vector,
+    pub(super) draft_h: B::Vector,
     /// The positions of the last catch-up.
-    batch: Range<usize>,
-    n_embd: usize,
+    pub(super) batch: Range<usize>,
+    pub(super) n_embd: usize,
     /// The logits of a draft step chained on the device.
-    logits: B::Vector,
+    pub(super) logits: B::Vector,
 }
 
-enum LayerState<B: Backend> {
+pub(super) enum LayerState<B: Backend> {
     DeltaNet(DeltaNetState<B::Vector>),
     Attention(B::KvCache),
 }
@@ -851,23 +853,23 @@ impl<B: Backend> State<B> {
     }
 }
 
-struct DeltaNetBuffers<B: Backend> {
+pub(super) struct DeltaNetBuffers<B: Backend> {
     /// q, k and v as projected.
-    qkv: B::Vector,
+    pub(super) qkv: B::Vector,
     /// q, k and v after the convolution.
-    conv: B::Vector,
-    z: B::Vector,
+    pub(super) conv: B::Vector,
+    pub(super) z: B::Vector,
     /// `ssm_beta · h`, then `sigmoid` of it.
-    beta: B::Vector,
+    pub(super) beta: B::Vector,
     /// `ssm_alpha · h`, then the decay `exp(g)`.
-    alpha: B::Vector,
-    o: B::Vector,
+    pub(super) alpha: B::Vector,
+    pub(super) o: B::Vector,
 }
 
-struct AttentionBuffers<B: Backend> {
+pub(super) struct AttentionBuffers<B: Backend> {
     /// Per head, the query then its gate.
-    qg: B::Vector,
-    k: B::Vector,
-    v: B::Vector,
-    att: B::Vector,
+    pub(super) qg: B::Vector,
+    pub(super) k: B::Vector,
+    pub(super) v: B::Vector,
+    pub(super) att: B::Vector,
 }

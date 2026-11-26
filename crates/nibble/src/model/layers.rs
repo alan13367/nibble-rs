@@ -195,18 +195,18 @@ impl Attention {
 
 /// SwiGLU feed-forward: `ffn_down · (silu(ffn_gate · x) * (ffn_up · x))`.
 pub(crate) struct SwiGlu {
-    gate: Weight,
-    up: Weight,
-    down: Weight,
+    pub(super) gate: Weight,
+    pub(super) up: Weight,
+    pub(super) down: Weight,
 }
 
 /// Buffers for [`SwiGlu::forward`].
 pub(crate) struct FfnBuffers<B: Backend> {
     /// `silu(gate · x) * (up · x)`.
-    hidden: B::Vector,
-    up: B::Vector,
+    pub(super) hidden: B::Vector,
+    pub(super) up: B::Vector,
     /// A mixture of experts' buffers, for models that have one.
-    moe: Option<MoeBuffers<B>>,
+    pub(super) moe: Option<MoeBuffers<B>>,
 }
 
 impl<B: Backend> FfnBuffers<B> {

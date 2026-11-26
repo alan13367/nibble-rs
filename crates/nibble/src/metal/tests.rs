@@ -10,7 +10,8 @@ use super::kernels::{EmbedArgs, Pipelines};
 use super::weights::Weights;
 use super::{MetalBackend, Output, Size, encode_matmul, encode_matvec, load, store};
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, ModelData, Params, QkNorm,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, HeadOrder, ModelData, Params, QkNorm,
+    Rotation,
 };
 use crate::cpu::{CpuBackend, Weight};
 use crate::model::{Architecture, ModelConfig};
@@ -307,6 +308,100 @@ fn embed_matches_dequantize() {
                     "{ty} row {row} value {i}: got {g}, expected {e}"
                 );
             }
+        }
+    }
+}
+
+/// `rotate` and `unrotate` give the CPU backend's results bit for bit, for
+/// blocks of 1 and of 64 to 2048 values, with and without signs and head
+/// order.
+#[test]
+fn rotate_matches_the_cpu_backend() {
+    if gpu().is_none() {
+        return;
+    }
+    let config = attention_config(4, 4, 64, 64);
+    let n = 3;
+    // (block, head size, key heads, repeats): rows of `hd * nk * rep` values.
+    let cases = [
+        (1, 4, 2, 2),
+        (64, 64, 2, 3),
+        (128, 32, 4, 2),
+        (256, 128, 2, 3),
+        (512, 128, 4, 3),
+        (1024, 128, 16, 3),
+        (2048, 64, 8, 4),
+    ];
+    for (block, hd, nk, rep) in cases {
+        let len = hd * nk * rep;
+        let mut params = Params::default();
+        let signs: Vec<f32> = values(len, 5)
+            .iter()
+            .map(|&v| if v < 0.0 { -1.0 } else { 1.0 })
+            .collect();
+        let signs = params.push(&signs);
+        let params = params.into_vec();
+        let bytes = [0u8; 16];
+        let data = ModelData {
+            bytes: &bytes,
+            mapped: false,
+            params: &params,
+            config: &config,
+            largest_tensor: 0,
+        };
+        let x = values(n * len, block as u32);
+        let mut cpu = CpuBackend::new(data, 16, 1, Default::default());
+        let mut metal = MetalBackend::new(data, 16, Default::default()).unwrap();
+        let heads = HeadOrder {
+            head_dim: hd,
+            n_k: nk,
+            rep,
+        };
+        for (signs, heads) in [
+            (None, None),
+            (Some(signs), None),
+            (Some(signs), Some(heads)),
+        ] {
+            let r = Rotation {
+                len,
+                block,
+                signs,
+                heads,
+            };
+            let inverse = Rotation { heads: None, ..r };
+            metal.check_rotation(r).unwrap();
+            cpu.begin(0, n).unwrap();
+            let mut want = vec![0.0; n * len];
+            cpu.rotate(&x, r, &mut want);
+            let mut want_inverse = x.clone();
+            cpu.unrotate(&mut want_inverse, inverse);
+            let mut mx = metal.vector(n * len).unwrap();
+            let mut out = metal.vector(n * len).unwrap();
+            metal.write(&mut mx, &x).unwrap();
+            metal.begin(0, n).unwrap();
+            metal.rotate(&mx, r, &mut out);
+            metal.unrotate(&mut mx, inverse);
+            metal.end().unwrap();
+            let what = format!(
+                "block {block}, signs {}, heads {}",
+                signs.is_some(),
+                heads.is_some()
+            );
+            let mut got = vec![0.0; n * len];
+            metal.read(&out, &mut got).unwrap();
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "rotate, {what}"
+            );
+            metal.read(&mx, &mut got).unwrap();
+            assert!(
+                got.iter()
+                    .zip(&want_inverse)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "unrotate, {what}"
+            );
         }
     }
 }

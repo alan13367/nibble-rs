@@ -59,6 +59,78 @@ kernel void copy_f32(
     }
 }
 
+// `RotateArgs` in `metal/kernels.rs`: rows of `len` values, a transform of
+// `block` values; `signs` and `head_dim` are 0 when there are none, and
+// `inverse` asks for `D · H x` instead of `H · D · P x`.
+struct RotateArgs {
+    uint len;
+    uint block;
+    uint signs;
+    uint head_dim;
+    uint n_k;
+    uint rep;
+    uint inverse;
+};
+
+// The input of a product with a Hadamard-folded weight (`Backend::rotate`),
+// or with `inverse` its inverse in place (`Backend::unrotate`): one
+// threadgroup per block of a row, the block in threadgroup memory. The
+// permutation and the signs are exact, so they go into the load; the
+// transform is that of ggml's CPU (`hadamard` in `cpu/mod.rs`): each value
+// times `1 / sqrt(block)`, then butterflies `u + v`, `u - v` from neighbours
+// up. ggml-metal's `kernel_fwht_tg` (`misc.metal`, blocks of 512 and more)
+// gives the same results. Its simdgroup kernel for smaller blocks writes the
+// lower sum as `val2 - val + 2 * val`, which the compiler rounds as `u + v`
+// for some block sizes and not others (measured on an M4 Max: 256 like the
+// CPU, 64 and 128 not), so for those nibble keeps the CPU's results.
+kernel void rotate(
+        constant RotateArgs & a [[buffer(0)]],
+        device const float * x [[buffer(1)]],
+        device const float * signs [[buffer(2)]],
+        device float * out [[buffer(3)]],
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint2 tpitg [[thread_position_in_threadgroup]],
+        uint2 ntg2 [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint ntg = ntg2.x;
+    const uint n = a.block;
+    const uint first = tgpig.x * n;
+    const uint64_t row = (uint64_t) tgpig.y * a.len;
+    const float scale = 1.0f / sqrt(float(n));
+    for (uint j = tid; j < n; j += ntg) {
+        const uint o = first + j;
+        float v;
+        if (a.inverse != 0 || a.head_dim == 0) {
+            v = x[row + o];
+        } else {
+            // The value that `HeadOrder::target` sends to place `o`.
+            const uint d = o % a.head_dim;
+            const uint head = o / a.head_dim;
+            v = x[row + d + a.head_dim * (head / a.rep + a.n_k * (head % a.rep))];
+        }
+        if (a.inverse == 0 && a.signs != 0) {
+            v *= signs[o];
+        }
+        shmem[j] = v * scale;
+    }
+    for (uint len = 1; len < n; len *= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint p = tid; p < n / 2; p += ntg) {
+            const uint i = (p / len) * 2 * len + p % len;
+            const float u = shmem[i];
+            const float v = shmem[i + len];
+            shmem[i] = u + v;
+            shmem[i + len] = u - v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < n; j += ntg) {
+        const uint o = first + j;
+        out[row + o] = a.inverse != 0 && a.signs != 0 ? shmem[j] * signs[o] : shmem[j];
+    }
+}
+
 struct AttentionArgs {
     uint n_pos;
     uint head_dim;

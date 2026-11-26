@@ -16,6 +16,7 @@ use std::arch::x86_64::*;
 use nibble_gguf::GgmlType;
 
 use super::scalar::{self, DeltaStep};
+use crate::quant::q2_0::Q2_0_BLOCK_BYTES;
 use crate::quant::{self, DotType, Q8_0_BLOCK_BYTES, QK8_0};
 
 /// Proof that the CPU supports AVX2, FMA and F16C: only [`Avx2::detect`]
@@ -330,6 +331,11 @@ fn dot_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f
                 *o = dot_f32_le(row, xq);
             }
         }
+        GgmlType::Q2_0 => {
+            for (o, row) in out.iter_mut().zip(rows) {
+                *o = dot_q2_0(row, xq);
+            }
+        }
         // AVX2 kernels for the other types will be added and tested on an
         // x86 machine. Until then the scalar reference keeps them correct
         // on x86 too, instead of refusing them; its sums follow the NEON
@@ -362,6 +368,45 @@ fn dot_q8_0(w: &[[u8; Q8_0_BLOCK_BYTES]], x: &[[u8; Q8_0_BLOCK_BYTES]]) -> f32 {
         acc = _mm256_fmadd_ps(d, q, acc);
     }
     hsum(acc)
+}
+
+/// `ggml_vec_dot_q2_0_q8_0`, AVX2 path (llama.cpp's VNNI forms compute the
+/// same exact integers): each block goes into the accumulator of its parity
+/// (two FMA chains, an odd last block into the even one), its two halves
+/// with their scales `d · d_y`; `hsum_float_8` of the two at the end.
+#[target_feature(enable = "avx2,fma,f16c")]
+fn dot_q2_0(row: &[u8], xq: &[u8]) -> f32 {
+    let blocks = row.as_chunks::<Q2_0_BLOCK_BYTES>().0;
+    let xs = xq.as_chunks::<Q8_0_BLOCK_BYTES>().0.as_chunks::<2>().0;
+    let mut acc = [_mm256_setzero_ps(); 2];
+    for (i, ([d0, d1, codes @ ..], x)) in blocks.iter().zip(xs).enumerate() {
+        let dx = f16_to_f32([*d0, *d1]);
+        for (qs, [e0, e1, qy @ ..]) in codes.as_chunks::<8>().0.iter().zip(x) {
+            let d = _mm256_set1_ps(dx * f16_to_f32([*e0, *e1]));
+            acc[i % 2] = _mm256_fmadd_ps(d, q2_0_dot_32(qs, qy), acc[i % 2]);
+        }
+    }
+    hsum(_mm256_add_ps(acc[0], acc[1]))
+}
+
+/// ggml's `q2_0_dot_32_avx2`: 32 weights (8 bytes of codes) against the
+/// quants of one `Q8_0` block, as 8 floats, lane `j` the exact `Σ (code - 1) · y` of
+/// weights `4j..4j + 4`. Each byte is widened to a 32-bit lane and its four
+/// codes spread over the lane's bytes; `maddubs` of the codes with `y`, less
+/// `maddubs` of ones with `y`, then pairs of 16-bit sums.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+fn q2_0_dot_32(qs: &[u8; 8], y: &[u8; QK8_0]) -> __m256 {
+    let v = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(i64::from_le_bytes(*qs)));
+    let v = _mm256_or_si256(v, _mm256_slli_epi32::<12>(v));
+    let v = _mm256_or_si256(v, _mm256_slli_epi32::<6>(v));
+    let v = _mm256_and_si256(v, _mm256_set1_epi32(0x0303_0303));
+    let y = load_u256(y);
+    let p = _mm256_sub_epi16(
+        _mm256_maddubs_epi16(v, y),
+        _mm256_maddubs_epi16(_mm256_set1_epi8(1), y),
+    );
+    _mm256_cvtepi32_ps(_mm256_madd_epi16(p, _mm256_set1_epi16(1)))
 }
 
 /// `ggml_vec_dot_f32`: four 8-lane FMA accumulators over steps of 32, the
@@ -825,6 +870,44 @@ mod tests {
                     assert_near(g, want, 1e-6, scale, &format!("{ty} n = {n} row {r}"));
                 }
             }
+        }
+    }
+
+    /// The `Q2_0` kernel against ggml's AVX2 kernel (llama.cpp b12359's
+    /// macOS x64 `libggml-cpu` under Rosetta with AVX advertised) on rows
+    /// `k_row(Q2_0, 25, 10 + r)` and `k_row(Q2_0, 3, 30)` (an odd last
+    /// block), and against the scalar reference within its summation order.
+    #[test]
+    fn q2_0_dots_match_ggml_bit_for_bit() {
+        use crate::quant::test_data::k_row;
+        let Some(k) = avx2() else { return };
+        let ty = GgmlType::Q2_0;
+        let cases: [(usize, u32, u32, u32); 5] = [
+            (25, 3, 10, 0xC03D_7C58),
+            (25, 3, 11, 0xC04F_E646),
+            (25, 3, 12, 0xBEC0_5C12),
+            (25, 3, 13, 0xC04F_20E0),
+            (3, 4, 30, 0xBEC5_CEF1),
+        ];
+        for (blocks, x_seed, w_seed, want) in cases {
+            let xq = quant::encoded(DotType::Q8_0, &values(64 * blocks, x_seed));
+            let row = k_row(ty, blocks, w_seed);
+            let mut got = [0.0];
+            k.dot_rows(ty, &row, row.len(), &xq, &mut got);
+            assert_eq!(
+                got[0].to_bits(),
+                want,
+                "{blocks} blocks, seed {w_seed}: {}",
+                got[0]
+            );
+            let reference = quant::dot_row(ty, &row, &xq);
+            assert_near(
+                got[0],
+                reference,
+                1e-6,
+                f64::from(reference.abs()).max(1.0),
+                "scalar",
+            );
         }
     }
 

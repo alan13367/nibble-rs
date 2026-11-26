@@ -243,7 +243,7 @@ impl KvTypes {
 /// A small `f32` model parameter (a norm weight, bias or convolution
 /// kernel): a range of the model's parameter arena, which a GPU backend
 /// uploads once.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Param {
     start: usize,
     len: usize,
@@ -278,6 +278,46 @@ impl Params {
 
     pub(crate) fn into_vec(self) -> Vec<f32> {
         self.data
+    }
+}
+
+/// The transform a matrix product's input goes through when the weight has
+/// a Hadamard rotation folded in (PrismML's `prism.hadamard` metadata, as
+/// llama.cpp's `llm_graph_context::build_hadamard_input` applies it): a
+/// folded weight is `W · D · H` for the weight `W`, ±1 signs `D` and the
+/// orthonormal block Walsh-Hadamard transform `H`, so `W · x` is the
+/// folded weight times `H · (D · x)`. Each row of `len` values is first
+/// permuted ([`HeadOrder`]), then multiplied by the signs, then transformed
+/// block by block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Rotation {
+    /// Values per row: the weight's columns.
+    pub(crate) len: usize,
+    /// Values per block of the transform: a power of two that divides `len`.
+    pub(crate) block: usize,
+    /// One ±1 per value of a row, or none.
+    pub(crate) signs: Option<Param>,
+    pub(crate) heads: Option<HeadOrder>,
+}
+
+/// The value heads of a Gated DeltaNet output, in the order its output
+/// projection was folded in (`gdn_v_grouped`): a row arrives with value
+/// head `k + n_k * r` (for key head `k`, repeat `r`) in place `k + n_k * r`
+/// and is reordered so that it is in place `r + rep * k` (llama.cpp's
+/// `set_gdn_v_perm`: `[head_dim, n_k, rep]` to `[head_dim, rep, n_k]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadOrder {
+    pub(crate) head_dim: usize,
+    pub(crate) n_k: usize,
+    pub(crate) rep: usize,
+}
+
+impl HeadOrder {
+    /// The place in a reordered row of value `i` of a row as it arrives.
+    pub(crate) const fn target(self, i: usize) -> usize {
+        let (d, head) = (i % self.head_dim, i / self.head_dim);
+        let (k, r) = (head % self.n_k, head / self.n_k);
+        d + self.head_dim * (r + self.rep * k)
     }
 }
 
@@ -439,6 +479,13 @@ pub(crate) trait Backend {
         Ok(())
     }
 
+    /// Checks, when a session starts, that the backend can apply rotation
+    /// `r` ([`Backend::rotate`] and [`Backend::unrotate`]).
+    fn check_rotation(&self, r: Rotation) -> Result<()> {
+        let _ = r;
+        Ok(())
+    }
+
     /// Positions held by `cache`.
     fn kv_len(&self, cache: &Self::KvCache) -> usize;
 
@@ -483,6 +530,15 @@ pub(crate) trait Backend {
     /// The tokens in slots `0..out.len()`, after every op that writes them
     /// (outside a batch).
     fn read_slots(&mut self, out: &mut [u32]) -> Result<()>;
+
+    /// `out = H · (D · P x)` for every row of `r.len` values of `x`: the
+    /// input of a product with a folded weight (see [`Rotation`]).
+    fn rotate(&mut self, x: &Self::Vector, r: Rotation, out: &mut Self::Vector);
+
+    /// `x = D · (H · x)` in place for every row of `r.len` values (`r` has
+    /// no [`HeadOrder`]): rows looked up in a table stored rotated (a
+    /// latent token embedding) back in the model's basis.
+    fn unrotate(&mut self, x: &mut Self::Vector, r: Rotation);
 
     /// `out = rmsnorm(x) * w`, for rows of `w.len()` values.
     fn rmsnorm(&mut self, x: &Self::Vector, w: Param, eps: f32, out: &mut Self::Vector);

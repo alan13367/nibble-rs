@@ -141,6 +141,10 @@ impl Neon {
             ty if quant::is_block32(ty) && self.dotprod => {
                 neon_call!(dot_block32_rows(ty, rows, row_bytes, xq, out))
             }
+            GgmlType::Q2_0 if self.dotprod && self.fp16 => {
+                neon_call!(dot_q2_0_rows_fp16(rows, row_bytes, xq, out))
+            }
+            GgmlType::Q2_0 if self.dotprod => neon_call!(dot_q2_0_rows(rows, row_bytes, xq, out)),
             _ => scalar(out),
         }
     }
@@ -1508,6 +1512,67 @@ fn dot_block32_rows(ty: GgmlType, rows: &[u8], row_bytes: usize, xq: &[u8], out:
     }
 }
 
+// --- Q2_0 ---------------------------------------------------------------------
+
+/// ggml's NEON `ggml_vec_dot_q2_0_q8_0`: each half of a block (32 weights,
+/// 8 bytes of codes) has every byte repeated four times by a table lookup,
+/// shifted right by 0, 2, 4 and 6 and masked to its code, less one; its two
+/// `vdotq_s32` go into one float vector with the half's scale
+/// (`vmlaq_n_f32`, fused), reduced once per row. The float order is that of
+/// [`quant::q2_0::dot_row`], which is the reference. With `fp16` the scales
+/// are converted by the hardware (exact either way).
+macro_rules! define_q2_0_rows {
+    ($name:ident, $feat:literal, $f16:ident) => {
+        #[target_feature(enable = $feat)]
+        fn $name(rows: &[u8], row_bytes: usize, xq: &[u8], out: &mut [f32]) {
+            use quant::q2_0::Q2_0_BLOCK_BYTES;
+            const SHIFTS: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+            let idx_lo = load_u8(&[0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+            let idx_hi = load_u8(&[4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7]);
+            let shifts = load_i8(&SHIFTS.map(|s| s as u8));
+            let mask = vdupq_n_u8(3);
+            let one = vdupq_n_s8(1);
+            let zero = vdupq_n_s32(0);
+            let xs = xq.as_chunks::<Q8_0_BLOCK_BYTES>().0.as_chunks::<2>().0;
+            let codes = |raw16: uint8x16_t, idx: uint8x16_t| {
+                let q = vandq_u8(vshlq_u8(vqtbl1q_u8(raw16, idx), shifts), mask);
+                vsubq_s8(vreinterpretq_s8_u8(q), one)
+            };
+            for (o, row) in out.iter_mut().zip(rows.chunks_exact(row_bytes)) {
+                let mut sumv = vdupq_n_f32(0.0);
+                for (block, x) in row.as_chunks::<Q2_0_BLOCK_BYTES>().0.iter().zip(xs) {
+                    let d0 = $f16([block[0], block[1]]);
+                    for (half, y) in block[2..].as_chunks::<8>().0.iter().zip(x) {
+                        let raw = vcreate_u8(u64::from_le_bytes(*half));
+                        let raw16 = vcombine_u8(raw, raw);
+                        let p = vdotq_s32(zero, codes(raw16, idx_lo), load_i8(at16(y, 2)));
+                        let p = vdotq_s32(p, codes(raw16, idx_hi), load_i8(at16(y, 18)));
+                        let d1 = $f16([y[0], y[1]]);
+                        sumv = vfmaq_n_f32(sumv, vcvtq_f32_s32(p), d0 * d1);
+                    }
+                }
+                *o = vaddvq_f32(sumv);
+            }
+        }
+    };
+}
+
+/// An f16 scale converted in software.
+fn f16_soft(b: [u8; 2]) -> f32 {
+    quant::f16_to_f32(u16::from_le_bytes(b))
+}
+
+/// An f16 scale converted by the hardware.
+#[inline]
+#[target_feature(enable = "neon,fp16")]
+fn f16_hard(b: [u8; 2]) -> f32 {
+    let bits = vdup_n_u16(u16::from_le_bytes(b));
+    vgetq_lane_f32::<0>(vcvt_f32_f16(vreinterpret_f16_u16(bits)))
+}
+
+define_q2_0_rows!(dot_q2_0_rows, "neon,dotprod", f16_soft);
+define_q2_0_rows!(dot_q2_0_rows_fp16, "neon,dotprod,fp16", f16_hard);
+
 macro_rules! define_q4_rows {
     ($name:ident, $feat:literal, $dot:ident) => {
         #[target_feature(enable = $feat)]
@@ -2076,6 +2141,41 @@ mod tests {
                     for (r, &g) in got.iter().enumerate() {
                         let want = quant::dot_row(ty, &w[r * row_bytes..(r + 1) * row_bytes], &xq);
                         assert_eq!(g.to_bits(), want.to_bits(), "{ty} n {n} row {r}, {k:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `Q2_0` kernel gives the scalar reference's results bit for bit,
+    /// which are ggml's NEON kernel's (llama.cpp b12722's `libggml-cpu` on
+    /// rows `k_row(Q2_0, 25, 10 + r)` and the activation `values(1600, 3)`).
+    #[test]
+    fn q2_0_dots_equal_the_scalar_reference_and_ggml() {
+        let ty = GgmlType::Q2_0;
+        let ggml = [0xC03D_7C5Bu32, 0xC04F_E646, 0xBEC0_5C0E, 0xC04F_20DE];
+        let mut kernels = variants();
+        // Both scale conversions of the `dotprod` kernel.
+        if let Some(&k) = kernels.first().filter(|k| k.dotprod && k.fp16) {
+            kernels.push(Neon { fp16: false, ..k });
+        }
+        for k in kernels {
+            for blocks in [1, 3, 25] {
+                let n = 64 * blocks;
+                let xq = quant::encoded(DotType::Q8_0, &values(n, 3));
+                let w: Vec<u8> = (0..4).flat_map(|r| k_row(ty, blocks, 10 + r)).collect();
+                let row_bytes = w.len() / 4;
+                let mut got = vec![0.0; 4];
+                k.dot_rows(ty, &w, row_bytes, &xq, &mut got);
+                for (r, &g) in got.iter().enumerate() {
+                    let want = quant::dot_row(ty, &w[r * row_bytes..(r + 1) * row_bytes], &xq);
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "{blocks} blocks, row {r}, {k:?}"
+                    );
+                    if blocks == 25 {
+                        assert_eq!(g.to_bits(), ggml[r], "row {r}: {g}, {k:?}");
                     }
                 }
             }

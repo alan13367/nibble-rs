@@ -1,5 +1,6 @@
 // The weight formats beyond the K-quants: `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
-// `IQ4_NL` and `MXFP4` (blocks of 32), `Q2_K`, and the codebook I-quants.
+// `IQ4_NL` and `MXFP4` (blocks of 32), `Q2_0` (blocks of 64), `Q2_K`, and
+// the codebook I-quants.
 //
 // The matrix-vector kernels transcribe ggml-metal's
 // (`kernel_mul_mv_*_f32_impl` in `mul_mv.metal`) with its simdgroup layout,
@@ -12,8 +13,10 @@
 // `metal/tests.rs`.
 
 #define QK4_0 32
+#define QK2_0 64
 
 typedef struct { half d; uint8_t qs[16]; } block_q4_0;
+typedef struct { half d; uint8_t qs[QK2_0 / 4]; } block_q2_0;
 typedef struct { half d; half m; uint8_t qs[16]; } block_q4_1;
 typedef struct { half d; uint8_t qh[4]; uint8_t qs[16]; } block_q5_0;
 typedef struct { half d; half m; uint8_t qh[4]; uint8_t qs[16]; } block_q5_1;
@@ -166,6 +169,73 @@ template <short NR0> static inline void matvec_q5_1_impl(constant MatvecArgs & a
     matvec_q_n_impl<block_q5_1, NR0>(a, w, w2, y, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// --- Q2_0 (ggml's `kernel_mul_mv_q2_0_f32_impl`) ----------------------------
+
+// 16 weights of a block (from weight `il`) times `yl`: `d * (Σ_lo + 2 Σ_hi -
+// Σ y)`, where `Σ_lo` and `Σ_hi` add the `y` whose code has its low or high
+// bit set (code `c` stands for `c - 1`).
+static inline float block_q2_0_dot_y(device const block_q2_0 * qb, float sumy, thread float * yl, int il) {
+    device const uint8_t * qs = qb->qs + il / 4;
+    float acc_lo = 0.0f;
+    float acc_hi = 0.0f;
+    FOR_UNROLL (short k = 0; k < 4; ++k) {
+        const uint8_t b = qs[k];
+        acc_lo += select(0.0f, yl[4 * k + 0], bool(b & 0x01));
+        acc_lo += select(0.0f, yl[4 * k + 1], bool(b & 0x04));
+        acc_lo += select(0.0f, yl[4 * k + 2], bool(b & 0x10));
+        acc_lo += select(0.0f, yl[4 * k + 3], bool(b & 0x40));
+    }
+    FOR_UNROLL (short k = 0; k < 4; ++k) {
+        const uint8_t b = qs[k];
+        acc_hi += select(0.0f, yl[4 * k + 0], bool(b & 0x02));
+        acc_hi += select(0.0f, yl[4 * k + 1], bool(b & 0x08));
+        acc_hi += select(0.0f, yl[4 * k + 2], bool(b & 0x20));
+        acc_hi += select(0.0f, yl[4 * k + 3], bool(b & 0x80));
+    }
+    return qb->d * (acc_lo + 2.0f * acc_hi - sumy);
+}
+
+// Each group of 4 lanes takes a block, a lane 16 of its weights, a
+// simdgroup 8 blocks at a time, for its `NR0` rows. No kernel for several
+// inputs at once: the product is bound by its arithmetic, not by loading
+// the codes, and one for two inputs measured no faster.
+template <short NR0>
+static inline void matvec_q2_0_impl(
+        constant MatvecArgs & a,
+        device const char * w,
+        device const char * w2,
+        device const float * y,
+        device float * dst,
+        threadgroup char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const int nb = a.cols / QK2_0;
+    const int r0 = (tgpig.x * a.nsg + sgitg) * NR0;
+    device const block_q2_0 * ax[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q2_0 *) matrix_row(w, w2, a, r0 + row);
+    }
+    float yl[16];
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 4;
+    const short il = (tiisg % 4) * 16;
+    device const float * yb = y + ix * QK2_0 + il;
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH / 4) {
+        float sumy = 0.f;
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            yl[i] = yb[i];
+            sumy += yb[i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            sumf[row] += block_q2_0_dot_y(ax[row] + ib, sumy, yl, il);
+        }
+        yb += QK2_0 * (N_SIMDWIDTH / 4);
+    }
+    simd_write<NR0>(a, dst, sumf, r0, tiisg, 1.0f);
+}
+
+MATVEC_KERNEL(matvec_q2_0, matvec_q2_0_impl, 8)
 MATVEC_KERNEL(matvec_q4_0, matvec_q4_0_impl, 4)
 MATVEC_KERNEL(matvec_q4_1, matvec_q4_1_impl, 4)
 MATVEC_KERNEL(matvec_q5_0, matvec_q5_0_impl, 4)
@@ -765,6 +835,20 @@ EMBED_Q_N(embed_q5_0, block_q5_0)
 EMBED_Q_N(embed_q5_1, block_q5_1)
 EMBED_Q_N(embed_iq4_nl, block_iq4_nl)
 EMBED_Q_N(embed_mxfp4, block_mxfp4)
+
+// One block of 64 per thread, as `dequantize_row_q2_0`.
+kernel void embed_q2_0(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
+        device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
+    if (i >= a.cols / QK2_0) {
+        return;
+    }
+    device const block_q2_0 & b = ((device const block_q2_0 *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes))[i];
+    const float d = b.d;
+    for (short j = 0; j < QK2_0; ++j) {
+        x[QK2_0 * i + j] = (float) ((int) ((b.qs[j / 4] >> (2 * (j % 4))) & 3) - 1) * d;
+    }
+}
 
 // Group `g` (of 32) of 8 values of a 256-value block, into `out`.
 static inline void decode8(device const block_q2_K & b, short g, thread float * out) {

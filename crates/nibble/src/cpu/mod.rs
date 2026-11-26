@@ -398,6 +398,24 @@ impl Cpu {
         });
     }
 
+    /// [`hadamard`] of every block of `n` values of `x`, blocks spread over
+    /// the threads when there are enough of them (ggml splits by block too).
+    pub(crate) fn hadamard(&self, x: &mut [f32], n: usize) {
+        let blocks = x.len() / n;
+        let work = x.len().saturating_mul(n.trailing_zeros() as usize);
+        if self.threads() == 1 || blocks < 2 || work < PARALLEL_MIN_MACS {
+            return hadamard(x, n);
+        }
+        let per_task = blocks.div_ceil(TASKS_PER_THREAD * self.threads()).max(1);
+        let split = Split {
+            segments: 1,
+            chunk_len: per_task * n,
+        };
+        self.pool.for_each_segment_chunk([x], split, |_, _, chunk| {
+            hadamard(chunk.segment(0), n);
+        });
+    }
+
     /// The pool for a product of `rows` output rows per token over `cols`
     /// input values in all, and the rows per task if it is worth splitting
     /// (`None`: one task per product, on the calling thread).
@@ -546,12 +564,13 @@ pub(crate) fn add_in_place(out: &mut [f32], x: &[f32]) {
     }
 }
 
-/// Logistic sigmoid (scalar in ggml too).
 /// The orthonormal Walsh-Hadamard transform of each block of `n` values
-/// (a power of two), as ggml's CPU backend computes llama.cpp's rotation of
-/// a quantized KV cache (`ggml_compute_forward_fwht`): each value scaled by
-/// `1 / sqrt(n)`, then the butterflies, whose sums are exact in either
-/// order. The transform is its own inverse.
+/// (a power of two), as ggml's CPU backend computes llama.cpp's Hadamard
+/// rotations (`ggml_compute_forward_fwht`, for a quantized KV cache and for
+/// folded weights): each value scaled by `1 / sqrt(n)`, then the butterflies
+/// from pairs of neighbours up. ggml's SIMD passes compute `u - v` as
+/// `fma(v, -1, u)`, which is exact, so the results are the same. The
+/// transform is its own inverse.
 pub(crate) fn hadamard(x: &mut [f32], n: usize) {
     let scale = 1.0 / (n as f32).sqrt();
     for row in x.chunks_exact_mut(n) {
@@ -560,11 +579,13 @@ pub(crate) fn hadamard(x: &mut [f32], n: usize) {
         }
         let mut len = 1;
         while len < n {
-            for i in (0..n).step_by(2 * len) {
-                for j in i..i + len {
-                    let (u, v) = (row[j], row[j + len]);
-                    row[j] = u + v;
-                    row[j + len] = u - v;
+            // Contiguous halves, so the compiler vectorizes the wider passes.
+            for pair in row.chunks_exact_mut(2 * len) {
+                let (lo, hi) = pair.split_at_mut(len);
+                for (a, b) in lo.iter_mut().zip(hi) {
+                    let (u, v) = (*a, *b);
+                    *a = u + v;
+                    *b = u - v;
                 }
             }
             len <<= 1;
@@ -572,6 +593,7 @@ pub(crate) fn hadamard(x: &mut [f32], n: usize) {
     }
 }
 
+/// Logistic sigmoid (scalar in ggml too).
 pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -585,6 +607,30 @@ pub(crate) fn softplus(x: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::quant::test_data::{f32_bytes, fnv1a, values};
+
+    /// ggml's CPU `ggml_compute_forward_fwht` (a `mul_mat` with
+    /// `GGML_HINT_SRC0_IS_HADAMARD`) in llama.cpp b12722's macOS arm64 and
+    /// b12359's x64 release, which agree: the FNV hash of the output bits of
+    /// `values(n * rows, seed)`, and its first, `n - 1`-th and last values.
+    #[test]
+    fn hadamard_matches_ggml_bit_for_bit() {
+        #[rustfmt::skip]
+        let cases: [(usize, usize, u32, u64, [u32; 4]); 3] = [
+            (64, 3, 5, 0x3582_09D5_E67A_1444, [0x3EC4_A651, 0xBF0D_DEA5, 0xBFCC_C035, 0xBD8E_13B8]),
+            (128, 2, 6, 0x7E37_B49A_8313_B4EB, [0x3FA5_B0D0, 0xBE43_E0B8, 0x3F06_9D2A, 0xBE47_6400]),
+            (1024, 5, 7, 0xB0F6_A026_A4E3_E72A, [0xBF1E_2A98, 0xBE53_5334, 0xBE76_2E1D, 0x3F33_3015]),
+        ];
+        for threads in [1, 4] {
+            let cpu = Cpu::new(threads);
+            for (n, rows, seed, hash, at) in cases {
+                let mut x = values(n * rows, seed);
+                cpu.hadamard(&mut x, n);
+                assert_eq!(fnv1a(&f32_bytes(&x)), hash, "n = {n}, {threads} threads");
+                let got = [x[0], x[1], x[n - 1], x[n * rows - 1]].map(f32::to_bits);
+                assert_eq!(got, at, "n = {n}");
+            }
+        }
+    }
 
     /// `ggml_rope_ext` (NeoX, 128 rotated dims, base 1e6) in llama.cpp's
     /// b12359 macOS arm64 release, on two heads of `values(256, 1)`: an FNV

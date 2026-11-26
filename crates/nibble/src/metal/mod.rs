@@ -42,12 +42,13 @@ use std::ops::Range;
 use device::{Buffer, Commands, Device, Pipeline, Size};
 use kernels::{
     AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, FlashArgs, MatmulArgs,
-    MatmulIdArgs, MatvecArgs, MoeArgs, MoeMapArgs, MoeSumArgs, Pipelines, RmsArgs, RouteArgs,
+    MatmulIdArgs, MatvecArgs, MoeArgs, MoeMapArgs, MoeSumArgs, Pipelines, RmsArgs, RotateArgs,
+    RouteArgs,
 };
 
 use crate::backend::{
     Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvCacheType, KvTypes, MAX_LOGIT_ROWS,
-    MAX_PENDING, ModelData, Param, QkNorm,
+    MAX_PENDING, ModelData, Param, QkNorm, Rotation,
 };
 use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
@@ -535,6 +536,44 @@ impl<'m> MetalBackend<'m> {
         commands.set_buffer(3, params, Self::param_offset(p.norm));
         commands.dispatch(Size::new(d.n_v_heads, 1, 1), Size::new(128, 1, 1));
         true
+    }
+
+    /// Encodes `rotate` (see [`Backend::rotate`]) of every row of `x` into
+    /// `out`, which may be `x` for the inverse.
+    fn encode_rotate(&mut self, x: &Buffer, r: Rotation, inverse: bool, out: &Buffer) {
+        let order = r.heads.unwrap_or(crate::backend::HeadOrder {
+            head_dim: 0,
+            n_k: 0,
+            rep: 0,
+        });
+        // `check_rotation` bounds every size.
+        let args = RotateArgs {
+            len: r.len as u32,
+            block: r.block as u32,
+            signs: u32::from(r.signs.is_some()),
+            head_dim: order.head_dim as u32,
+            n_k: order.n_k as u32,
+            rep: order.rep as u32,
+            inverse: u32::from(inverse),
+        };
+        if self.n == 0 || !self.reserve(1) {
+            return;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return;
+        };
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.rotate);
+        commands.set_bytes(0, &args);
+        commands.set_buffer(1, x, 0);
+        let signs = r.signs.map_or(0, Self::param_offset);
+        commands.set_buffer(2, &self.params, signs);
+        commands.set_buffer(3, out, 0);
+        commands.set_threadgroup_memory(0, 4 * r.block);
+        commands.dispatch(
+            Size::new(r.len / r.block, self.n, 1),
+            Size::new((r.block / 2).clamp(1, THREADS), 1, 1),
+        );
     }
 
     /// Threadgroups of [`THREADS`] covering `n` threads.
@@ -1425,6 +1464,29 @@ impl Backend for MetalBackend<'_> {
             *o = v.to_bits();
         }
         Ok(())
+    }
+
+    fn check_rotation(&self, r: Rotation) -> Result<()> {
+        let fits = r.block.is_power_of_two()
+            && r.block <= 8192
+            && 4 * r.block <= self.device.max_threadgroup_memory()
+            && u32::try_from(r.len).is_ok();
+        if fits {
+            Ok(())
+        } else {
+            Err(backend_error(format!(
+                "no kernel for a Hadamard rotation of {} values in blocks of {}",
+                r.len, r.block
+            )))
+        }
+    }
+
+    fn rotate(&mut self, x: &MetalVector, r: Rotation, out: &mut MetalVector) {
+        self.encode_rotate(&x.buffer, r, false, &out.buffer);
+    }
+
+    fn unrotate(&mut self, x: &mut MetalVector, r: Rotation) {
+        self.encode_rotate(&x.buffer, r, true, &x.buffer);
     }
 
     fn rmsnorm(&mut self, x: &MetalVector, w: Param, eps: f32, out: &mut MetalVector) {

@@ -12,12 +12,12 @@ has the full record of phases 0–6 and the first steps of phase 7).
 
 | Area | State |
 |---|---|
-| Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0); Metal backend, the default (`auto`); OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; llama.cpp's KV cache types on both backends |
+| Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; Ternary Bonsai (`qwen35` with `prism.hadamard` folded weights, Q2_0) on CPU and Metal; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0/Q2_0); Metal backend, the default (`auto`); OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; llama.cpp's KV cache types on both backends |
 | Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot; kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta |
 | Decode (M4 Max) | Faster than llama.cpp on every local file on Metal (empty context and 4096 tokens, `-fa` off and on) and on the CPU (tie on Qwen3-0.6B Q8_0). Qwen3.5-4B Q8_0 Metal 73 tok/s, 131 with `--draft 3` (llama.cpp 64, 124) |
 | Prompt (M4 Max, pp512) | Metal level with llama.cpp on the 0.8B files, 1–3% behind on the 4B–27B, 8% behind on the 35B MoE, 11% on Qwen3-0.6B, about 45% behind with a quantized KV cache at depth (Phase 7 step 6). CPU far behind (no prompt tiles) |
-| Tests | 247 pass in `cargo test --workspace` (Metal tests skip without a device); 13 reference tests on real models with `--ignored` (12 pass here; `qwen35_bf16` needs a file not on this machine) |
-| Not started | CUDA; AVX2 kernels beyond F32/F16/BF16/Q8_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; CPU prompt tiles; parallel server slots |
+| Tests | 259 pass in `cargo test --workspace` (Metal tests skip without a device); 14 reference tests on real models with `--ignored` (13 pass here; `qwen35_bf16` needs a file not on this machine) |
+| Not started | CUDA; PrismML's PTQ1_0 and PQ2_0 (their llama.cpp fork's types); AVX2 kernels beyond F32/F16/BF16/Q8_0/Q2_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; CPU prompt tiles; parallel server slots |
 | To rerun | The 5600X comparisons (correctness and speed) predate the attention and fused-multiply-add fixes |
 | Git | Five commits; the cache types and the prompt work since 8f000c7 are not committed |
 
@@ -137,7 +137,8 @@ crates/
       topology.rs  default thread count: performance cores on Apple Silicon, else one per physical core
       backend.rs   the CPU Backend
       attention.rs the KV cache (every cache type) and attention, with and without flash attention
-    model/         registry (mod.rs), config, bind, shared layers, qwen3, qwen35 (also `qwen35moe`)
+    model/         registry (mod.rs), config, bind, shared layers, qwen3, qwen35 (also `qwen35moe`),
+                   hadamard (`prism.hadamard` folded weights), bonsai (qwen35 with folded weights)
     tokenizer/     facade (vocab, specials, decoding) + bpe.rs, pretokenize.rs, unicode tables
     chat/          ChatML / Qwen3 / Qwen3.5 templates with tools, tool-call parser
     sampler.rs     greedy, temperature, top-k/top-p/min-p, penalties, logprobs
