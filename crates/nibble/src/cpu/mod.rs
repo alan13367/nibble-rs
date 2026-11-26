@@ -547,6 +547,31 @@ pub(crate) fn add_in_place(out: &mut [f32], x: &[f32]) {
 }
 
 /// Logistic sigmoid (scalar in ggml too).
+/// The orthonormal Walsh-Hadamard transform of each block of `n` values
+/// (a power of two), as ggml's CPU backend computes llama.cpp's rotation of
+/// a quantized KV cache (`ggml_compute_forward_fwht`): each value scaled by
+/// `1 / sqrt(n)`, then the butterflies, whose sums are exact in either
+/// order. The transform is its own inverse.
+pub(crate) fn hadamard(x: &mut [f32], n: usize) {
+    let scale = 1.0 / (n as f32).sqrt();
+    for row in x.chunks_exact_mut(n) {
+        for v in row.iter_mut() {
+            *v *= scale;
+        }
+        let mut len = 1;
+        while len < n {
+            for i in (0..n).step_by(2 * len) {
+                for j in i..i + len {
+                    let (u, v) = (row[j], row[j + len]);
+                    row[j] = u + v;
+                    row[j + len] = u - v;
+                }
+            }
+            len <<= 1;
+        }
+    }
+}
+
 pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }

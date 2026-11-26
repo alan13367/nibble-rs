@@ -72,6 +72,16 @@ pub enum Error {
     /// Drafting was asked for, but the model has no multi-token-prediction
     /// head.
     NoDraftHead,
+    /// A KV cache type whose blocks do not divide the model's attention
+    /// heads.
+    UnsupportedCacheType {
+        /// `K` or `V`.
+        which: &'static str,
+        /// The type asked for.
+        ty: crate::KvCacheType,
+        /// Values per attention head.
+        head_dim: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -115,6 +125,16 @@ impl fmt::Display for Error {
             }
             Self::InvalidToken(id) => write!(f, "token id {id} is outside the vocabulary"),
             Self::EmptyInput => write!(f, "no tokens to evaluate"),
+            Self::UnsupportedCacheType {
+                which,
+                ty,
+                head_dim,
+            } => write!(
+                f,
+                "{which} cache type {ty} has blocks of {} values, which do not divide the \
+                 attention heads of {head_dim} values",
+                ty.block_size()
+            ),
             Self::TooManyTokens { n, max } => {
                 write!(f, "{n} tokens to evaluate at once; at most {max} can be")
             }

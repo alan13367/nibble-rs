@@ -14,6 +14,8 @@ pub(crate) fn source() -> String {
         include_str!("shaders/matvec.metal"),
         include_str!("shaders/kquants.metal"),
         include_str!("shaders/iquants.metal"),
+        include_str!("shaders/matmul.metal"),
+        include_str!("shaders/kv.metal"),
         include_str!("shaders/ops.metal"),
         include_str!("shaders/moe.metal"),
     ]
@@ -77,6 +79,14 @@ macro_rules! kernel_args {
 kernel_args! {
     /// `dst = W · x`, or as `mode` says.
     struct MatvecArgs { cols: u32, rows: u32, row_bytes: u32, nsg: u32, mode: u32, ncols: u32 }
+    /// `dst = W · x` (or `+=`, as `mode` says) for a batch of `n` inputs.
+    struct MatmulArgs { cols: u32, rows: u32, row_bytes: u32, n: u32, mode: u32 }
+    /// The tiles of a prompt batch's expert slots (`moe_map`).
+    struct MoeMapArgs { n: u32, k: u32, n_expert: u32 }
+    /// The expert products of a prompt batch (`matmul_*_id`).
+    struct MatmulIdArgs {
+        cols: u32, rows: u32, row_bytes: u32, expert_bytes: u32, k: u32, per_slot: u32,
+    }
     /// Decode row `row` of a matrix.
     struct EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     struct RmsArgs { n: u32, eps: f32 }
@@ -88,7 +98,12 @@ kernel_args! {
     struct AttentionArgs {
         n_pos: u32, head_dim: u32, group: u32, kv_dim: u32, q_stride: u32, gated: u32,
         n_rot: u32, norm: u32, chunk: u32, n_chunks: u32, scale: f32, base: f32, eps: f32,
-        pad: u32,
+        k_type: u32, v_type: u32, k_row: u32, v_row: u32, rot_k: u32, rot_v: u32,
+    }
+    /// Attention over a prompt batch (`attention_prompt_*`).
+    struct FlashArgs {
+        n: u32, n_past: u32, kv_dim: u32, q_stride: u32, gated: u32, n_head: u32, scale: f32,
+        group: u32, heads: u32, tiles: u32, k_type: u32, v_type: u32, k_row: u32, v_row: u32,
     }
     struct DeltaArgs {
         n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32, rows: u32,
@@ -230,6 +245,41 @@ const MATVECS: &[MatvecSpec] = &[
     (GgmlType::Iq1M, "matvec_iq1_m", Some(2), 4, true, 0),
 ];
 
+/// The matrix-matrix kernels (`kernel_mul_mm` in ggml-metal), by weight type.
+#[rustfmt::skip]
+const MATMULS: &[(GgmlType, &str)] = &[
+    (GgmlType::F32, "matmul_f32"),
+    (GgmlType::F16, "matmul_f16"),
+    (GgmlType::Bf16, "matmul_bf16"),
+    (GgmlType::Q4_0, "matmul_q4_0"),
+    (GgmlType::Q4_1, "matmul_q4_1"),
+    (GgmlType::Q5_0, "matmul_q5_0"),
+    (GgmlType::Q5_1, "matmul_q5_1"),
+    (GgmlType::Q8_0, "matmul_q8_0"),
+    (GgmlType::Mxfp4, "matmul_mxfp4"),
+    (GgmlType::Q2K, "matmul_q2_K"),
+    (GgmlType::Q3K, "matmul_q3_K"),
+    (GgmlType::Q4K, "matmul_q4_K"),
+    (GgmlType::Q5K, "matmul_q5_K"),
+    (GgmlType::Q6K, "matmul_q6_K"),
+    (GgmlType::Iq2Xxs, "matmul_iq2_xxs"),
+    (GgmlType::Iq2Xs, "matmul_iq2_xs"),
+    (GgmlType::Iq2S, "matmul_iq2_s"),
+    (GgmlType::Iq3Xxs, "matmul_iq3_xxs"),
+    (GgmlType::Iq3S, "matmul_iq3_s"),
+    (GgmlType::Iq1S, "matmul_iq1_s"),
+    (GgmlType::Iq1M, "matmul_iq1_m"),
+    (GgmlType::Iq4Nl, "matmul_iq4_nl"),
+    (GgmlType::Iq4Xs, "matmul_iq4_xs"),
+];
+
+/// Weight rows and inputs of a `matmul_*` threadgroup, its threads
+/// (4 simdgroups) and its threadgroup memory (`MATMUL_SMEM`).
+pub(crate) const MATMUL_ROWS: usize = 64;
+pub(crate) const MATMUL_INPUTS: usize = 32;
+pub(crate) const MATMUL_THREADS: usize = 128;
+pub(crate) const MATMUL_SMEM: usize = 8192;
+
 /// `(type, embedding kernel, values each thread writes)`.
 #[rustfmt::skip]
 const EMBEDS: &[(GgmlType, &str, usize)] = &[
@@ -274,23 +324,82 @@ const ATTENTIONS: [(usize, usize); 11] = [
     (4, 4),
 ];
 
+/// The head sizes of the `attention_prompt_d{HD}` kernels.
+const ATTENTION_PROMPTS: [usize; 3] = [64, 128, 256];
+
+/// Cached positions `attention_prompt_*` reads at a time (`FLASH_C`); a KV
+/// cache holds a whole number of them.
+pub(crate) const FLASH_C: usize = 32;
+
+/// How `attention_prompt_*` splits `group` query heads per key head of
+/// `hd` values: the heads of a threadgroup (a divisor of `group`, at most
+/// 4), its tiles of 8 tokens (4 simdgroups in all where the heads allow),
+/// its simdgroups, and its threadgroup memory in bytes. A staged kernel also holds a block of dequantized keys or
+/// values; where that does not fit, a threadgroup takes fewer tiles, then
+/// fewer heads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PromptAttention {
+    pub(crate) heads: usize,
+    pub(crate) tiles: usize,
+    pub(crate) nsg: usize,
+    pub(crate) smem: usize,
+}
+
+impl PromptAttention {
+    /// The split, if one fits in `max_smem` bytes.
+    pub(crate) fn new(group: usize, hd: usize, staged: bool, max_smem: usize) -> Option<Self> {
+        let smem = |nsg: usize| {
+            nsg * (8 * hd * 2 + (8 * FLASH_C + 64) * 4) + if staged { FLASH_C * hd * 2 } else { 0 }
+        };
+        let divisors = (1..=group.min(4))
+            .rev()
+            .filter(|h| group.is_multiple_of(*h));
+        for heads in divisors {
+            for tiles in (1..=4 / heads).rev() {
+                let nsg = heads * tiles;
+                if smem(nsg) <= max_smem {
+                    return Some(Self {
+                        heads,
+                        tiles,
+                        nsg,
+                        smem: smem(nsg),
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Every compute pipeline of the backend.
 #[derive(Debug)]
 pub(crate) struct Pipelines {
     matvecs: Vec<(GgmlType, Matvec)>,
+    /// `(type, matmul_*, matmul_*_id)`.
+    matmuls: Vec<(GgmlType, Pipeline, Pipeline)>,
     embeds: Vec<(GgmlType, Pipeline, usize)>,
     pub(crate) rmsnorm: Pipeline,
     pub(crate) swiglu: Pipeline,
     pub(crate) copy: Pipeline,
     pub(crate) argmax: Pipeline,
     pub(crate) moe_route: Pipeline,
+    pub(crate) moe_map: Pipeline,
     pub(crate) moe_combine: Pipeline,
     pub(crate) moe_residual: Pipeline,
     /// `(G, D, pipeline)` from [`ATTENTIONS`].
     attentions: Vec<(usize, usize, Pipeline)>,
     pub(crate) attention_reduce: Pipeline,
+    pub(crate) attention_prep: Pipeline,
+    /// `(HD, pipeline, staged pipeline)` from [`ATTENTION_PROMPTS`].
+    attention_prompts: Vec<(usize, Pipeline, Pipeline)>,
+    pub(crate) attention_unrotate: Pipeline,
     pub(crate) delta_net: Pipeline,
     pub(crate) delta_net_batch: Pipeline,
+    pub(crate) delta_prep: Pipeline,
+    pub(crate) delta_chunk_prep: Pipeline,
+    pub(crate) delta_chunk_scan: Pipeline,
+    /// `delta_scan_r1_c{CH}`, by `CH`, the float4s of a key per lane.
+    delta_scans: Vec<(usize, Pipeline)>,
     pub(crate) delta_norm: Pipeline,
 }
 
@@ -324,18 +433,24 @@ impl Pipelines {
                 ))
             })
             .collect();
+        let matmuls = MATMULS
+            .iter()
+            .filter_map(|&(ty, name)| Some((ty, get(name).ok()?, get(&format!("{name}_id")).ok()?)))
+            .collect();
         let embeds = EMBEDS
             .iter()
             .filter_map(|&(ty, name, per_thread)| Some((ty, get(name).ok()?, per_thread)))
             .collect();
         Ok(Self {
             matvecs,
+            matmuls,
             embeds,
             rmsnorm: get("rmsnorm")?,
             swiglu: get("swiglu")?,
             copy: get("copy_f32")?,
             argmax: get("argmax")?,
             moe_route: get("moe_route")?,
+            moe_map: get("moe_map")?,
             moe_combine: get("moe_combine")?,
             moe_residual: get("moe_residual")?,
             attentions: ATTENTIONS
@@ -343,8 +458,27 @@ impl Pipelines {
                 .map(|&(g, d)| Ok((g, d, get(&format!("attention_g{g}_d{d}"))?)))
                 .collect::<Result<_, String>>()?,
             attention_reduce: get("attention_reduce")?,
+            attention_prep: get("attention_prep")?,
+            attention_prompts: ATTENTION_PROMPTS
+                .iter()
+                .map(|&hd| {
+                    Ok((
+                        hd,
+                        get(&format!("attention_prompt_d{hd}"))?,
+                        get(&format!("attention_prompt_staged_d{hd}"))?,
+                    ))
+                })
+                .collect::<Result<_, String>>()?,
+            attention_unrotate: get("attention_unrotate")?,
             delta_net: get("delta_net")?,
             delta_net_batch: get("delta_net_batch")?,
+            delta_prep: get("delta_prep")?,
+            delta_chunk_prep: get("delta_chunk_prep")?,
+            delta_chunk_scan: get("delta_chunk_scan")?,
+            delta_scans: [1, 2, 4]
+                .iter()
+                .map(|&c| Ok((c, get(&format!("delta_scan_r1_c{c}"))?)))
+                .collect::<Result<_, String>>()?,
             delta_norm: get("delta_norm")?,
         })
     }
@@ -359,6 +493,16 @@ impl Pipelines {
         self.matvecs.iter().find(|(t, _)| *t == ty).map(|(_, m)| m)
     }
 
+    /// The matrix-matrix kernel for weights of type `ty`.
+    pub(crate) fn matmul(&self, ty: GgmlType) -> Option<&Pipeline> {
+        self.matmuls.iter().find(|m| m.0 == ty).map(|m| &m.1)
+    }
+
+    /// The expert matrix-matrix kernel for weights of type `ty`.
+    pub(crate) fn matmul_id(&self, ty: GgmlType) -> Option<&Pipeline> {
+        self.matmuls.iter().find(|m| m.0 == ty).map(|m| &m.2)
+    }
+
     /// The attention kernel for `group` query heads per key head and heads
     /// of `head_dim` values, and the `G` it was built for.
     pub(crate) fn attention(&self, group: usize, head_dim: usize) -> Option<(&Pipeline, usize)> {
@@ -368,6 +512,31 @@ impl Pipelines {
             .iter()
             .find(|a| (a.0, a.1) == (g, d))
             .map(|a| (&a.2, a.0))
+    }
+
+    /// The prompt attention kernel for heads of `head_dim` values.
+    pub(crate) fn attention_prompt(&self, head_dim: usize) -> Option<&Pipeline> {
+        self.attention_prompts
+            .iter()
+            .find(|a| a.0 == head_dim)
+            .map(|a| &a.1)
+    }
+
+    /// The prompt attention kernel for caches of any type.
+    pub(crate) fn attention_prompt_staged(&self, head_dim: usize) -> Option<&Pipeline> {
+        self.attention_prompts
+            .iter()
+            .find(|a| a.0 == head_dim)
+            .map(|a| &a.2)
+    }
+
+    /// The DeltaNet scan for keys of `d_k` values (at most 512).
+    pub(crate) fn delta_scan(&self, d_k: usize) -> Option<&Pipeline> {
+        let ch = d_k.div_ceil(128).next_power_of_two();
+        self.delta_scans
+            .iter()
+            .find(|(c, _)| *c == ch)
+            .map(|(_, p)| p)
     }
 
     /// The embedding kernel for type `ty` and the values each thread writes.

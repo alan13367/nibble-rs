@@ -13,11 +13,14 @@
 //! is a few command buffers: the first is committed after a few dispatches,
 //! so the GPU starts while the rest of the batch is encoded, and the last
 //! when the batch ends. Batches whose logits are not needed are not waited
-//! for, so a prompt streams to the GPU. For now an op over a batch encodes
-//! the dispatch of each token in turn, at that token's rows of the vectors:
-//! each token gets exactly its result in a batch of its own. The model file's memory map is
-//! wrapped in a buffer without a copy; activations are f32, and the KV
-//! cache is f16.
+//! for, so a prompt streams to the GPU. A batch of up to
+//! [`MATMUL_MIN_BATCH`] tokens (a draft being verified) gives each token
+//! exactly its result in a batch of its own; a longer one (a prompt)
+//! multiplies matrices with simdgroup-matrix tiles, attends with a flash
+//! attention kernel and splits each DeltaNet layer into a parallel pass and
+//! a scan, rounding like llama.cpp's batched path rather than like
+//! decoding. The model file's memory map is wrapped in a buffer without a
+//! copy; activations are f32, and the KV cache is f16.
 //!
 //! Decoding one token is a chain of dependent dispatches, each waiting for
 //! the last (4–6 µs each on an M4 Max, which bounds small models more than
@@ -36,15 +39,15 @@ mod weights;
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use device::{Buffer, Commands, Device, Size};
+use device::{Buffer, Commands, Device, Pipeline, Size};
 use kernels::{
-    AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, MatvecArgs, MoeArgs,
-    MoeSumArgs, Pipelines, RmsArgs, RouteArgs,
+    AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, FlashArgs, MatmulArgs,
+    MatmulIdArgs, MatvecArgs, MoeArgs, MoeMapArgs, MoeSumArgs, Pipelines, RmsArgs, RouteArgs,
 };
 
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_LOGIT_ROWS, MAX_PENDING, ModelData,
-    Param, QkNorm,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvCacheType, KvTypes, MAX_LOGIT_ROWS,
+    MAX_PENDING, ModelData, Param, QkNorm,
 };
 use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
@@ -61,6 +64,17 @@ const MAX_EXPERTS: usize = 4096;
 /// threadgroup updates (`DELTA_ROWS` in the shader per simdgroup).
 const DELTA_SIMDGROUPS: usize = 4;
 const DELTA_GROUP_ROWS: usize = DELTA_SIMDGROUPS * 4;
+/// Tokens per chunk of `delta_chunk_*` (`DCHUNK`), the head size they
+/// take (`DHEAD`), the floats a chunk's prep leaves (`DCHUNK_PREP`), and
+/// the threadgroup memory of the scan (the state rows, two chunks by 32
+/// rows, four diagonals, three values per token), in bytes.
+const DCHUNK: usize = 32;
+const DHEAD: usize = 128;
+const DCHUNK_PREP: usize = 2 * DCHUNK * DCHUNK + DCHUNK;
+const DCHUNK_SCAN_SMEM: usize = 4 * (32 * DHEAD + 2 * DCHUNK * 32 + 4 * 64 + 3 * DCHUNK);
+
+/// Simdgroups per threadgroup of `delta_scan`, one state row each.
+const SCAN_SIMDGROUPS: usize = 8;
 
 /// Simdgroups per threadgroup of `attention` (`ATT_SIMDGROUPS` in the shader).
 const ATTENTION_SIMDGROUPS: usize = 8;
@@ -95,6 +109,13 @@ impl AttentionPlan {
         (self.g + 3 + ATTENTION_SIMDGROUPS) * head_dim + self.g * chunk
     }
 }
+
+/// Batches of more than this many tokens multiply with the matrix-matrix
+/// kernels (ggml-metal's `mul_mm`, which rounds inputs to f16), smaller ones
+/// with the matrix-vector kernels, bit-identical to decoding each token.
+/// llama.cpp takes `mul_mm` above 16 inputs too (its few-row kernels cover
+/// 2 to 16), and a draft being verified is at most [`MAX_LOGIT_ROWS`] long.
+const MATMUL_MIN_BATCH: usize = MAX_LOGIT_ROWS;
 
 /// Dispatches after which a token's first commands are committed, so the GPU
 /// starts while the CPU encodes the rest, and after which later ones are.
@@ -161,6 +182,19 @@ pub(crate) struct MetalBackend<'m> {
     /// One DeltaNet layer's state, which a batch that stays pending runs
     /// on; allocated by the first batch that needs it.
     delta_work: Option<Buffer>,
+    /// The types of the attention caches it makes, and their bytes so far.
+    kv: KvTypes,
+    kv_bytes: usize,
+    /// The chunked delta rule's per-chunk matrices (`delta_chunk_prep`),
+    /// and the floats they have room for.
+    delta_chunks: Option<(Buffer, usize)>,
+    /// The expert tiles and slot lists of a prompt batch (`moe_map`), and
+    /// the slots they have room for; allocated by the first batch that
+    /// needs them.
+    moe_map: Option<(Buffer, Buffer, usize)>,
+    /// Buffers replaced while commands that use them may still run (command
+    /// buffers do not retain them), freed at the next sync.
+    retired: Vec<Buffer>,
     attention: AttentionPlan,
     n_ctx: usize,
     /// Tokens in the batch being encoded.
@@ -197,6 +231,21 @@ fn u32_of(n: usize, what: &str) -> std::result::Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("{what} ({n}) is too large for the Metal kernels"))
 }
 
+/// The `KV_*` code of a cache type in the shaders (`shaders/kv.metal`).
+const fn kv_code(ty: KvCacheType) -> u32 {
+    match ty {
+        KvCacheType::F16 => 0,
+        KvCacheType::F32 => 1,
+        KvCacheType::Bf16 => 2,
+        KvCacheType::Q8_0 => 3,
+        KvCacheType::Q4_0 => 4,
+        KvCacheType::Q4_1 => 5,
+        KvCacheType::Iq4Nl => 6,
+        KvCacheType::Q5_0 => 7,
+        KvCacheType::Q5_1 => 8,
+    }
+}
+
 /// Copies `data` into the start of `buffer`.
 ///
 /// # Safety
@@ -226,7 +275,7 @@ unsafe fn load(buffer: &Buffer, out: &mut [f32]) {
 impl<'m> MetalBackend<'m> {
     /// A backend on the system's default GPU for sessions of up to `n_ctx`
     /// positions of `model`.
-    pub(crate) fn new(model: ModelData<'m>, n_ctx: usize) -> Result<Self> {
+    pub(crate) fn new(model: ModelData<'m>, n_ctx: usize, kv: KvTypes) -> Result<Self> {
         let device = Device::system_default().map_err(backend_error)?;
         let mut pipelines = Pipelines::new(&device).map_err(backend_error)?;
         check_wide_matvecs(&device, &mut pipelines).map_err(backend_error)?;
@@ -267,6 +316,11 @@ impl<'m> MetalBackend<'m> {
             slots,
             partials,
             delta_work: None,
+            kv,
+            kv_bytes: 0,
+            delta_chunks: None,
+            moe_map: None,
+            retired: Vec::new(),
             attention,
             n_ctx,
             n: 0,
@@ -344,6 +398,9 @@ impl<'m> MetalBackend<'m> {
             if let Err(e) = commands.wait() {
                 self.gpu_error.get_or_insert(e);
             }
+        }
+        if self.commands.is_none() {
+            self.retired.clear();
         }
         self.gpu_result()
     }
@@ -536,7 +593,137 @@ impl<'m> MetalBackend<'m> {
             commands.barrier();
         }
         let (pipelines, weights, n) = (&self.pipelines, &self.weights, self.n);
-        let result = encode_matvec(commands, pipelines, weights, w, (x, 0), (out, 0), output, n);
+        let result = if n > MATMUL_MIN_BATCH && matmul_covers(pipelines, w) {
+            let add = match output {
+                Output::Store => false,
+                Output::Add => true,
+                Output::SwiGlu(_) => {
+                    return self.fail("a SwiGLU product of a prompt batch".to_owned());
+                }
+            };
+            encode_matmul(commands, pipelines, weights, w, x, out, add, n)
+        } else {
+            encode_matvec(commands, pipelines, weights, w, (x, 0), (out, 0), output, n)
+        };
+        if let Err(e) = result {
+            self.fail(e);
+        }
+    }
+}
+
+impl MetalBackend<'_> {
+    /// Whether the expert products of this batch multiply tiles of slots
+    /// (`matmul_*_id`) rather than one slot at a time: prompt batches, as
+    /// llama.cpp's `mul_mm_id`, for routers the map kernel covers (one
+    /// thread per expert).
+    fn moe_matmul(&self, w: &Experts) -> bool {
+        self.n > MATMUL_MIN_BATCH
+            && w.first.cols.is_multiple_of(32)
+            && self.pipelines.matmul_id(w.first.ty).is_some()
+            && w.count <= self.pipelines.moe_map.max_threads()
+    }
+
+    /// Encodes `moe_map` for the batch's `route` of `k` slots per token
+    /// over `n_expert` experts. False after a failure.
+    fn encode_moe_map(&mut self, route: &Buffer, k: usize, n_expert: usize) -> bool {
+        let slots = self.n * k;
+        if self.moe_map.as_ref().is_none_or(|m| m.2 < slots) {
+            // The most tiles: the full ones, and a partial one per expert.
+            let tiles = slots.div_ceil(32) + n_expert.min(slots);
+            let made = self
+                .device
+                .buffer(4 * (1 + 3 * tiles))
+                .and_then(|t| Ok((t, self.device.buffer(4 * (slots + n_expert))?)));
+            match made {
+                Ok((t, i)) => {
+                    if let Some((old_t, old_i, _)) = self.moe_map.replace((t, i, slots)) {
+                        self.retired.extend([old_t, old_i]);
+                    }
+                }
+                Err(e) => {
+                    self.fail(e);
+                    return false;
+                }
+            }
+        }
+        let args = MoeMapArgs {
+            n: self.n as u32,
+            k: k as u32,
+            n_expert: n_expert as u32,
+        };
+        if !self.reserve(1) {
+            return false;
+        }
+        let (Some(commands), Some((tiles, ids, _))) =
+            (self.commands.as_mut(), self.moe_map.as_ref())
+        else {
+            return false;
+        };
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.moe_map);
+        commands.set_bytes(0, &args);
+        commands.set_buffer(1, route, 0);
+        commands.set_buffer(2, tiles, 0);
+        commands.set_buffer(3, ids, 0);
+        commands.set_threadgroup_memory(
+            0,
+            (2 * 4 * n_expert + 2 * n_expert * k).next_multiple_of(16),
+        );
+        commands.dispatch(Size::new(1, 1, 1), Size::new(n_expert, 1, 1));
+        true
+    }
+
+    /// Encodes the expert products of every slot with `matmul_*_id`, after
+    /// [`Self::encode_moe_map`]: `out_s = w_e · x`, the input row `s` of `x`
+    /// with `per_slot`, else row `s / k`.
+    fn encode_matmul_id(
+        &mut self,
+        w: &Experts,
+        x: &Buffer,
+        out: &Buffer,
+        k: usize,
+        per_slot: bool,
+    ) {
+        if !self.reserve(1) {
+            return;
+        }
+        let f = &w.first;
+        let result = (|| {
+            let pipeline = self
+                .pipelines
+                .matmul_id(f.ty)
+                .ok_or_else(|| format!("no expert matrix kernel for {} weights", f.ty))?;
+            let (tiles, ids, _) = self.moe_map.as_ref().ok_or("no expert map")?;
+            let args = MatmulIdArgs {
+                cols: u32_of(f.cols, "a matrix width")?,
+                rows: u32_of(f.rows, "a matrix height")?,
+                row_bytes: u32_of(f.row_bytes, "a matrix row")?,
+                expert_bytes: u32_of(f.rows * f.row_bytes, "an expert")?,
+                k: u32_of(k, "an expert count")?,
+                per_slot: u32::from(per_slot),
+            };
+            let (w_buffer, w_offset) = self
+                .weights
+                .locate(&w.all())
+                .ok_or_else(|| format!("experts at byte {} are outside the model", f.offset))?;
+            let slots = self.n * k;
+            let max_tiles = slots.div_ceil(32) + w.count.min(slots);
+            let commands = self.commands.as_mut().ok_or("no commands")?;
+            commands.barrier();
+            commands.set_pipeline(pipeline);
+            commands.set_bytes(0, &args);
+            commands.set_buffer(1, w_buffer, w_offset);
+            commands.set_buffer(2, x, 0);
+            commands.set_buffer(3, tiles, 0);
+            commands.set_buffer(4, ids, 0);
+            commands.set_buffer(5, out, 0);
+            commands.set_threadgroup_memory(0, kernels::MATMUL_SMEM);
+            commands.dispatch(
+                Size::new(max_tiles, f.rows.div_ceil(kernels::MATMUL_ROWS), 1),
+                Size::new(kernels::MATMUL_THREADS, 1, 1),
+            );
+            Ok::<_, String>(())
+        })();
         if let Err(e) = result {
             self.fail(e);
         }
@@ -621,6 +808,61 @@ impl MetalBackend<'_> {
             self.fail(e);
         }
     }
+}
+
+/// Whether the matrix-matrix kernels cover products with `w`.
+fn matmul_covers(pipelines: &Pipelines, w: &Weight) -> bool {
+    w.cols.is_multiple_of(32) && pipelines.matmul(w.ty).is_some()
+}
+
+/// Encodes `out = w · x` (`out += w · x` with `add`) for the `n` rows of
+/// `x` into `commands`, with the matrix-matrix kernel of `w`'s type.
+#[expect(clippy::too_many_arguments, reason = "one dispatch")]
+fn encode_matmul(
+    commands: &mut Commands,
+    pipelines: &Pipelines,
+    weights: &Weights<'_>,
+    w: &Weight,
+    x: &Buffer,
+    out: &Buffer,
+    add: bool,
+    n: usize,
+) -> std::result::Result<(), String> {
+    let pipeline = pipelines
+        .matmul(w.ty)
+        .ok_or_else(|| format!("no matrix kernel for {} weights", w.ty))?;
+    if !w.cols.is_multiple_of(32) {
+        return Err(format!("{} columns is not a multiple of 32", w.cols));
+    }
+    let args = MatmulArgs {
+        cols: u32_of(w.cols, "a matrix width")?,
+        rows: u32_of(w.rows, "a matrix height")?,
+        row_bytes: u32_of(w.row_bytes, "a matrix row")?,
+        n: u32_of(n, "a batch")?,
+        mode: if add {
+            kernels::MATVEC_ADD
+        } else {
+            kernels::MATVEC_STORE
+        },
+    };
+    let (w_buffer, w_offset) = weights
+        .locate(w)
+        .ok_or_else(|| format!("a weight at byte {} is outside the model", w.offset))?;
+    commands.set_pipeline(pipeline);
+    commands.set_bytes(0, &args);
+    commands.set_buffer(1, w_buffer, w_offset);
+    commands.set_buffer(2, x, 0);
+    commands.set_buffer(3, out, 0);
+    commands.set_threadgroup_memory(0, kernels::MATMUL_SMEM);
+    commands.dispatch(
+        Size::new(
+            n.div_ceil(kernels::MATMUL_INPUTS),
+            w.rows.div_ceil(kernels::MATMUL_ROWS),
+            1,
+        ),
+        Size::new(kernels::MATMUL_THREADS, 1, 1),
+    );
+    Ok(())
 }
 
 /// Encodes `out = w · x` (or as `output` says) into `commands`, for the
@@ -784,10 +1026,20 @@ impl Backend for MetalBackend<'_> {
 
     fn kv_cache(&mut self, n_ctx: usize) -> Result<MetalKvCache> {
         let c = self.model.config;
-        let bytes = 2 * c.n_head_kv * c.head_dim * n_ctx;
+        // Prompt attention reads whole blocks of positions (the ones past
+        // the end are masked).
+        let positions = n_ctx.next_multiple_of(kernels::FLASH_C);
+        let kv_dim = c.n_head_kv * c.head_dim;
+        let buffer = |ty: KvCacheType| {
+            self.device
+                .buffer(ty.bytes(kv_dim) * positions)
+                .map_err(backend_error)
+        };
+        let (k, v) = (buffer(self.kv.k)?, buffer(self.kv.v)?);
+        self.kv_bytes += (self.kv.k.bytes(kv_dim) + self.kv.v.bytes(kv_dim)) * positions;
         Ok(MetalKvCache {
-            k: self.device.buffer(bytes).map_err(backend_error)?,
-            v: self.device.buffer(bytes).map_err(backend_error)?,
+            k,
+            v,
             len: 0,
             capacity: n_ctx,
         })
@@ -837,6 +1089,15 @@ impl Backend for MetalBackend<'_> {
     ) {
         let (g, u) = (&gate.first, &up.first);
         let route = &route.buffer;
+        if self.moe_matmul(gate) && self.moe_matmul(up) {
+            if self.encode_moe_map(route, k, gate.count) {
+                self.encode_matmul_id(gate, &x.buffer, &out.buffer, k, false);
+                self.encode_matmul_id(up, &x.buffer, &up_out.buffer, k, false);
+                let n = self.n * k * g.rows;
+                self.elementwise(|p| &p.swiglu, n, &[&out.buffer, &up_out.buffer]);
+            }
+            return;
+        }
         if (g.ty, g.cols, g.rows, g.row_bytes) == (u.ty, u.cols, u.rows, u.row_bytes) {
             let output = Output::SwiGlu(&up.first);
             return self.encode_matvec_id(
@@ -882,15 +1143,21 @@ impl Backend for MetalBackend<'_> {
     ) {
         let e = down.first.rows;
         let (route, products) = (&route.buffer, &products.buffer);
-        self.encode_matvec_id(
-            down,
-            None,
-            &hidden.buffer,
-            products,
-            route,
-            (k, true),
-            Output::Store,
-        );
+        if self.moe_matmul(down) {
+            if self.encode_moe_map(route, k, down.count) {
+                self.encode_matmul_id(down, &hidden.buffer, products, k, true);
+            }
+        } else {
+            self.encode_matvec_id(
+                down,
+                None,
+                &hidden.buffer,
+                products,
+                route,
+                (k, true),
+                Output::Store,
+            );
+        }
         let args = MoeSumArgs {
             n: e as u32,
             k: k as u32,
@@ -951,6 +1218,10 @@ impl Backend for MetalBackend<'_> {
                 d.d_k
             )))
         }
+    }
+
+    fn kv_bytes(&self) -> usize {
+        self.kv_bytes
     }
 
     fn kv_len(&self, cache: &MetalKvCache) -> usize {
@@ -1278,8 +1549,12 @@ impl Backend for MetalBackend<'_> {
         up_out: &mut MetalVector,
     ) {
         let x = &x.buffer;
-        if (gate.ty, gate.cols, gate.rows, gate.row_bytes)
-            == (up.ty, up.cols, up.rows, up.row_bytes)
+        // A prompt batch multiplies both matrices, then applies the SwiGLU,
+        // as llama.cpp does.
+        let matmul = self.n > MATMUL_MIN_BATCH && matmul_covers(&self.pipelines, gate);
+        if !matmul
+            && (gate.ty, gate.cols, gate.rows, gate.row_bytes)
+                == (up.ty, up.cols, up.rows, up.row_bytes)
         {
             return self.encode_matvec(gate, x, &out.buffer, Output::SwiGlu(up), true);
         }
@@ -1319,28 +1594,68 @@ impl Backend for MetalBackend<'_> {
         let (q_norm, k_norm) = norm.weights.map_or((0, 0), |(q, k)| {
             (Self::param_offset(q), Self::param_offset(k))
         });
-        for t in 0..n {
-            // Each token appends its key and value, then attends to every
-            // position up to its own.
-            cache.len += 1;
-            let chunk = plan.chunk(cache.len, c.n_head_kv);
-            let n_chunks = cache.len.div_ceil(chunk);
-            let args = AttentionArgs {
-                n_pos: cache.len as u32,
-                head_dim: hd as u32,
-                group: group as u32,
+        let kv = self.kv;
+        let rot_v = kv.rot_v(hd);
+        // With a rotated value cache the output is rotated back, and gated,
+        // by `attention_unrotate`.
+        let gated = norm.gated && rot_v.is_none();
+        let args = |n_pos: usize, chunk: usize, n_chunks: usize| AttentionArgs {
+            n_pos: n_pos as u32,
+            head_dim: hd as u32,
+            group: group as u32,
+            kv_dim: kv_dim as u32,
+            q_stride: q_stride as u32,
+            gated: u32::from(gated),
+            n_rot: c.rope_dims as u32,
+            norm: u32::from(norm.weights.is_some()),
+            chunk: chunk as u32,
+            n_chunks: n_chunks as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            base: c.rope_base,
+            eps: norm.eps,
+            k_type: kv_code(kv.k),
+            v_type: kv_code(kv.v),
+            k_row: kv.k.bytes(kv_dim) as u32,
+            v_row: kv.v.bytes(kv_dim) as u32,
+            rot_k: kv.rot_k(hd).unwrap_or(0) as u32,
+            rot_v: rot_v.unwrap_or(0) as u32,
+        };
+        let first = cache.len;
+        // f16 caches are multiplied from device memory, others from blocks
+        // dequantized into threadgroup memory.
+        let staged = kv != KvTypes::default();
+        let shape =
+            kernels::PromptAttention::new(group, hd, staged, self.device.max_threadgroup_memory());
+        fn flash(p: &Pipelines, staged: bool, hd: usize) -> Option<&Pipeline> {
+            if staged {
+                p.attention_prompt_staged(hd)
+            } else {
+                p.attention_prompt(hd)
+            }
+        }
+        let prompt = n > MATMUL_MIN_BATCH
+            && shape.is_some_and(|s| {
+                flash(&self.pipelines, staged, hd).is_some_and(|p| p.max_threads() >= 32 * s.nsg)
+            });
+        if let (true, Some(shape)) = (prompt, shape) {
+            let prep = args(cache.len, 0, 0);
+            let flash_args = FlashArgs {
+                n: n as u32,
+                n_past: cache.len as u32,
                 kv_dim: kv_dim as u32,
                 q_stride: q_stride as u32,
-                gated: u32::from(norm.gated),
-                n_rot: c.rope_dims as u32,
-                norm: u32::from(norm.weights.is_some()),
-                chunk: chunk as u32,
-                n_chunks: n_chunks as u32,
-                scale: 1.0 / (hd as f32).sqrt(),
-                base: c.rope_base,
-                eps: norm.eps,
-                pad: 0,
+                gated: u32::from(gated),
+                n_head: c.n_head as u32,
+                scale: prep.scale,
+                group: group as u32,
+                heads: shape.heads as u32,
+                tiles: shape.tiles as u32,
+                k_type: prep.k_type,
+                v_type: prep.v_type,
+                k_row: prep.k_row,
+                v_row: prep.v_row,
             };
+            cache.len += n;
             if !self.reserve(2) {
                 return;
             }
@@ -1348,40 +1663,112 @@ impl Backend for MetalBackend<'_> {
                 return;
             };
             let p = &self.pipelines;
-            let Some((pipeline, _)) = p.attention(group, hd) else {
+            let Some(flash) = flash(p, staged, hd) else {
                 return;
             };
-            let (q_at, kv_at, out_at) = (
-                4 * t * c.n_head * q_stride,
-                4 * t * kv_dim,
-                4 * t * c.n_head * hd,
-            );
             commands.barrier();
-            commands.set_pipeline(pipeline);
-            commands.set_bytes(0, &args);
-            commands.set_buffer(1, &q.buffer, q_at);
-            commands.set_buffer(2, &k.buffer, kv_at);
-            commands.set_buffer(3, &v.buffer, kv_at);
+            commands.set_pipeline(&p.attention_prep);
+            commands.set_bytes(0, &prep);
+            commands.set_buffer(1, &q.buffer, 0);
+            commands.set_buffer(2, &k.buffer, 0);
+            commands.set_buffer(3, &v.buffer, 0);
             commands.set_buffer(4, &self.params, q_norm);
             commands.set_buffer(5, &self.params, k_norm);
             commands.set_buffer(6, &cache.k, 0);
             commands.set_buffer(7, &cache.v, 0);
-            commands.set_buffer(8, &self.partials, 0);
-            commands.set_buffer(9, &out.buffer, out_at);
-            commands.set_threadgroup_memory(0, 4 * plan.floats(hd, chunk));
+            commands.set_threadgroup_memory(0, 4 * 2 * hd);
             commands.dispatch(
-                Size::new(c.n_head_kv, n_chunks, 1),
+                Size::new(c.n_head + c.n_head_kv, n, 1),
                 Size::new(32 * ATTENTION_SIMDGROUPS, 1, 1),
             );
-            if n_chunks > 1 {
+            commands.barrier();
+            commands.set_pipeline(flash);
+            commands.set_bytes(0, &flash_args);
+            commands.set_buffer(1, &q.buffer, 0);
+            commands.set_buffer(2, &cache.k, 0);
+            commands.set_buffer(3, &cache.v, 0);
+            commands.set_buffer(4, &out.buffer, 0);
+            commands.set_threadgroup_memory(0, shape.smem);
+            commands.dispatch(
+                Size::new(
+                    n.div_ceil(8 * shape.tiles),
+                    c.n_head_kv * (group / shape.heads),
+                    1,
+                ),
+                Size::new(32 * shape.nsg, 1, 1),
+            );
+        } else {
+            for t in 0..n {
+                // Each token appends its key and value, then attends to
+                // every position up to its own.
+                cache.len += 1;
+                let chunk = plan.chunk(cache.len, c.n_head_kv);
+                let n_chunks = cache.len.div_ceil(chunk);
+                let args = args(cache.len, chunk, n_chunks);
+                if !self.reserve(2) {
+                    return;
+                }
+                let Some(commands) = self.commands.as_mut() else {
+                    return;
+                };
+                let p = &self.pipelines;
+                let Some((pipeline, _)) = p.attention(group, hd) else {
+                    return;
+                };
+                let (q_at, kv_at, out_at) = (
+                    4 * t * c.n_head * q_stride,
+                    4 * t * kv_dim,
+                    4 * t * c.n_head * hd,
+                );
                 commands.barrier();
-                commands.set_pipeline(&p.attention_reduce);
+                commands.set_pipeline(pipeline);
                 commands.set_bytes(0, &args);
                 commands.set_buffer(1, &q.buffer, q_at);
-                commands.set_buffer(2, &self.partials, 0);
-                commands.set_buffer(3, &out.buffer, out_at);
-                commands.dispatch(Size::new(c.n_head, 1, 1), Size::new(hd.min(256), 1, 1));
+                commands.set_buffer(2, &k.buffer, kv_at);
+                commands.set_buffer(3, &v.buffer, kv_at);
+                commands.set_buffer(4, &self.params, q_norm);
+                commands.set_buffer(5, &self.params, k_norm);
+                commands.set_buffer(6, &cache.k, 0);
+                commands.set_buffer(7, &cache.v, 0);
+                commands.set_buffer(8, &self.partials, 0);
+                commands.set_buffer(9, &out.buffer, out_at);
+                commands.set_threadgroup_memory(0, 4 * plan.floats(hd, chunk));
+                commands.dispatch(
+                    Size::new(c.n_head_kv, n_chunks, 1),
+                    Size::new(32 * ATTENTION_SIMDGROUPS, 1, 1),
+                );
+                if n_chunks > 1 {
+                    commands.barrier();
+                    commands.set_pipeline(&p.attention_reduce);
+                    commands.set_bytes(0, &args);
+                    commands.set_buffer(1, &q.buffer, q_at);
+                    commands.set_buffer(2, &self.partials, 0);
+                    commands.set_buffer(3, &out.buffer, out_at);
+                    commands.dispatch(Size::new(c.n_head, 1, 1), Size::new(hd.min(256), 1, 1));
+                }
             }
+        }
+        if rot_v.is_some() {
+            let args = AttentionArgs {
+                gated: u32::from(norm.gated),
+                ..args(first, 0, 0)
+            };
+            if !self.reserve(1) {
+                return;
+            }
+            let Some(commands) = self.commands.as_mut() else {
+                return;
+            };
+            commands.barrier();
+            commands.set_pipeline(&self.pipelines.attention_unrotate);
+            commands.set_bytes(0, &args);
+            commands.set_buffer(1, &q.buffer, 0);
+            commands.set_buffer(2, &out.buffer, 0);
+            commands.set_threadgroup_memory(0, 4 * hd);
+            commands.dispatch(
+                Size::new(c.n_head, n, 1),
+                Size::new(32 * ATTENTION_SIMDGROUPS, 1, 1),
+            );
         }
     }
 
@@ -1392,7 +1779,7 @@ impl Backend for MetalBackend<'_> {
         eps: f32,
         state: &mut DeltaNetState<MetalVector>,
         qkv: &MetalVector,
-        _conv: &mut MetalVector,
+        conv: &mut MetalVector,
         z: &mut MetalVector,
         beta: &mut MetalVector,
         alpha: &mut MetalVector,
@@ -1472,38 +1859,154 @@ impl Backend for MetalBackend<'_> {
             eps,
             scale: args.scale,
         };
-        if !self.reserve(2) {
+        // A prompt batch: the replayed tokens alone, then every token's
+        // inputs in parallel, then the scan (see `delta_prep`), which stages
+        // up to 16 tokens' q, k, v, beta and decay at a time.
+        let scan_row = 2 * d.d_k + SCAN_SIMDGROUPS + 2;
+        // Each thread loads `SCAN_LOADS` (4) float4s of q and k and one other
+        // value of a block.
+        let threads = 32 * SCAN_SIMDGROUPS;
+        let stage = (self.device.max_threadgroup_memory() / (4 * scan_row))
+            .min(4 * threads / (d.d_k / 2))
+            .min(threads / (SCAN_SIMDGROUPS + 2))
+            .min(16);
+        let prompt = n > MATMUL_MIN_BATCH
+            && conv.len >= n * d.conv_dim()
+            && stage > 0
+            && self.pipelines.delta_scan(d.d_k).is_some();
+        // The chunked form reads whole chunks of the batch buffers.
+        let n_chunks = n.div_ceil(DCHUNK);
+        let chunked = prompt
+            && d.d_k == DHEAD
+            && d.d_v == DHEAD
+            && conv.len >= n_chunks * DCHUNK * d.conv_dim()
+            && beta.len >= n * d.n_v_heads
+            && DCHUNK_SCAN_SMEM <= self.device.max_threadgroup_memory();
+        let chunk_floats = d.n_v_heads * n_chunks * DCHUNK_PREP;
+        if chunked
+            && self
+                .delta_chunks
+                .as_ref()
+                .is_none_or(|c| c.1 < chunk_floats)
+        {
+            match self.device.buffer(4 * chunk_floats) {
+                Ok(b) => {
+                    if let Some((old, _)) = self.delta_chunks.replace((b, chunk_floats)) {
+                        self.retired.push(old);
+                    }
+                }
+                Err(e) => return self.fail(e),
+            }
+        }
+        if !self.reserve(if prompt { 5 } else { 2 }) {
             return;
         }
         let Some(commands) = self.commands.as_mut() else {
             return;
         };
         let ssm = &state.ssm.buffer;
+        let params = &self.params;
+        let groups = Size::new(d.n_v_heads, d.d_v.div_ceil(DELTA_GROUP_ROWS), 1);
+        let threads = Size::new(32 * DELTA_SIMDGROUPS, 1, 1);
+        if prompt {
+            if r > 0 {
+                let replay = DeltaBatchArgs { n: 0, ..batch };
+                commands.barrier();
+                commands.set_pipeline(&self.pipelines.delta_net_batch);
+                commands.set_bytes(0, &replay);
+                commands.set_buffer(1, &qkv.buffer, 0);
+                commands.set_buffer(2, &state.conv.buffer, 0);
+                commands.set_buffer(3, params, Self::param_offset(p.conv));
+                commands.set_buffer(4, &beta.buffer, 0);
+                commands.set_buffer(5, &alpha.buffer, 0);
+                commands.set_buffer(6, params, Self::param_offset(p.dt_bias));
+                commands.set_buffer(7, params, Self::param_offset(p.a));
+                commands.set_buffer(8, ssm, 0);
+                commands.set_buffer(9, &out.buffer, 0);
+                commands.set_buffer(10, ssm, 0);
+                commands.set_buffer(11, &state.pending_ba.buffer, 0);
+                commands.set_buffer(12, ssm, 0);
+                commands.set_threadgroup_memory(0, 4 * (2 * d.d_k + DELTA_GROUP_ROWS));
+                commands.dispatch(groups, threads);
+            }
+            // Concurrent with the replay, which reads none of its outputs.
+            if r == 0 {
+                commands.barrier();
+            }
+            commands.set_pipeline(&self.pipelines.delta_prep);
+            commands.set_bytes(0, &batch);
+            commands.set_buffer(1, &qkv.buffer, 0);
+            commands.set_buffer(2, &state.conv.buffer, 0);
+            commands.set_buffer(3, params, Self::param_offset(p.conv));
+            commands.set_buffer(4, &beta.buffer, 0);
+            commands.set_buffer(5, &alpha.buffer, 0);
+            commands.set_buffer(6, params, Self::param_offset(p.dt_bias));
+            commands.set_buffer(7, params, Self::param_offset(p.a));
+            commands.set_buffer(8, &conv.buffer, 0);
+            commands.dispatch(Size::new(d.n_k_heads, n, 1), threads);
+            commands.barrier();
+            if let (true, Some((chunks, _))) = (chunked, self.delta_chunks.as_ref()) {
+                commands.set_pipeline(&self.pipelines.delta_chunk_prep);
+                commands.set_bytes(0, &batch);
+                commands.set_buffer(1, &conv.buffer, 0);
+                commands.set_buffer(2, &beta.buffer, 0);
+                commands.set_buffer(3, &alpha.buffer, 0);
+                commands.set_buffer(4, chunks, 0);
+                commands.set_threadgroup_memory(0, 4 * (2 * DCHUNK * DCHUNK + 2 * DCHUNK));
+                commands.dispatch(Size::new(n_chunks, d.n_v_heads, 1), Size::new(128, 1, 1));
+                commands.barrier();
+                commands.set_pipeline(&self.pipelines.delta_chunk_scan);
+                commands.set_bytes(0, &batch);
+                commands.set_buffer(1, &conv.buffer, 0);
+                commands.set_buffer(2, &beta.buffer, 0);
+                commands.set_buffer(3, chunks, 0);
+                commands.set_buffer(4, ssm, 0);
+                commands.set_buffer(5, &out.buffer, 0);
+                commands.set_threadgroup_memory(0, DCHUNK_SCAN_SMEM);
+                commands.dispatch(Size::new(d.n_v_heads, d.d_v / 32, 1), Size::new(128, 1, 1));
+            }
+            if !chunked {
+                let Some(scan) = self.pipelines.delta_scan(d.d_k) else {
+                    return;
+                };
+                commands.set_pipeline(scan);
+                commands.set_bytes(6, &CountArgs { n: stage as u32 });
+                commands.set_threadgroup_memory(0, 4 * stage * scan_row);
+                commands.set_bytes(0, &batch);
+                commands.set_buffer(1, &conv.buffer, 0);
+                commands.set_buffer(2, &beta.buffer, 0);
+                commands.set_buffer(3, &alpha.buffer, 0);
+                commands.set_buffer(4, ssm, 0);
+                commands.set_buffer(5, &out.buffer, 0);
+                commands.dispatch(
+                    Size::new(d.n_v_heads, d.d_v.div_ceil(SCAN_SIMDGROUPS), 1),
+                    Size::new(32 * SCAN_SIMDGROUPS, 1, 1),
+                );
+            }
+        }
         let state_out = match &self.delta_work {
             Some(work) if pending => work,
             _ => ssm,
         };
-        let params = &self.params;
-        commands.barrier();
-        commands.set_pipeline(&self.pipelines.delta_net_batch);
-        commands.set_bytes(0, &batch);
-        commands.set_buffer(1, &qkv.buffer, 0);
-        commands.set_buffer(2, &state.conv.buffer, 0);
-        commands.set_buffer(3, params, Self::param_offset(p.conv));
-        commands.set_buffer(4, &beta.buffer, 0);
-        commands.set_buffer(5, &alpha.buffer, 0);
-        commands.set_buffer(6, params, Self::param_offset(p.dt_bias));
-        commands.set_buffer(7, params, Self::param_offset(p.a));
-        commands.set_buffer(8, ssm, 0);
-        commands.set_buffer(9, &out.buffer, 0);
-        commands.set_buffer(10, state_out, 0);
-        commands.set_buffer(11, &state.pending_ba.buffer, 0);
-        commands.set_buffer(12, ssm, 0);
-        commands.set_threadgroup_memory(0, 4 * (2 * d.d_k + DELTA_GROUP_ROWS));
-        commands.dispatch(
-            Size::new(d.n_v_heads, d.d_v.div_ceil(DELTA_GROUP_ROWS), 1),
-            Size::new(32 * DELTA_SIMDGROUPS, 1, 1),
-        );
+        if !prompt {
+            commands.barrier();
+            commands.set_pipeline(&self.pipelines.delta_net_batch);
+            commands.set_bytes(0, &batch);
+            commands.set_buffer(1, &qkv.buffer, 0);
+            commands.set_buffer(2, &state.conv.buffer, 0);
+            commands.set_buffer(3, params, Self::param_offset(p.conv));
+            commands.set_buffer(4, &beta.buffer, 0);
+            commands.set_buffer(5, &alpha.buffer, 0);
+            commands.set_buffer(6, params, Self::param_offset(p.dt_bias));
+            commands.set_buffer(7, params, Self::param_offset(p.a));
+            commands.set_buffer(8, ssm, 0);
+            commands.set_buffer(9, &out.buffer, 0);
+            commands.set_buffer(10, state_out, 0);
+            commands.set_buffer(11, &state.pending_ba.buffer, 0);
+            commands.set_buffer(12, ssm, 0);
+            commands.set_threadgroup_memory(0, 4 * (2 * d.d_k + DELTA_GROUP_ROWS));
+            commands.dispatch(groups, threads);
+        }
         commands.barrier();
         commands.set_pipeline(&self.pipelines.delta_norm);
         commands.set_bytes(0, &args);

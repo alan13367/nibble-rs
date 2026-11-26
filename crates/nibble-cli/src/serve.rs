@@ -88,6 +88,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
             .map(|m| m.len()),
         load_time,
         n_ctx: probe.n_ctx(),
+        kv: (probe.cache_types(), probe.kv_cache_bytes()),
         compute: probe.compute(),
         addr,
         api_key: options.api_key.is_some(),
@@ -105,6 +106,8 @@ struct Banner<'a> {
     file_bytes: Option<u64>,
     load_time: Duration,
     n_ctx: usize,
+    /// The cache types and the bytes of the KV caches.
+    kv: ((nibble::KvCacheType, nibble::KvCacheType), usize),
     /// What runs the sessions: threads and kernels, or the GPU.
     compute: String,
     addr: SocketAddr,
@@ -153,6 +156,14 @@ impl Banner<'_> {
             s.dim(&format!("  (model maximum {})", c.n_ctx_train))
         };
         out.push_str(&row("context", format!("{} tokens{max}", self.n_ctx)));
+        let ((k, v), kv_bytes) = self.kv;
+        out.push_str(&row(
+            "cache",
+            format!(
+                "K {k}, V {v}  {}",
+                s.dim(&format!("{} for the whole context", bytes(kv_bytes as u64)))
+            ),
+        ));
         out.push_str(&row("compute", self.compute.clone()));
         let auth = if self.api_key {
             "API key required".to_owned()

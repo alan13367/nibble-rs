@@ -717,6 +717,7 @@ fn session(model: &Model) -> nibble::Session<'_> {
             backend: nibble::BackendKind::Cpu,
             n_batch: 0,
             draft_max: 0,
+            ..Default::default()
         })
         .unwrap()
 }
@@ -881,6 +882,7 @@ fn drafting(
         backend,
         n_batch,
         draft_max: 3,
+        ..Default::default()
     };
     common::session_or_skip(model, options)
 }
@@ -1014,6 +1016,7 @@ fn drafting_does_not_change_generation() {
                         backend,
                         n_batch: 0,
                         draft_max,
+                        ..Default::default()
                     };
                     let mut s = common::session_or_skip(&model, options)?;
                     let mut sampler = Sampler::new(*config);

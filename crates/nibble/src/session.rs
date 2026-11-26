@@ -1,6 +1,6 @@
 //! Inference sessions: one sequence's tokens, cache and logits.
 
-use crate::backend::{Backend, BackendKind, MAX_LOGIT_ROWS};
+use crate::backend::{Backend, BackendKind, KvCacheType, KvTypes, MAX_LOGIT_ROWS};
 use crate::cpu::{self, CpuBackend};
 use crate::error::{Error, Result};
 #[cfg(target_os = "macos")]
@@ -36,6 +36,13 @@ pub struct SessionOptions {
     /// right. `0`, the default, does not draft. Needs a model with a head
     /// ([`Model::has_mtp`]); at most [`MAX_EVAL_ALL`]` - 1` are drafted.
     pub draft_max: usize,
+    /// The type of the cached attention keys (default
+    /// [`KvCacheType::F16`]), as llama.cpp's `--cache-type-k`.
+    pub cache_type_k: KvCacheType,
+    /// The type of the cached attention values (default
+    /// [`KvCacheType::F16`]), as llama.cpp's `--cache-type-v`. A quantized
+    /// type makes attention follow llama.cpp's flash-attention path.
+    pub cache_type_v: KvCacheType,
 }
 
 /// The default [`SessionOptions::n_batch`], llama.cpp's default batch.
@@ -49,6 +56,8 @@ impl Default for SessionOptions {
             backend: BackendKind::default(),
             n_batch: 0,
             draft_max: 0,
+            cache_type_k: KvCacheType::F16,
+            cache_type_v: KvCacheType::F16,
         }
     }
 }
@@ -141,21 +150,35 @@ impl<'m> Engine<'m> {
         rows: usize,
     ) -> Result<(Self, Option<String>)> {
         let mtp = options.draft_max > 0;
+        let kv = KvTypes {
+            k: options.cache_type_k,
+            v: options.cache_type_v,
+        };
+        let head_dim = model.config().head_dim;
+        for (which, ty) in [("K", kv.k), ("V", kv.v)] {
+            if !head_dim.is_multiple_of(ty.block_size()) {
+                return Err(Error::UnsupportedCacheType {
+                    which,
+                    ty,
+                    head_dim,
+                });
+            }
+        }
         let cpu = |threads: usize| -> Result<Self> {
             let threads = match threads {
                 0 => cpu::default_threads(),
                 n => n,
             };
-            let mut backend = CpuBackend::new(model.data(), n_ctx, threads);
+            let mut backend = CpuBackend::new(model.data(), n_ctx, threads, kv);
             let state = model.new_state(&mut backend, n_ctx, rows, mtp)?;
             Ok(Self::Cpu(Run { backend, state }))
         };
         match options.backend {
             BackendKind::Cpu => Ok((cpu(options.threads)?, None)),
-            BackendKind::Metal => Ok((Self::metal(model, n_ctx, rows, mtp)?, None)),
+            BackendKind::Metal => Ok((Self::metal(model, n_ctx, rows, mtp, kv)?, None)),
             // Only Metal exists to try, and only on macOS.
             BackendKind::Auto if !cfg!(target_os = "macos") => Ok((cpu(options.threads)?, None)),
-            BackendKind::Auto => match Self::metal(model, n_ctx, rows, mtp) {
+            BackendKind::Auto => match Self::metal(model, n_ctx, rows, mtp, kv) {
                 Ok(engine) => Ok((engine, None)),
                 Err(e) => Ok((cpu(options.threads)?, Some(e.to_string()))),
             },
@@ -163,14 +186,20 @@ impl<'m> Engine<'m> {
     }
 
     #[cfg(target_os = "macos")]
-    fn metal(model: &'m Model, n_ctx: usize, rows: usize, mtp: bool) -> Result<Self> {
-        let mut backend = MetalBackend::new(model.data(), n_ctx)?;
+    fn metal(model: &'m Model, n_ctx: usize, rows: usize, mtp: bool, kv: KvTypes) -> Result<Self> {
+        let mut backend = MetalBackend::new(model.data(), n_ctx, kv)?;
         let state = model.new_state(&mut backend, n_ctx, rows, mtp)?;
         Ok(Self::Metal(Run { backend, state }))
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn metal(_model: &'m Model, _n_ctx: usize, _rows: usize, _mtp: bool) -> Result<Self> {
+    fn metal(
+        _model: &'m Model,
+        _n_ctx: usize,
+        _rows: usize,
+        _mtp: bool,
+        _kv: KvTypes,
+    ) -> Result<Self> {
         Err(Error::Backend(
             "Metal is only available on macOS".to_owned(),
         ))
@@ -188,6 +217,7 @@ pub struct Session<'m> {
     engine: Engine<'m>,
     /// Why [`BackendKind::Auto`] fell back to the CPU.
     fallback: Option<String>,
+    kv: KvTypes,
     tokens: Vec<u32>,
     /// The logits of the last evaluation: one row, or one per token after
     /// [`Session::eval_all`] (grown then).
@@ -248,6 +278,10 @@ impl<'m> Session<'m> {
             rows,
             engine,
             fallback,
+            kv: KvTypes {
+                k: options.cache_type_k,
+                v: options.cache_type_v,
+            },
             tokens: Vec::new(),
             logits: vec![0.0; c.n_vocab],
             logits_row: 0,
@@ -314,6 +348,19 @@ impl<'m> Session<'m> {
     #[must_use]
     pub fn fallback_reason(&self) -> Option<&str> {
         self.fallback.as_deref()
+    }
+
+    /// Bytes of the attention layers' KV caches, allocated for the whole
+    /// context when the session started.
+    #[must_use]
+    pub fn kv_cache_bytes(&self) -> usize {
+        on_engine!(&self.engine, |b, _s| b.kv_bytes())
+    }
+
+    /// The types of the cached keys and values.
+    #[must_use]
+    pub fn cache_types(&self) -> (KvCacheType, KvCacheType) {
+        (self.kv.k, self.kv.v)
     }
 
     /// What runs the session, for logs: `10 threads, neon kernels` on the

@@ -49,6 +49,16 @@ The tokens generated are the same as without it. On an M4 Max, Qwen3.5-4B
 Q8_0 decodes at about 131 tok/s with `--draft 3` on Metal (73 without) and
 80 on the CPU (49); 2 or 3 drafts are best.
 
+`-ctk T` / `-ctv T` (`--cache-type-k`, `--cache-type-v`) choose the type of
+the cached attention keys and values, as llama.cpp's flags do: `f32`,
+`f16` (the default), `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0` or
+`q5_1`. `q8_0` halves the cache with almost no change in output; the 4-bit
+types quarter it but can hurt (Qwen3-0.6B's answers fall apart with 4-bit
+keys, in llama.cpp too). As in llama.cpp, quantized caches are rotated
+with a Walsh-Hadamard transform, and quantized values use flash attention.
+Output matches llama.cpp on the same types (`-fa on` when V is
+quantized). `serve` prints the cache's size for the whole context.
+
 ## OpenAI-compatible server
 
 ```sh

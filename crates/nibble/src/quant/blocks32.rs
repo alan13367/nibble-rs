@@ -255,6 +255,157 @@ pub(crate) fn dot_row(ty: GgmlType, row: &[u8], xq: &[u8]) -> f32 {
     sumf
 }
 
+/// Encodes `x` (a multiple of 32 values) as `ty` into `out`, as ggml's
+/// `quantize_row_*_ref` (`ggml-quants.c`) do, which is what its CPU
+/// backend stores in a KV cache of that type (`from_float` of
+/// `ggml_compute_forward_set_rows`). `IQ4_NL` takes the reference's single
+/// guess of the scale (`ntry = -1`), not `quantize_iq4_nl`'s search.
+///
+/// # Panics
+///
+/// If `ty` is not `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1` or `IQ4_NL`, or `out` is
+/// not exactly the bytes of `x` (internal invariants).
+pub(crate) fn quantize_row_ref(ty: GgmlType, x: &[f32], out: &mut [u8]) {
+    let bb = block_bytes(ty);
+    assert!(
+        bb > 0 && ty != GgmlType::Mxfp4,
+        "no reference quantizer for {ty}"
+    );
+    assert_eq!(out.len(), x.len() / QK8_0 * bb, "{ty} row size");
+    // `IQ4_NL`'s indices, which a block of zeros leaves as the block before
+    // set them, as the reference does (its scale is then 0).
+    let mut l = [0u8; QK8_0];
+    for (xb, block) in x
+        .as_chunks::<QK8_0>()
+        .0
+        .iter()
+        .zip(out.chunks_exact_mut(bb))
+    {
+        match ty {
+            GgmlType::Q4_0 | GgmlType::Q5_0 => quantize_block_sym(ty, xb, block),
+            GgmlType::Q4_1 | GgmlType::Q5_1 => quantize_block_min(ty, xb, block),
+            _ => quantize_block_iq4_nl(xb, block, &mut l),
+        }
+    }
+}
+
+/// The value of largest magnitude in `x` (the first of equal ones).
+fn signed_max(x: &[f32; QK8_0]) -> f32 {
+    let (mut amax, mut max) = (0.0f32, 0.0f32);
+    for &v in x {
+        if amax < v.abs() {
+            amax = v.abs();
+            max = v;
+        }
+    }
+    max
+}
+
+/// `quantize_row_q4_0_ref` / `quantize_row_q5_0_ref` for one block.
+fn quantize_block_sym(ty: GgmlType, x: &[f32; QK8_0], block: &mut [u8]) {
+    let five = ty == GgmlType::Q5_0;
+    let (levels, bias, top) = if five {
+        (-16.0f32, 16.5f32, 31u8)
+    } else {
+        (-8.0, 8.5, 15)
+    };
+    let d = signed_max(x) / levels;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    block[..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+    let qs_at = if five { 6 } else { 2 };
+    let mut qh = 0u32;
+    for j in 0..QK8_0 / 2 {
+        let x0 = x[j] * id;
+        let x1 = x[j + QK8_0 / 2] * id;
+        // C's `(int8_t)` conversion truncates, as `as` does in range.
+        let xi0 = ((x0 + bias) as i8 as u8).min(top);
+        let xi1 = ((x1 + bias) as i8 as u8).min(top);
+        block[qs_at + j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+        qh |= u32::from((xi0 & 0x10) >> 4) << j;
+        qh |= u32::from((xi1 & 0x10) >> 4) << (j + QK8_0 / 2);
+    }
+    if five {
+        block[2..6].copy_from_slice(&qh.to_le_bytes());
+    }
+}
+
+/// `quantize_row_q4_1_ref` / `quantize_row_q5_1_ref` for one block.
+fn quantize_block_min(ty: GgmlType, x: &[f32; QK8_0], block: &mut [u8]) {
+    let five = ty == GgmlType::Q5_1;
+    let (mut min, mut max) = (f32::MAX, -f32::MAX);
+    for &v in x {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    let d = (max - min) / if five { 31.0 } else { 15.0 };
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    block[..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+    block[2..4].copy_from_slice(&f32_to_f16(min).to_le_bytes());
+    let qs_at = if five { 8 } else { 4 };
+    let mut qh = 0u32;
+    for j in 0..QK8_0 / 2 {
+        let x0 = (x[j] - min) * id;
+        let x1 = (x[j + QK8_0 / 2] - min) * id;
+        let (xi0, xi1) = if five {
+            ((x0 + 0.5) as u8, (x1 + 0.5) as u8)
+        } else {
+            (
+                ((x0 + 0.5) as i8 as u8).min(15),
+                ((x1 + 0.5) as i8 as u8).min(15),
+            )
+        };
+        block[qs_at + j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+        qh |= u32::from((xi0 & 0x10) >> 4) << j;
+        qh |= u32::from((xi1 & 0x10) >> 4) << (j + QK8_0 / 2);
+    }
+    if five {
+        block[4..8].copy_from_slice(&qh.to_le_bytes());
+    }
+}
+
+/// `quantize_row_iq4_nl_impl` for one block of 32 as
+/// `quantize_row_iq4_nl_ref` calls it (no importance weights, `ntry = -1`):
+/// the scale guessed from the largest magnitude, the nearest values, then
+/// the least-squares scale for them.
+fn quantize_block_iq4_nl(x: &[f32; QK8_0], block: &mut [u8], l: &mut [u8; QK8_0]) {
+    let values = KVALUES_IQ4NL.map(f32::from);
+    let mut mid = [0.0f32; 15];
+    for k in 0..15 {
+        mid[k] = 0.5 * (values[k] + values[k + 1]);
+    }
+    let best = |v: f32| -> usize { 15 - mid.iter().filter(|&&m| v < m).count() };
+    let (mut amax, mut max) = (0.0f32, 0.0f32);
+    for &v in x {
+        if v.abs() > amax {
+            amax = v.abs();
+            max = v;
+        }
+    }
+    let mut d = 0.0f32;
+    if amax >= 1e-15 {
+        let id = 1.0 / (max / values[0]);
+        let (mut sqx, mut sq2) = (0.0f32, 0.0f32);
+        for (j, &v) in x.iter().enumerate() {
+            let idx = best(id * v);
+            l[j] = idx as u8;
+            let w = v * v;
+            let q = values[idx];
+            // `sqx += w*q*xb[j]`, contracted to a fused multiply-add.
+            sqx = (w * q).mul_add(v, sqx);
+            sq2 = (w * q).mul_add(q, sq2);
+        }
+        d = if sq2 > 0.0 { sqx / sq2 } else { 0.0 };
+    }
+    block[..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+    for j in 0..16 {
+        block[2 + j] = l[j] | (l[j + 16] << 4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

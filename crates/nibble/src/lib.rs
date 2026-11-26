@@ -39,7 +39,7 @@ pub mod sampler;
 mod session;
 pub mod tokenizer;
 
-pub use backend::BackendKind;
+pub use backend::{BackendKind, KvCacheType};
 pub use error::{Error, Result};
 pub use model::{Architecture, Model, ModelConfig};
 pub use nibble_gguf as gguf;

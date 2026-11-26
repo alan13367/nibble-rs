@@ -70,10 +70,12 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     let mut session = model.session(model_opts.session_options())?;
     crate::args::report_fallback(&session);
     let mut sampler = Sampler::new(sampling.config());
+    let (k, v) = session.cache_types();
     eprintln!(
-        "nibble: {} prompt tokens, context {}, {}, seed {}",
+        "nibble: {} prompt tokens, context {} (KV cache K {k}, V {v}, {:.0} MiB), {}, seed {}",
         tokens.len(),
         session.n_ctx(),
+        session.kv_cache_bytes() as f64 / (1024.0 * 1024.0),
         session.compute(),
         sampler.config().seed
     );

@@ -20,6 +20,8 @@
 
 use std::ops::Range;
 
+use nibble_gguf::GgmlType;
+
 use crate::cpu::{Experts, Weight};
 use crate::error::Result;
 use crate::model::ModelConfig;
@@ -72,6 +74,169 @@ impl BackendKind {
 impl std::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// The type of the keys or of the values in an attention layer's cache:
+/// llama.cpp's `--cache-type-k` / `--cache-type-v` types. Smaller types fit
+/// longer contexts in the same memory; `F16`, the default, is llama.cpp's.
+///
+/// Quantized values (any type but `F32`, `F16` and `BF16`) make attention
+/// follow llama.cpp's flash-attention path, which llama.cpp requires for
+/// them; otherwise attention follows its path without flash attention, so
+/// compare with `llama-completion -fa on` or `-fa off` accordingly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KvCacheType {
+    /// 32-bit floats.
+    F32,
+    /// 16-bit floats (the default).
+    #[default]
+    F16,
+    /// bfloat16.
+    Bf16,
+    /// 8-bit, blocks of 32 with an f16 scale.
+    Q8_0,
+    /// 4-bit, blocks of 32 with an f16 scale.
+    Q4_0,
+    /// 4-bit, blocks of 32 with an f16 scale and minimum.
+    Q4_1,
+    /// 4-bit non-linear, blocks of 32 with an f16 scale.
+    Iq4Nl,
+    /// 5-bit, blocks of 32 with an f16 scale.
+    Q5_0,
+    /// 5-bit, blocks of 32 with an f16 scale and minimum.
+    Q5_1,
+}
+
+impl KvCacheType {
+    /// Every cache type, in llama.cpp's order.
+    pub const ALL: [Self; 9] = [
+        Self::F32,
+        Self::F16,
+        Self::Bf16,
+        Self::Q8_0,
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Iq4Nl,
+        Self::Q5_0,
+        Self::Q5_1,
+    ];
+
+    /// The name llama.cpp's `--cache-type-k` takes, e.g. `q8_0`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+            Self::Q4_1 => "q4_1",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
+        }
+    }
+
+    /// The type named `name` (as [`KvCacheType::name`] gives it).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The GGUF tensor type with this encoding.
+    #[must_use]
+    pub const fn ggml_type(self) -> GgmlType {
+        match self {
+            Self::F32 => GgmlType::F32,
+            Self::F16 => GgmlType::F16,
+            Self::Bf16 => GgmlType::Bf16,
+            Self::Q8_0 => GgmlType::Q8_0,
+            Self::Q4_0 => GgmlType::Q4_0,
+            Self::Q4_1 => GgmlType::Q4_1,
+            Self::Iq4Nl => GgmlType::Iq4Nl,
+            Self::Q5_0 => GgmlType::Q5_0,
+            Self::Q5_1 => GgmlType::Q5_1,
+        }
+    }
+
+    /// Whether the type is quantized in blocks (not a float type).
+    #[must_use]
+    pub const fn is_quantized(self) -> bool {
+        !matches!(self, Self::F32 | Self::F16 | Self::Bf16)
+    }
+
+    /// Values per block: 32 for the quantized types, else 1.
+    #[must_use]
+    pub const fn block_size(self) -> usize {
+        if self.is_quantized() { 32 } else { 1 }
+    }
+
+    /// Bytes that hold `n` values, a multiple of [`KvCacheType::block_size`].
+    #[must_use]
+    pub const fn bytes(self, n: usize) -> usize {
+        let bytes_per_block = match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+            Self::Q8_0 => 34,
+            Self::Q4_0 | Self::Iq4Nl => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+        };
+        n / self.block_size() * bytes_per_block
+    }
+}
+
+impl std::fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The types of an attention layer's cached keys and values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KvTypes {
+    pub(crate) k: KvCacheType,
+    pub(crate) v: KvCacheType,
+}
+
+impl KvTypes {
+    /// Whether attention follows llama.cpp's flash-attention path: for
+    /// quantized values, which llama.cpp only stores with it.
+    pub(crate) const fn flash(self) -> bool {
+        self.v.is_quantized()
+    }
+
+    /// The block size of the Walsh-Hadamard rotation llama.cpp applies to
+    /// the queries and keys of a quantized key cache (`llama_kv_cache`'s
+    /// `n_rot_k`): the largest power of two from 64 that divides the head,
+    /// if 64 does.
+    pub(crate) fn rot_k(self, head_dim: usize) -> Option<usize> {
+        if !self.k.is_quantized() || !head_dim.is_multiple_of(64) {
+            return None;
+        }
+        let mut n = 64;
+        while head_dim.is_multiple_of(2 * n) {
+            n *= 2;
+        }
+        Some(n)
+    }
+
+    /// The block size of the rotation of the values (and back of the
+    /// attention output) for a quantized value cache: 64 (`n_rot_v`).
+    pub(crate) fn rot_v(self, head_dim: usize) -> Option<usize> {
+        (self.v.is_quantized() && head_dim.is_multiple_of(64)).then_some(64)
+    }
+
+    /// The key type attention computes with: llama.cpp's flash attention
+    /// casts f32 keys to f16 (`build_attn_mha`), so they are stored as f16.
+    pub(crate) const fn stored_k(self) -> KvCacheType {
+        match (self.flash(), self.k) {
+            (true, KvCacheType::F32) => KvCacheType::F16,
+            (_, k) => k,
+        }
     }
 }
 
@@ -257,6 +422,9 @@ pub(crate) trait Backend {
 
     /// An empty KV cache for up to `n_ctx` positions of one layer.
     fn kv_cache(&mut self, n_ctx: usize) -> Result<Self::KvCache>;
+
+    /// Bytes of every KV cache made so far.
+    fn kv_bytes(&self) -> usize;
 
     /// Checks, when a session starts, that the backend can run Gated
     /// DeltaNet layers of these sizes.

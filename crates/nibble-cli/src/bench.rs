@@ -4,9 +4,8 @@
 //! the same machine and thread count:
 //!
 //! - `pp N`: each repetition evaluates `N` random tokens into an empty
-//!   session, timed as a whole. nibble has no batched matrix products yet
-//!   (Phase 7), so this is token-by-token evaluation and does not compare
-//!   with llama-bench's batched `pp` until then.
+//!   session, timed as a whole, in batches of the session's `n_batch` (512
+//!   by default, llama-bench's `-ub`).
 //! - `tg N`: each repetition decodes `N` random tokens one at a time into an
 //!   empty session, computing the full logits each time (llama-bench's
 //!   `test_gen`).
@@ -99,12 +98,6 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
         c.weight_type,
         session.compute(),
     );
-    if pp > 0 {
-        eprintln!(
-            "nibble: pp evaluates tokens one at a time until batched prompt processing exists"
-        );
-    }
-
     let mut tokens = RandomTokens::new(seed, c.n_vocab);
     let context: Vec<u32> = (0..depth).map(|_| tokens.next()).collect();
     let at = if depth > 0 {

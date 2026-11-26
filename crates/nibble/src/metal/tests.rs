@@ -8,8 +8,10 @@ use nibble_gguf::GgmlType;
 use super::device::{Buffer, Device};
 use super::kernels::{EmbedArgs, Pipelines};
 use super::weights::Weights;
-use super::{MetalBackend, Output, Size, encode_matvec, load, store};
-use crate::backend::{Backend, ModelData, Params, QkNorm};
+use super::{MetalBackend, Output, Size, encode_matmul, encode_matvec, load, store};
+use crate::backend::{
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, ModelData, Params, QkNorm,
+};
 use crate::cpu::{CpuBackend, Weight};
 use crate::model::{Architecture, ModelConfig};
 use crate::quant::test_data::{k_row, values};
@@ -326,6 +328,9 @@ fn attention_matches_the_cpu_backend() {
         (3, 3, 64, 64, false, false),
         (16, 2, 64, 32, false, true),
         (8, 2, 512, 128, false, true),
+        (24, 4, 256, 64, true, true),
+        (16, 2, 256, 64, true, true),
+        (5, 1, 128, 128, false, true),
     ];
     for (n_head, n_head_kv, head_dim, rope_dims, gated, norms) in shapes {
         let config = attention_config(n_head, n_head_kv, head_dim, rope_dims);
@@ -364,7 +369,7 @@ fn attention_matches_the_cpu_backend() {
             })
             .collect();
 
-        let mut cpu = CpuBackend::new(data, n_pos, 1);
+        let mut cpu = CpuBackend::new(data, n_pos, 1, Default::default());
         let mut expected = Vec::new();
         let mut cache = cpu.kv_cache(n_pos).unwrap();
         let (mut q, mut k, v) = (vec![0.0; q_len], vec![0.0; kv_len], vec![0.0; kv_len]);
@@ -380,8 +385,41 @@ fn attention_matches_the_cpu_backend() {
             expected.push(out.clone());
         }
 
+        // Prompt batches (`attention_prompt`, or one token at a time for the
+        // shapes it does not cover), of sizes that leave partial tiles.
+        let mut metal = MetalBackend::new(data, n_pos, Default::default()).unwrap();
+        let mut cache = metal.kv_cache(n_pos).unwrap();
+        let mut start = 0;
+        for n in [40, 17, 100, 143] {
+            let batch = &inputs[start..start + n];
+            let rows = |i: usize| -> Vec<f32> { batch.iter().flat_map(|x| x[i].clone()).collect() };
+            let mut q = metal.vector(n * q_len).unwrap();
+            let mut k = metal.vector(n * kv_len).unwrap();
+            let mut v = metal.vector(n * kv_len).unwrap();
+            let mut out = metal.vector(n * n_head * head_dim).unwrap();
+            metal.write(&mut q, &rows(0)).unwrap();
+            metal.write(&mut k, &rows(1)).unwrap();
+            metal.write(&mut v, &rows(2)).unwrap();
+            metal.begin(start, n).unwrap();
+            metal.attention(&mut q, &mut k, &v, norm, &mut cache, &mut out);
+            metal.end().unwrap();
+            let mut got = vec![0.0; n * n_head * head_dim];
+            metal.read(&out, &mut got).unwrap();
+            for (t, row) in got.chunks(n_head * head_dim).enumerate() {
+                let pos = start + t;
+                for (i, (&g, &e)) in row.iter().zip(&expected[pos]).enumerate() {
+                    // The queries are rounded to f16 too.
+                    assert!(
+                        (g - e).abs() <= 1e-2 * (1.0 + e.abs()),
+                        "{n_head}/{n_head_kv} heads of {head_dim}, batch of {n}, position {pos}, value {i}: {g} vs {e}"
+                    );
+                }
+            }
+            start += n;
+        }
+
         for chunk in [None, Some(64), Some(256)] {
-            let mut metal = MetalBackend::new(data, n_pos).unwrap();
+            let mut metal = MetalBackend::new(data, n_pos, Default::default()).unwrap();
             if let Some(chunk) = chunk
                 && !metal.force_attention_chunk(chunk)
             {
@@ -465,7 +503,10 @@ fn uncovered_attention_shapes_fail_when_the_backend_starts() {
             config: &config,
             largest_tensor: 0,
         };
-        assert!(MetalBackend::new(data, 16).is_err(), "{config:?}");
+        assert!(
+            MetalBackend::new(data, 16, Default::default()).is_err(),
+            "{config:?}"
+        );
     }
     let config = attention_config(16, 8, 128, 128);
     let data = ModelData {
@@ -475,7 +516,7 @@ fn uncovered_attention_shapes_fail_when_the_backend_starts() {
         config: &config,
         largest_tensor: 0,
     };
-    assert!(MetalBackend::new(data, 16).is_ok());
+    assert!(MetalBackend::new(data, 16, Default::default()).is_ok());
 }
 
 /// The kernels for several inputs that are built all reproduce the one-input
@@ -493,4 +534,433 @@ fn every_wide_kernel_passes_the_startup_check() {
     for (ty, widths) in before {
         assert_eq!(pipelines.matvec(ty).unwrap().widths(), widths, "{ty}");
     }
+}
+
+/// The value a matrix-matrix kernel multiplies for `v`: `half`, or
+/// `bfloat` for BF16 weights.
+fn tile_value(ty: GgmlType, v: f32) -> f64 {
+    f64::from(if ty == GgmlType::Bf16 {
+        quant::bf16_to_f32(quant::f32_to_bf16(v))
+    } else {
+        quant::f16_to_f32(quant::f32_to_f16(v))
+    })
+}
+
+/// The matrix-matrix kernel of every type, stored and added, against f64
+/// products of the weights and inputs rounded as its tiles hold them, for
+/// whole and partial tiles of rows and inputs.
+#[test]
+fn matmul_matches_rounded_products() {
+    let Some((device, pipelines)) = gpu() else {
+        return;
+    };
+    for &ty in TYPES {
+        assert!(pipelines.matmul(ty).is_some(), "no matrix kernel for {ty}");
+        for (rows, cols, n) in [(64, 256, 32), (130, 512, 45), (9, 1024, 17)] {
+            if cols % block_size(ty) != 0 {
+                continue;
+            }
+            let (bytes, w, decoded) = matrix(ty, rows, cols, 7);
+            let weights = Weights::build(&device, &bytes, false, bytes.len(), usize::MAX).unwrap();
+            let x: Vec<f32> = (0..n).flat_map(|t| values(cols, 1000 + t as u32)).collect();
+            let base: Vec<f32> = values(n * rows, 99);
+            for add in [false, true] {
+                let xb = floats(&device, &x);
+                let out = floats(&device, &base);
+                let mut commands = device.commands().unwrap();
+                encode_matmul(&mut commands, &pipelines, &weights, &w, &xb, &out, add, n).unwrap();
+                commands.commit();
+                commands.wait().unwrap();
+                let got = read(&out, n * rows);
+                for t in 0..n {
+                    for r in 0..rows {
+                        let (mut want, mut mag) = (0.0, 0.0);
+                        for c in 0..cols {
+                            let term =
+                                tile_value(ty, decoded[r][c]) * tile_value(ty, x[t * cols + c]);
+                            want += term;
+                            mag += term.abs();
+                        }
+                        if add {
+                            want += f64::from(base[t * rows + r]);
+                        }
+                        let g = f64::from(got[t * rows + r]);
+                        assert!(
+                            (g - want).abs() <= 1e-5 * mag + 1e-6,
+                            "{ty} {rows}x{cols} n={n} add={add} input {t} row {r}: {g} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Times the Q8_0 matrix kernel on the shapes of a 4B model's products
+/// (run with `--ignored --nocapture`).
+#[test]
+#[ignore = "a timing, not a check"]
+fn matmul_timing() {
+    let Some((device, pipelines)) = gpu() else {
+        return;
+    };
+    let n = 512;
+    for ty in [GgmlType::Q8_0, GgmlType::Q4K] {
+        for (rows, cols) in [(2560, 2560), (9216, 2560), (2560, 9216), (3584, 1024)] {
+            let row = weight_row(ty, cols, 1);
+            let bytes: Vec<u8> = (0..rows).flat_map(|_| row.iter().copied()).collect();
+            let w = Weight {
+                ty,
+                cols,
+                rows,
+                offset: 0,
+                row_bytes: row.len(),
+            };
+            let weights = Weights::build(&device, &bytes, false, bytes.len(), usize::MAX).unwrap();
+            let xb = floats(&device, &values(n * cols, 3));
+            let out = floats(&device, &vec![0.0; n * rows]);
+            let reps = 20;
+            let start = std::time::Instant::now();
+            let mut commands = device.commands().unwrap();
+            for _ in 0..reps {
+                encode_matmul(&mut commands, &pipelines, &weights, &w, &xb, &out, false, n)
+                    .unwrap();
+            }
+            commands.commit();
+            commands.wait().unwrap();
+            let s = start.elapsed().as_secs_f64() / f64::from(reps);
+            let flops = 2.0 * (rows * cols * n) as f64;
+            eprintln!(
+                "{ty} {rows}x{cols} n={n}: {:.3} ms, {:.2} TFLOP/s",
+                s * 1e3,
+                flops / s / 1e12
+            );
+        }
+    }
+}
+
+/// A prompt batch through a DeltaNet layer (`delta_prep` and `delta_scan`,
+/// after a short pending batch that it replays first) gives, bit for bit,
+/// the outputs and state of the tokens evaluated one at a time; with heads
+/// of 128 (`delta_chunk_*`), the same within rounding.
+#[test]
+fn delta_net_prompt_batch_equals_steps() {
+    if gpu().is_none() {
+        return;
+    }
+    for (n_k_heads, n_v_heads, d_k) in [(2, 4, 128), (2, 2, 64), (1, 2, 256)] {
+        let d = DeltaNetDims {
+            conv_kernel: 4,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v: d_k,
+        };
+        let mut params = Params::default();
+        let conv_taps: Vec<f32> = values(d.conv_kernel * d.conv_dim(), 5)
+            .iter()
+            .map(|v| 0.5 * v)
+            .collect();
+        let p = DeltaNetParams {
+            conv: params.push(&conv_taps),
+            dt_bias: params.push(&values(n_v_heads, 6)),
+            a: params.push(
+                &values(n_v_heads, 7)
+                    .iter()
+                    .map(|v| -0.5 - v.abs())
+                    .collect::<Vec<_>>(),
+            ),
+            norm: params.push(
+                &values(d.d_v, 8)
+                    .iter()
+                    .map(|v| 1.0 + 0.5 * v)
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        let params = params.into_vec();
+        let config = attention_config(2, 1, 64, 64);
+        let bytes = [0u8; 16];
+        let data = ModelData {
+            bytes: &bytes,
+            mapped: false,
+            params: &params,
+            config: &config,
+            largest_tensor: 0,
+        };
+        let (short, long) = (3, 100);
+        let n = short + long;
+        let qkv: Vec<f32> = values(n * d.conv_dim(), 20);
+        let beta: Vec<f32> = values(n * n_v_heads, 21);
+        let alpha: Vec<f32> = values(n * n_v_heads, 22);
+        let z: Vec<f32> = values(n * d.value_dim(), 23);
+
+        // Evaluates `tokens` in batches of the sizes given, returning every
+        // token's output and the final state.
+        let run = |sizes: &[usize]| -> (Vec<f32>, Vec<f32>) {
+            let mut metal = MetalBackend::new(data, 64, Default::default()).unwrap();
+            let mut state = DeltaNetState {
+                conv: metal.vector(d.conv_len()).unwrap(),
+                oldest: 0,
+                ssm: metal.vector(d.state_len()).unwrap(),
+                pending: 0,
+                keep: 0,
+                pending_ba: metal.vector(d.pending_len()).unwrap(),
+                pending_row: 0,
+            };
+            let mut outputs = Vec::new();
+            let mut at = 0;
+            for &m in sizes {
+                let rows = |v: &[f32], len: usize| v[at * len..(at + m) * len].to_vec();
+                let mut x = metal.vector(m.next_multiple_of(32) * d.conv_dim()).unwrap();
+                // Whole chunks of rows, as the chunked delta rule reads.
+                let mut conv = metal.vector(m.next_multiple_of(32) * d.conv_dim()).unwrap();
+                let mut zv = metal.vector(m * d.value_dim()).unwrap();
+                let mut b = metal.vector(m * n_v_heads).unwrap();
+                let mut al = metal.vector(m * n_v_heads).unwrap();
+                let mut out = metal.vector(m * d.value_dim()).unwrap();
+                let mut xs = rows(&qkv, d.conv_dim());
+                xs.resize(x.len, 0.0);
+                metal.write(&mut x, &xs).unwrap();
+                metal.write(&mut zv, &rows(&z, d.value_dim())).unwrap();
+                metal.write(&mut b, &rows(&beta, n_v_heads)).unwrap();
+                metal.write(&mut al, &rows(&alpha, n_v_heads)).unwrap();
+                metal.begin(at, m).unwrap();
+                metal.delta_net(
+                    d, p, 1e-6, &mut state, &x, &mut conv, &mut zv, &mut b, &mut al, &mut out,
+                );
+                metal.end().unwrap();
+                let mut got = vec![0.0; m * d.value_dim()];
+                metal.read(&out, &mut got).unwrap();
+                outputs.extend(got);
+                at += m;
+            }
+            // A last step applies a pending batch to the state.
+            let mut ssm = vec![0.0; d.state_len()];
+            metal.read(&state.ssm, &mut ssm).unwrap();
+            (outputs, ssm)
+        };
+        let (want_out, want_state) = run(&vec![1; n]);
+        let (got_out, got_state) = run(&[short, long]);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let what = format!("{n_k_heads}/{n_v_heads} heads of {d_k}");
+        if d_k == 128 {
+            // The chunked rule (heads of 128): the same in exact arithmetic.
+            let err = |a: &[f32], b: &[f32]| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
+                    .fold(0.0f32, f32::max)
+            };
+            let (e_out, e_state) = (err(&got_out, &want_out), err(&got_state, &want_state));
+            assert!(
+                e_out <= 2e-5 && e_state <= 2e-5,
+                "{what}: errors {e_out}, {e_state}"
+            );
+        } else {
+            assert_eq!(bits(&got_out), bits(&want_out), "outputs, {what}");
+            assert_eq!(bits(&got_state), bits(&want_state), "state, {what}");
+        }
+    }
+}
+
+/// Attention over caches of every type (with llama.cpp's rotations of
+/// quantized ones) against the CPU backend, one token at a time and in
+/// prompt batches.
+#[test]
+fn attention_with_cache_types_matches_the_cpu_backend() {
+    use crate::backend::{KvCacheType as T, KvTypes};
+    if gpu().is_none() {
+        return;
+    }
+    let n_pos = 200;
+    let types = [
+        (T::Q8_0, T::Q8_0),
+        (T::Q4_0, T::F16),
+        (T::F16, T::Q5_1),
+        (T::Bf16, T::Bf16),
+        (T::F32, T::Iq4Nl),
+        (T::Q4_1, T::Q5_0),
+        (T::F32, T::F32),
+        (T::Iq4Nl, T::Q5_1),
+        (T::Q5_0, T::Q4_1),
+        (T::Q5_1, T::Q8_0),
+        (T::Q4_1, T::Iq4Nl),
+        (T::F16, T::Q4_0),
+    ];
+    // (query heads, key heads, head size, rotated dims, gated)
+    let shapes = [
+        (8, 2, 256, 64, true),
+        (16, 8, 128, 128, false),
+        (6, 1, 64, 64, true),
+    ];
+    for (n_head, n_head_kv, head_dim, rope_dims, gated) in shapes {
+        let config = attention_config(n_head, n_head_kv, head_dim, rope_dims);
+        let mut params = Params::default();
+        let weight = |seed| -> Vec<f32> {
+            values(head_dim, seed)
+                .iter()
+                .map(|v| 1.0 + 0.5 * v)
+                .collect()
+        };
+        let q_norm = params.push(&weight(1));
+        let k_norm = params.push(&weight(2));
+        let params = params.into_vec();
+        let bytes = [0u8; 16];
+        let data = ModelData {
+            bytes: &bytes,
+            mapped: false,
+            params: &params,
+            config: &config,
+            largest_tensor: 0,
+        };
+        let norm = QkNorm {
+            weights: Some((q_norm, k_norm)),
+            eps: 1e-6,
+            gated,
+        };
+        let q_len = n_head * head_dim * if gated { 2 } else { 1 };
+        let kv_len = n_head_kv * head_dim;
+        let o_len = n_head * head_dim;
+        let inputs: Vec<[Vec<f32>; 3]> = (0..n_pos as u32)
+            .map(|p| {
+                [
+                    values(q_len, 3 * p + 10),
+                    values(kv_len, 3 * p + 11),
+                    values(kv_len, 3 * p + 12),
+                ]
+            })
+            .collect();
+        for (k_type, v_type) in types {
+            let kv = KvTypes {
+                k: k_type,
+                v: v_type,
+            };
+            let mut cpu = CpuBackend::new(data, n_pos, 1, kv);
+            let mut cache = cpu.kv_cache(n_pos).unwrap();
+            let mut expected = Vec::new();
+            let mut out = vec![0.0; o_len];
+            for (pos, [qi, ki, vi]) in inputs.iter().enumerate() {
+                let (mut q, mut k) = (qi.clone(), ki.clone());
+                cpu.begin(pos, 1).unwrap();
+                cpu.attention(&mut q, &mut k, vi, norm, &mut cache, &mut out);
+                cpu.end().unwrap();
+                expected.push(out.clone());
+            }
+            let tol = if k_type.is_quantized() || v_type.is_quantized() {
+                4e-2
+            } else {
+                1e-2
+            };
+            for sizes in [&[1usize; 200][..], &[40, 17, 100, 43][..]] {
+                let mut metal = MetalBackend::new(data, n_pos, kv).unwrap();
+                let mut cache = metal.kv_cache(n_pos).unwrap();
+                let mut start = 0;
+                let mut worst = 0.0f32;
+                for &n in sizes {
+                    let batch = &inputs[start..start + n];
+                    let rows = |i: usize| -> Vec<f32> {
+                        batch.iter().flat_map(|x| x[i].clone()).collect()
+                    };
+                    let mut q = metal.vector(n * q_len).unwrap();
+                    let mut k = metal.vector(n * kv_len).unwrap();
+                    let mut v = metal.vector(n * kv_len).unwrap();
+                    let mut out = metal.vector(n * o_len).unwrap();
+                    metal.write(&mut q, &rows(0)).unwrap();
+                    metal.write(&mut k, &rows(1)).unwrap();
+                    metal.write(&mut v, &rows(2)).unwrap();
+                    metal.begin(start, n).unwrap();
+                    metal.attention(&mut q, &mut k, &v, norm, &mut cache, &mut out);
+                    metal.end().unwrap();
+                    let mut got = vec![0.0; n * o_len];
+                    metal.read(&out, &mut got).unwrap();
+                    for (t, row) in got.chunks(o_len).enumerate() {
+                        for (&g, &e) in row.iter().zip(&expected[start + t]) {
+                            worst = worst.max((g - e).abs() / (1.0 + e.abs()));
+                        }
+                    }
+                    start += n;
+                }
+                assert!(
+                    worst <= tol,
+                    "{n_head}/{n_head_kv} heads of {head_dim}, K {k_type} V {v_type}, batches of {}: error {worst}",
+                    sizes[0]
+                );
+            }
+        }
+    }
+}
+
+/// Times a DeltaNet layer over a 512-token batch with Qwen3.5-4B's sizes
+/// (run with `--ignored --nocapture`).
+#[test]
+#[ignore = "a timing, not a check"]
+fn delta_net_timing() {
+    if gpu().is_none() {
+        return;
+    }
+    let d = DeltaNetDims {
+        conv_kernel: 4,
+        n_k_heads: 16,
+        n_v_heads: 32,
+        d_k: 128,
+        d_v: 128,
+    };
+    let mut params = Params::default();
+    let p = DeltaNetParams {
+        conv: params.push(&values(d.conv_kernel * d.conv_dim(), 5)),
+        dt_bias: params.push(&values(d.n_v_heads, 6)),
+        a: params.push(
+            &values(d.n_v_heads, 7)
+                .iter()
+                .map(|v| -0.5 - v.abs())
+                .collect::<Vec<_>>(),
+        ),
+        norm: params.push(&values(d.d_v, 8)),
+    };
+    let params = params.into_vec();
+    let config = attention_config(2, 1, 64, 64);
+    let bytes = [0u8; 16];
+    let data = ModelData {
+        bytes: &bytes,
+        mapped: false,
+        params: &params,
+        config: &config,
+        largest_tensor: 0,
+    };
+    let n = 512;
+    let mut metal = MetalBackend::new(data, 64, Default::default()).unwrap();
+    let mut state = DeltaNetState {
+        conv: metal.vector(d.conv_len()).unwrap(),
+        oldest: 0,
+        ssm: metal.vector(d.state_len()).unwrap(),
+        pending: 0,
+        keep: 0,
+        pending_ba: metal.vector(d.pending_len()).unwrap(),
+        pending_row: 0,
+    };
+    let mut x = metal.vector(n * d.conv_dim()).unwrap();
+    metal.write(&mut x, &values(n * d.conv_dim(), 1)).unwrap();
+    let mut conv = metal.vector(n * d.conv_dim()).unwrap();
+    let mut z = metal.vector(n * d.value_dim()).unwrap();
+    let mut b = metal.vector(n * d.n_v_heads).unwrap();
+    let mut al = metal.vector(n * d.n_v_heads).unwrap();
+    let mut out = metal.vector(n * d.value_dim()).unwrap();
+    let reps = 20;
+    let mut run = |metal: &mut MetalBackend<'_>| {
+        metal.begin(0, n).unwrap();
+        metal.delta_net(
+            d, p, 1e-6, &mut state, &x, &mut conv, &mut z, &mut b, &mut al, &mut out,
+        );
+        metal.end().unwrap();
+    };
+    run(&mut metal);
+    let start = std::time::Instant::now();
+    for _ in 0..reps {
+        run(&mut metal);
+    }
+    drop(run);
+    let mut sink = vec![0.0; n * d.value_dim()];
+    metal.read(&out, &mut sink).unwrap();
+    let s = start.elapsed().as_secs_f64() / f64::from(reps);
+    eprintln!("delta_net, {n} tokens: {:.3} ms", s * 1e3);
 }

@@ -301,6 +301,7 @@ fn first_token_matches_a_naive_reference() {
                 backend: nibble::BackendKind::Cpu,
                 n_batch: 0,
                 draft_max: 0,
+                ..Default::default()
             })
             .unwrap();
         let logits = session.eval(&[token]).unwrap();
@@ -331,6 +332,7 @@ fn incremental_and_batched_evaluation_agree() {
             backend: nibble::BackendKind::Cpu,
             n_batch: 0,
             draft_max: 0,
+            ..Default::default()
         })
         .unwrap();
     let batched_logits = batched.eval(&tokens).unwrap().to_vec();
@@ -341,6 +343,7 @@ fn incremental_and_batched_evaluation_agree() {
             backend: nibble::BackendKind::Cpu,
             n_batch: 0,
             draft_max: 0,
+            ..Default::default()
         })
         .unwrap();
     for &t in &tokens {
@@ -361,6 +364,7 @@ fn truncate_restores_an_earlier_state() {
             backend: nibble::BackendKind::Cpu,
             n_batch: 0,
             draft_max: 0,
+            ..Default::default()
         })
         .unwrap();
     session.eval(&[1, 2, 3, 4]).unwrap();
@@ -375,6 +379,7 @@ fn truncate_restores_an_earlier_state() {
             backend: nibble::BackendKind::Cpu,
             n_batch: 0,
             draft_max: 0,
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(fresh.eval(&[1, 2, 9]).unwrap(), &after_truncate[..]);
@@ -392,6 +397,7 @@ fn generation_is_deterministic_and_respects_limits() {
                 backend: nibble::BackendKind::Cpu,
                 n_batch: 0,
                 draft_max: 0,
+                ..Default::default()
             })
             .unwrap();
         let mut sampler = Sampler::new(config);
@@ -434,6 +440,7 @@ fn evaluation_errors() {
             backend: nibble::BackendKind::Cpu,
             n_batch: 0,
             draft_max: 0,
+            ..Default::default()
         })
         .unwrap();
     assert!(matches!(session.eval(&[]), Err(Error::EmptyInput)));
@@ -456,6 +463,7 @@ fn evaluation_errors() {
                 backend: nibble::BackendKind::Cpu,
                 n_batch: 0,
                 draft_max: 0,
+                ..Default::default()
             })
             .unwrap()
             .n_ctx(),
@@ -586,5 +594,65 @@ fn batch_size_does_not_change_the_logits() {
     let tokens: Vec<u32> = (0..23u32).map(|i| (i * 37 + 11) % n_vocab).collect();
     for backend in [nibble::BackendKind::Cpu, nibble::BackendKind::Metal] {
         common::assert_batches_match_steps(&model, backend, N_CTX, &tokens, 9);
+    }
+}
+
+/// Cache types whose blocks do not divide the heads (8 values here) are
+/// refused when the session starts; the float types run on both backends,
+/// close to the f16 cache, and give every batch size the logits of
+/// evaluating one token at a time on the CPU.
+#[test]
+fn cache_types() {
+    use nibble::KvCacheType;
+    let model = Weights::new().model();
+    let n_vocab = model.config().n_vocab as u32;
+    let tokens: Vec<u32> = (0..23u32).map(|i| (i * 37 + 11) % n_vocab).collect();
+    let options = |backend, k, v, n_batch| SessionOptions {
+        n_ctx: N_CTX,
+        threads: 2,
+        backend,
+        n_batch,
+        cache_type_k: k,
+        cache_type_v: v,
+        ..SessionOptions::default()
+    };
+    for ty in KvCacheType::ALL.into_iter().filter(|t| t.is_quantized()) {
+        let err = model
+            .session(options(nibble::BackendKind::Cpu, ty, KvCacheType::F16, 0))
+            .err();
+        assert!(
+            matches!(err, Some(Error::UnsupportedCacheType { which: "K", ty: t, head_dim: 8 }) if t == ty),
+            "{ty}: {err:?}"
+        );
+    }
+    let cpu = nibble::BackendKind::Cpu;
+    let mut f16 = model
+        .session(options(cpu, KvCacheType::F16, KvCacheType::F16, 0))
+        .unwrap();
+    let reference = f16.eval(&tokens).unwrap().to_vec();
+    for (k, v) in [
+        (KvCacheType::F32, KvCacheType::F32),
+        (KvCacheType::Bf16, KvCacheType::Bf16),
+        (KvCacheType::F32, KvCacheType::Bf16),
+    ] {
+        let mut stepped = model.session(options(cpu, k, v, 1)).unwrap();
+        let mut last = Vec::new();
+        for &t in &tokens {
+            last = stepped.eval(&[t]).unwrap().to_vec();
+        }
+        let mut batched = model.session(options(cpu, k, v, 5)).unwrap();
+        let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(batched.eval(&tokens).unwrap()),
+            bits(&last),
+            "K {k} V {v}"
+        );
+        common::assert_logits_close(&last, &reference, &format!("K {k} V {v} against f16"));
+        if let Some(mut metal) =
+            common::session_or_skip(&model, options(nibble::BackendKind::Metal, k, v, 0))
+        {
+            let got = metal.eval(&tokens).unwrap().to_vec();
+            common::assert_logits_close(&got, &last, &format!("K {k} V {v} on Metal"));
+        }
     }
 }

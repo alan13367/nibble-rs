@@ -8,18 +8,21 @@ use std::ops::Range;
 
 use super::attention::{AttentionScratch, KvCache, attend};
 use super::{
-    Cpu, DeltaStep, EncodedInput, Experts, Kernels, Split, Weight, add_in_place, l2_norm_chunks,
-    rmsnorm, rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
+    Cpu, DeltaStep, EncodedInput, Experts, Kernels, Split, Weight, add_in_place, hadamard,
+    l2_norm_chunks, rmsnorm, rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
 };
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, MAX_LOGIT_ROWS, MAX_PENDING, ModelData,
-    Param, QkNorm,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvTypes, MAX_LOGIT_ROWS, MAX_PENDING,
+    ModelData, Param, QkNorm,
 };
 use crate::error::Result;
 
 /// The CPU backend of one session.
 pub(crate) struct CpuBackend<'m> {
     model: ModelData<'m>,
+    /// The types of the attention caches it makes, and their bytes so far.
+    kv: KvTypes,
+    kv_bytes: usize,
     cpu: Cpu,
     /// The input of the current matrix products, encoded for their weights.
     input: EncodedInput,
@@ -31,6 +34,8 @@ pub(crate) struct CpuBackend<'m> {
     /// A gated attention's queries and gates, split from its projection.
     query: Vec<f32>,
     gate: Vec<f32>,
+    /// A token's values, rotated for a quantized value cache.
+    value: Vec<f32>,
     /// The products that [`Backend::residual`] adds.
     product: Vec<f32>,
     /// The token slots of [`Backend::argmax`].
@@ -49,10 +54,12 @@ pub(crate) struct CpuBackend<'m> {
 
 impl<'m> CpuBackend<'m> {
     /// A backend with `threads` threads for sessions of up to `n_ctx` positions.
-    pub(crate) fn new(model: ModelData<'m>, n_ctx: usize, threads: usize) -> Self {
+    pub(crate) fn new(model: ModelData<'m>, n_ctx: usize, threads: usize, kv: KvTypes) -> Self {
         let c = model.config;
         Self {
             model,
+            kv,
+            kv_bytes: 0,
             cpu: Cpu::new(threads),
             input: EncodedInput::new(),
             n: 0,
@@ -60,6 +67,7 @@ impl<'m> CpuBackend<'m> {
             attention: AttentionScratch::new(c, n_ctx),
             query: vec![0.0; c.n_head * c.head_dim],
             gate: vec![0.0; c.n_head * c.head_dim],
+            value: vec![0.0; c.n_head_kv * c.head_dim],
             product: vec![0.0; c.n_embd],
             slots: [0; MAX_LOGIT_ROWS],
             expert_ids: Vec::new(),
@@ -92,7 +100,13 @@ impl Backend for CpuBackend<'_> {
     }
 
     fn kv_cache(&mut self, n_ctx: usize) -> Result<KvCache> {
-        Ok(KvCache::new(self.model.config, n_ctx))
+        let cache = KvCache::new(self.model.config, n_ctx, self.kv);
+        self.kv_bytes += cache.bytes();
+        Ok(cache)
+    }
+
+    fn kv_bytes(&self) -> usize {
+        self.kv_bytes
     }
 
     fn kv_len(&self, cache: &KvCache) -> usize {
@@ -433,8 +447,24 @@ impl Backend for CpuBackend<'_> {
             let rope = &self.rope[t * half..(t + 1) * half];
             rope_neox(q, hd, rope);
             rope_neox(k, hd, rope);
+            // llama.cpp rotates what a quantized cache holds (`build_attn`).
+            if let Some(n) = self.kv.rot_k(hd) {
+                hadamard(q, n);
+                hadamard(k, n);
+            }
+            let rot_v = self.kv.rot_v(hd);
+            let v = if let Some(n) = rot_v {
+                self.value.copy_from_slice(v);
+                hadamard(&mut self.value, n);
+                &self.value
+            } else {
+                v
+            };
             cache.push(self.cpu.kernels(), k, v);
             attend(&self.cpu, c, q, cache, &mut self.attention, out);
+            if let Some(n) = rot_v {
+                hadamard(out, n);
+            }
             if norm.gated {
                 for (a, &g) in out.iter_mut().zip(&self.gate) {
                     *a *= sigmoid(g);

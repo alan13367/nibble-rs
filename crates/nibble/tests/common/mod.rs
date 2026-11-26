@@ -164,7 +164,9 @@ pub(crate) fn session_or_skip(
 /// Checks that evaluating `tokens` in batches of any size gives, bit for
 /// bit, the logits of evaluating them one token at a time, on `backend`:
 /// whole, and in two calls split at `split` (each call cuts a batch where
-/// it takes its checkpoint, 4 tokens before its end).
+/// it takes its checkpoint, 4 tokens before its end). On Metal, batches of
+/// more than [`nibble::MAX_EVAL_ALL`] tokens multiply matrices with f16
+/// tiles, as llama.cpp does, and are only checked to be close.
 pub(crate) fn assert_batches_match_steps(
     model: &nibble::Model,
     backend: nibble::BackendKind,
@@ -178,6 +180,7 @@ pub(crate) fn assert_batches_match_steps(
         threads: 2,
         n_batch,
         draft_max: 0,
+        ..Default::default()
     };
     let Some(mut stepped) = session_or_skip(model, options(1)) else {
         return;
@@ -188,27 +191,27 @@ pub(crate) fn assert_batches_match_steps(
         .collect();
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     for n_batch in [2, 3, 5, 64] {
+        let exact = backend != nibble::BackendKind::Metal || n_batch <= nibble::MAX_EVAL_ALL;
+        let check = |got: &[f32], want: &[f32], what: &str| {
+            if exact {
+                assert_eq!(
+                    bits(got),
+                    bits(want),
+                    "{backend} batches of {n_batch}{what}"
+                );
+            } else {
+                assert_logits_close(got, want, &format!("{backend} batches of {n_batch}{what}"));
+            }
+        };
         let mut s = session_or_skip(model, options(n_batch)).unwrap();
         assert_eq!(s.n_batch(), n_batch.min(n_ctx));
         let whole = s.eval(tokens).unwrap();
-        assert_eq!(
-            bits(whole),
-            bits(&steps[tokens.len() - 1]),
-            "{backend} batches of {n_batch}"
-        );
+        check(whole, &steps[tokens.len() - 1], "");
         s.clear().unwrap();
         let first = s.eval(&tokens[..split]).unwrap();
-        assert_eq!(
-            bits(first),
-            bits(&steps[split - 1]),
-            "{backend} batches of {n_batch}, first call"
-        );
+        check(first, &steps[split - 1], ", first call");
         let second = s.eval(&tokens[split..]).unwrap();
-        assert_eq!(
-            bits(second),
-            bits(&steps[tokens.len() - 1]),
-            "{backend} batches of {n_batch}, second call"
-        );
+        check(second, &steps[tokens.len() - 1], ", second call");
     }
 
     // `eval_all`: each row is the logits after its token.
@@ -237,6 +240,19 @@ pub(crate) fn assert_batches_match_steps(
     ));
 }
 
+/// Checks that `got` is within 1% of the largest magnitude of `want` at
+/// every logit.
+pub(crate) fn assert_logits_close(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= 0.01 * scale,
+            "{what}: logit {i} is {g}, not {w}"
+        );
+    }
+}
+
 /// Checks, on `backend`, that an evaluation of 2 to 16 tokens (a draft being
 /// verified) can be taken back without replaying anything, and that
 /// evaluation then continues bit for bit as from the kept prefix: after
@@ -254,6 +270,7 @@ pub(crate) fn assert_rewinds_into_short_batches(
         threads: 2,
         n_batch,
         draft_max: 0,
+        ..Default::default()
     };
     let Some(mut s) = session_or_skip(model, options(0)) else {
         return;

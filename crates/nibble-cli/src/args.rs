@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nibble::sampler::SamplerConfig;
-use nibble::{BackendKind, Model, Session, SessionOptions};
+use nibble::{BackendKind, KvCacheType, Model, Session, SessionOptions};
 
 pub(crate) type CliResult<T> = Result<T, Box<dyn Error>>;
 
@@ -78,13 +78,15 @@ impl Args {
     }
 }
 
-/// `-m`, `-c`, `-t`, `--backend`, `--draft`, `--read`.
+/// `-m`, `-c`, `-t`, `--backend`, `--draft`, `-ctk`, `-ctv`, `--read`.
 pub(crate) struct ModelOptions {
     pub(crate) path: Option<PathBuf>,
     pub(crate) n_ctx: usize,
     pub(crate) threads: usize,
     pub(crate) backend: BackendKind,
     pub(crate) draft: usize,
+    pub(crate) cache_type_k: KvCacheType,
+    pub(crate) cache_type_v: KvCacheType,
     pub(crate) mmap: bool,
 }
 
@@ -97,6 +99,11 @@ pub(crate) const MODEL_HELP: &str = "  -m, --model FILE         GGUF model file 
       --draft N            Draft up to N tokens after each one with the model's
                            MTP head and check them in one pass (speculative
                            decoding; same output). Default 0 = off
+  -ctk, --cache-type-k T   Type of the cached attention keys: f32, f16, bf16,
+                           q8_0, q4_0, q4_1, iq4_nl, q5_0 or q5_1 (default f16)
+  -ctv, --cache-type-v T   Type of the cached attention values (same types,
+                           default f16). A quantized type computes attention as
+                           llama.cpp's flash attention does
       --read               Read the model into memory instead of memory-mapping it
 ";
 
@@ -116,6 +123,8 @@ impl ModelOptions {
             threads: 0,
             backend: BackendKind::Auto,
             draft: 0,
+            cache_type_k: KvCacheType::F16,
+            cache_type_v: KvCacheType::F16,
             mmap: true,
         }
     }
@@ -133,6 +142,8 @@ impl ModelOptions {
                 })?;
             }
             "--draft" => self.draft = args.parse(flag)?,
+            "-ctk" | "--cache-type-k" => self.cache_type_k = cache_type(flag, args)?,
+            "-ctv" | "--cache-type-v" => self.cache_type_v = cache_type(flag, args)?,
             "--read" => self.mmap = false,
             _ => return Ok(false),
         }
@@ -184,8 +195,23 @@ impl ModelOptions {
             backend: self.backend,
             n_batch: 0,
             draft_max: self.draft,
+            cache_type_k: self.cache_type_k,
+            cache_type_v: self.cache_type_v,
         }
     }
+}
+
+/// The cache type named by the value of `flag`.
+fn cache_type(flag: &str, args: &mut Args) -> CliResult<KvCacheType> {
+    let name = args.string(flag)?;
+    KvCacheType::from_name(&name).ok_or_else(|| {
+        let names: Vec<&str> = KvCacheType::ALL.iter().map(|t| t.name()).collect();
+        format!(
+            "unknown cache type `{name}` for {flag} (expected one of {})",
+            names.join(", ")
+        )
+        .into()
+    })
 }
 
 /// Sampling flags.

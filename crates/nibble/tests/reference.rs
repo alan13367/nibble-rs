@@ -68,17 +68,31 @@ fn greedy_on(
     backend: nibble::BackendKind,
     draft_max: usize,
 ) -> (String, StopReason, nibble::DraftStats) {
-    let tok = model.tokenizer();
-    let tokens = tok.encode(prompt, true);
-    let mut session = model
-        .session(SessionOptions {
+    greedy_with(
+        model,
+        prompt,
+        max_tokens,
+        SessionOptions {
             n_ctx: 512,
             threads: 0,
             backend,
             n_batch: 0,
             draft_max,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+}
+
+/// [`greedy`] in a session with `options`.
+fn greedy_with(
+    model: &Model,
+    prompt: &str,
+    max_tokens: usize,
+    options: SessionOptions,
+) -> (String, StopReason, nibble::DraftStats) {
+    let tok = model.tokenizer();
+    let tokens = tok.encode(prompt, true);
+    let mut session = model.session(options).unwrap();
     let mut sampler = Sampler::new(SamplerConfig::greedy());
     let mut decoder = StreamDecoder::new();
     let mut text = String::new();
@@ -416,4 +430,53 @@ fn qwen38_27b_ud_q4_k_xl_greedy_matches_llama_cpp() {
          fn main() {\n    let n = 10;\n    println!(\"The {}th Fibonacci number is: {}\", n, \
          fibonacci(n));"
     );
+}
+
+/// Quantized and bf16 KV caches give llama.cpp b12722's tokens, on the CPU
+/// (`llama-completion -ngl 0 --device none --no-repack -ub 1 -ctk K -ctv V`,
+/// `-fa on` exactly when V is quantized) and on Metal (`-ngl 99 -ub 1`).
+/// With 4-bit keys this model's answer falls apart, in llama.cpp too: a
+/// sensitive check. llama.cpp runs attention over `iq4_nl` keys on its CPU
+/// even with `-ngl 99` (ggml-metal has no kernel for them), and 4-bit
+/// caches diverge between its CPU and Metal paths, so Metal is checked on
+/// the others.
+#[test]
+#[ignore = "needs models/Qwen3-0.6B-Q8_0.gguf"]
+fn qwen3_cache_types_match_llama_cpp() {
+    use nibble::{BackendKind, KvCacheType as T};
+    let model = load_model("Qwen3-0.6B-Q8_0.gguf");
+    let prompt = "<|im_start|>user\nWhat does this function do?\n\n```rust\n\
+                  fn gcd(mut a: u64, mut b: u64) -> u64 {\n    while b != 0 {\n        \
+                  let t = a % b;\n        a = b;\n        b = t;\n    }\n    a\n}\n\
+                  ```<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nThe function";
+    let gcd = " `gcd(mut a: u64, mut b: u64) -> u64` is a **Greatest Common Divisor (GCD)** \
+               function in Rust.\n\n### What it";
+    let broken = format!(
+        " of how how way how how to? \n\n</think>\n\n</think>\n\n{}Okay, I",
+        "Okay, I am the best way.\n\n".repeat(3)
+    );
+    let iq4 = " `gcd(mut a: u64, mut b: u66) -> u64` in Rust does **compute the greatest \
+               common divisor (GCD)** of two integers `a`";
+    let cases = [
+        (BackendKind::Cpu, T::Q8_0, T::Q8_0, gcd),
+        (BackendKind::Cpu, T::Q4_0, T::Q4_0, broken.as_str()),
+        (BackendKind::Cpu, T::Bf16, T::F16, gcd),
+        (BackendKind::Cpu, T::Iq4Nl, T::Q5_1, iq4),
+        (BackendKind::Metal, T::Q8_0, T::Q8_0, gcd),
+        (BackendKind::Metal, T::Bf16, T::F16, gcd),
+    ];
+    for (backend, k, v, expected) in cases {
+        if backend == BackendKind::Metal && !cfg!(target_os = "macos") {
+            continue;
+        }
+        let options = SessionOptions {
+            n_ctx: 512,
+            backend,
+            cache_type_k: k,
+            cache_type_v: v,
+            ..Default::default()
+        };
+        let (text, _, _) = greedy_with(&model, prompt, 40, options);
+        assert_eq!(text, expected, "{backend} K {k} V {v}");
+    }
 }
