@@ -41,31 +41,35 @@ pub(crate) const MAX_PENDING: usize = MAX_LOGIT_ROWS;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendKind {
-    /// Metal where available (and the model's shapes are covered), else
-    /// the CPU.
+    /// Metal or CUDA where available (and the model's shapes are covered),
+    /// else the CPU.
     #[default]
     Auto,
     /// The CPU.
     Cpu,
     /// Metal (Apple GPUs). Sessions fail to start where it is unavailable.
     Metal,
+    /// CUDA (NVIDIA GPUs on Windows and Linux). Sessions fail to start where
+    /// it is unavailable.
+    Cuda,
 }
 
 impl BackendKind {
-    /// The name used on the command line: `auto`, `cpu` or `metal`.
+    /// The name used on the command line: `auto`, `cpu`, `metal` or `cuda`.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
             Self::Metal => "metal",
+            Self::Cuda => "cuda",
         }
     }
 
     /// The backend named `name`.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        [Self::Auto, Self::Cpu, Self::Metal]
+        [Self::Auto, Self::Cpu, Self::Metal, Self::Cuda]
             .into_iter()
             .find(|b| b.name() == name)
     }
@@ -328,11 +332,13 @@ pub(crate) struct ModelData<'m> {
     pub(crate) bytes: &'m [u8],
     /// Whether `bytes` is a memory map of the file (whole pages, so a GPU
     /// can use it without a copy).
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "read by Metal"))]
     pub(crate) mapped: bool,
     /// The parameter arena.
     pub(crate) params: &'m [f32],
     pub(crate) config: &'m ModelConfig,
     /// Bytes of the largest tensor.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "read by Metal"))]
     pub(crate) largest_tensor: usize,
 }
 
@@ -441,6 +447,16 @@ pub(crate) struct QkNorm {
     /// Each query head is followed by a gate of the same size, and the
     /// attention output is multiplied by `sigmoid(gate)` (Qwen3.5).
     pub(crate) gated: bool,
+    /// llama.cpp rotates these heads with multi-section RoPE
+    /// (`ggml_rope_multi`; every section has the token's position for text),
+    /// which ggml-cuda runs apart from the norm, where it fuses NEOX RoPE
+    /// with the norm into one kernel. Only the CUDA backend, whose rounding
+    /// follows ggml-cuda's, distinguishes the two.
+    #[cfg_attr(
+        not(any(windows, target_os = "linux")),
+        expect(dead_code, reason = "read by the CUDA backend")
+    )]
+    pub(crate) multi_rope: bool,
 }
 
 /// The ops the forward pass is written in.

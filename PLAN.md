@@ -12,12 +12,14 @@ has the full record of phases 0–6 and the first steps of phase 7).
 
 | Area | State |
 |---|---|
-| Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; Ternary Bonsai (`qwen35` with `prism.hadamard` folded weights, Q2_0) on CPU and Metal; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0/Q2_0); Metal backend, the default (`auto`); OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; CPU prompt batches (parallel batch ops and attention, NEON `i8mm` 8-input K-quant tiles); llama.cpp's KV cache types on both backends |
-| Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot (rechecked after the CPU prompt work on Qwen3-0.6B Q8_0, Qwen3.5-0.8B Q4_K_M and 4B Q8_0); kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta |
+| Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; Ternary Bonsai (`qwen35` with `prism.hadamard` folded weights, Q2_0) on CPU and Metal; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0/Q2_0); Metal backend, the default (`auto`) on macOS; CUDA backend (Windows, Linux), the default where an NVIDIA GPU is present; OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; CPU prompt batches (parallel batch ops and attention, NEON `i8mm` 8-input K-quant tiles); llama.cpp's KV cache types on both backends |
+| Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot (rechecked after the CPU prompt work on Qwen3-0.6B Q8_0, Qwen3.5-0.8B Q4_K_M and 4B Q8_0); kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta. CUDA: logits bit-identical to llama.cpp b12675's CUDA build (`-ngl 99 -fa off -ub 1`) on every local file (Qwen3-0.6B Q8_0/BF16; Qwen3.5-0.8B BF16, Q8_0, Q6_K, Q4_K, Q3_K, Q2_K, IQ2_M; 4B Q8_0; 9B Q3_K_M and UD-Q4_K_XL), at 8, 19, 300 and 4329 tokens, batched or not; greedy text identical on all of them. RTX 3070 Ti (sm_86) only |
 | Decode (M4 Max) | Faster than llama.cpp on every local file on Metal (empty context and 4096 tokens, `-fa` off and on) and on the CPU. Qwen3.5-4B Q8_0 Metal 74 tok/s, 131 with `--draft 3` (llama.cpp 64, 124); Qwen3-0.6B Q8_0 CPU 295 (261) |
 | Prompt (M4 Max, pp512) | Metal level with llama.cpp on the 0.8B Q4_K_M, the 35B MoE and the 4B with a q8_0 cache at depth 4096; 5% behind on the 4B and on Qwen3-0.6B (its flash attention). CPU 11–23% behind llama.cpp, whose CPU prompt products run in Accelerate (Phase 7 step 6) |
 | Tests | 261 pass in `cargo test --workspace` (Metal tests skip without a device); 14 reference tests on real models with `--ignored` (13 pass here; `qwen35_bf16` needs a file not on this machine) |
-| Not started | CUDA; PrismML's PTQ1_0 and PQ2_0 (their llama.cpp fork's types); AVX2 kernels beyond F32/F16/BF16/Q8_0/Q2_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; AVX2 prompt tiles; parallel server slots |
+| Decode (RTX 3070 Ti, CUDA) | Qwen3.5-4B Q8_0 97 tok/s (llama.cpp 98), 9B UD-Q4_K_XL 82 (85), Qwen3-0.6B Q8_0 237 (400), 0.8B Q4_K_M 267 (393); at depth 4096: 0.6B 169 (291), 4B 88 (95). Small models lose to launch overhead (no CUDA graphs yet) |
+| Prompt (RTX 3070 Ti, CUDA) | pp512 12–20× behind llama.cpp: every token runs as a decode step (llama.cpp's batched GEMM rounds differently, so a faster prompt path must keep the one-token arithmetic) |
+| Not started | PrismML's PTQ1_0 and PQ2_0 (their llama.cpp fork's types); AVX2 kernels beyond F32/F16/BF16/Q8_0/Q2_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; AVX2 prompt tiles; parallel server slots |
 | To rerun | The 5600X comparisons (correctness and speed) predate the attention and fused-multiply-add fixes |
 | Git | Committed through `94f7d5b` (not pushed); the fixes from the 2026-11-26 review (Q8_0 prompt tiles dropped, deferred RMSNorm precision) are not committed |
 
@@ -60,11 +62,43 @@ The forward pass is written once against an op-level `Backend` trait
 (`backend.rs`), generic over the backend's vector and KV-cache types. Ops
 are coarse where a GPU can fuse them: `attention` covers the Q/K norms,
 RoPE, the cache append and the gate, `delta_net` the convolution, the delta
-rule and the gated norm. `BackendKind::Auto` picks Metal, then CUDA (once it
-exists), then the CPU, and keeps why each GPU backend was skipped
+rule and the gated norm. `BackendKind::Auto` picks Metal, then CUDA, then the CPU, and keeps why each GPU backend was skipped
 (`Session::fallback_reason`). GPU libraries are opened at runtime, never linked.
 
-### CUDA (Windows, Linux) — not started
+### CUDA (Windows, Linux) — first version done
+
+Status: every op of `qwen3`, `qwen35` and `qwen35moe` runs on the GPU. For
+`qwen3` and `qwen35` they round as ggml-cuda does for one token without
+flash attention, so the logits equal llama.cpp's CUDA build bit for bit (see
+Status). The mixture-of-experts ops (routing, expert products) are checked
+only against the synthetic f64 reference: no MoE file was at hand to compare
+with llama.cpp. Kernels are
+built with `-use_fast_math`, as ggml-cuda is. What that took, for the next
+kernels:
+
+- **Transcribe ggml-cuda, including the launch geometry:** `mul_mat_vec_q`
+  (4 warps on Ampere and newer, 2 for K-quants on Turing), `mul_mat_vec_f`
+  for F32/F16/BF16 weights (block size from the row length, F16 accumulated
+  in `half2`, activations not rounded), `rms_norm_f32` (`float4` geometry),
+  `soft_max_f32`, `ssm_conv`, `gated_delta_net_cuda`, and `mul_mat_f`
+  (tensor cores) for KQ once llama.cpp's padded n_kv passes 512.
+- **Follow ggml-cuda's fusions:** RMS_NORM+MUL+ROPE is one kernel for NEOX
+  RoPE (Qwen3) and separate kernels for multi-section RoPE (Qwen3.5), with
+  different rounding (`QkNorm::multi_rope`).
+- **Match nvcc's multiply-add fusion** where it decides the result (RoPE's
+  second half): written with `fmaf` in the order nvcc chose for ggml.
+- **Attention** follows the non-flash path: KQ, softmax over the row padded
+  as llama.cpp pads its cache (256), KQV accumulated in `half2` (KQV has no
+  precision request), V stored transposed. Quantized caches, which
+  llama.cpp runs only with flash attention, keep an online softmax.
+- **Debugging:** dump llama.cpp's tensors with a `cb_eval` program loaded
+  against the release DLLs, and nibble's from an instrumented copy (both
+  outside the repository). Observing an intermediate tensor splits
+  llama.cpp's graph and disables its fusions for that token: observe only
+  the ends of fused chains.
+
+Next: CUDA graphs per token (launch overhead on small models), a prompt path
+faster than per-token decode steps, partial offload, and the plan below.
 
 - **Driver API only**, loaded at runtime from `nvcuda.dll` / `libcuda.so.1`.
   Entry points are resolved through `cuGetProcAddress`, which avoids the

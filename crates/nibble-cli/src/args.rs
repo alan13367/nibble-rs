@@ -94,8 +94,8 @@ pub(crate) const MODEL_HELP: &str = "  -m, --model FILE         GGUF model file 
   -c, --ctx N              Context size in tokens (default 4096, 0 = model maximum)
   -t, --threads N          Threads (default: performance cores on Apple Silicon,
                            else one per physical core)
-      --backend B          auto, cpu or metal (default auto: Metal where
-                           available, else the CPU)
+      --backend B          auto, cpu, metal or cuda (default auto: Metal or CUDA
+                           where available, else the CPU)
       --draft N            Draft up to N tokens after each one with the model's
                            MTP head and check them in one pass (speculative
                            decoding; same output). Default 0 = off
@@ -138,7 +138,7 @@ impl ModelOptions {
             "--backend" => {
                 let name = args.string(flag)?;
                 self.backend = BackendKind::from_name(&name).ok_or_else(|| {
-                    format!("unknown backend `{name}` (expected auto, cpu or metal)")
+                    format!("unknown backend `{name}` (expected auto, cpu, metal or cuda)")
                 })?;
             }
             "--draft" => self.draft = args.parse(flag)?,

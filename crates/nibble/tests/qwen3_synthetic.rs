@@ -567,32 +567,41 @@ fn metal_matches_the_cpu_over_a_sequence() {
     }
 }
 
-/// The default backend is Metal on a Mac with a GPU, the CPU elsewhere.
+/// The default backend is Metal on a Mac with a GPU, CUDA on Windows/Linux
+/// with an NVIDIA GPU, and the CPU elsewhere.
 #[test]
-fn the_default_backend_is_metal_where_available() {
+fn the_default_backend_is_a_gpu_where_available() {
     let w = Weights::new();
     let model = w.model();
     let session = model.session(SessionOptions::default()).unwrap();
     let metal = common::metal_session(&model, N_CTX).is_some();
+    let cuda = common::cuda_session(&model, N_CTX).is_some();
     let want = if metal {
         nibble::BackendKind::Metal
+    } else if cuda {
+        nibble::BackendKind::Cuda
     } else {
         nibble::BackendKind::Cpu
     };
     assert_eq!(session.backend(), want);
     assert_eq!(
         session.fallback_reason().is_some(),
-        cfg!(target_os = "macos") && !metal
+        (cfg!(target_os = "macos") && !metal)
+            || (cfg!(any(windows, target_os = "linux")) && !metal && !cuda)
     );
 }
 
-/// Batches give every token the logits it gets alone, on the CPU and on Metal.
+/// Batches give every token the logits it gets alone, on every backend.
 #[test]
 fn batch_size_does_not_change_the_logits() {
     let model = Weights::new().model();
     let n_vocab = model.config().n_vocab as u32;
     let tokens: Vec<u32> = (0..23u32).map(|i| (i * 37 + 11) % n_vocab).collect();
-    for backend in [nibble::BackendKind::Cpu, nibble::BackendKind::Metal] {
+    for backend in [
+        nibble::BackendKind::Cpu,
+        nibble::BackendKind::Metal,
+        nibble::BackendKind::Cuda,
+    ] {
         common::assert_batches_match_steps(&model, backend, N_CTX, &tokens, 9);
     }
 }
@@ -648,11 +657,11 @@ fn cache_types() {
             "K {k} V {v}"
         );
         common::assert_logits_close(&last, &reference, &format!("K {k} V {v} against f16"));
-        if let Some(mut metal) =
-            common::session_or_skip(&model, options(nibble::BackendKind::Metal, k, v, 0))
-        {
-            let got = metal.eval(&tokens).unwrap().to_vec();
-            common::assert_logits_close(&got, &last, &format!("K {k} V {v} on Metal"));
+        for backend in [nibble::BackendKind::Metal, nibble::BackendKind::Cuda] {
+            if let Some(mut gpu) = common::session_or_skip(&model, options(backend, k, v, 0)) {
+                let got = gpu.eval(&tokens).unwrap().to_vec();
+                common::assert_logits_close(&got, &last, &format!("K {k} V {v} on {backend}"));
+            }
         }
     }
 }

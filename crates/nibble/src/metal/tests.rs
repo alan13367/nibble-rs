@@ -461,6 +461,7 @@ fn attention_matches_the_cpu_backend() {
             weights: norms.then_some((q_norm, k_norm)),
             eps: 1e-6,
             gated,
+            multi_rope: false,
         };
         let q_len = n_head * head_dim * if gated { 2 } else { 1 };
         let kv_len = n_head_kv * head_dim;
@@ -932,6 +933,7 @@ fn attention_with_cache_types_matches_the_cpu_backend() {
             weights: Some((q_norm, k_norm)),
             eps: 1e-6,
             gated,
+            multi_rope: false,
         };
         let q_len = n_head * head_dim * if gated { 2 } else { 1 };
         let kv_len = n_head_kv * head_dim;
@@ -1156,6 +1158,7 @@ fn attention_timing() {
             weights: Some((qn, kn)),
             eps: 1e-6,
             gated,
+            multi_rope: false,
         };
         let shape = super::kernels::PromptAttention::new(
             n_head / n_head_kv,

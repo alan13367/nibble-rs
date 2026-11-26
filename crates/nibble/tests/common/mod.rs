@@ -140,19 +140,35 @@ pub(crate) fn metal_session(model: &nibble::Model, n_ctx: usize) -> Option<nibbl
     session_or_skip(model, options)
 }
 
-/// A session with `options`, or `None` (with a note) for a Metal session
-/// where Metal is not available.
+/// A CUDA session on `model`, or `None` (with a note) where CUDA is not
+/// available.
+#[allow(dead_code)]
+pub(crate) fn cuda_session(model: &nibble::Model, n_ctx: usize) -> Option<nibble::Session<'_>> {
+    let options = nibble::SessionOptions {
+        n_ctx,
+        backend: nibble::BackendKind::Cuda,
+        ..nibble::SessionOptions::default()
+    };
+    session_or_skip(model, options)
+}
+
+/// A session with `options`, or `None` (with a note) for a GPU session whose
+/// backend is not available.
 pub(crate) fn session_or_skip(
     model: &nibble::Model,
     options: nibble::SessionOptions,
 ) -> Option<nibble::Session<'_>> {
     match model.session(options) {
         Ok(s) => Some(s),
-        // Only a missing device or framework skips: on a Mac with a GPU,
-        // a backend that fails to start (a shader that does not compile,
-        // say) is a bug.
+        // Only a missing platform, driver or device skips: on a machine
+        // with a supported GPU, a backend that fails to start is a bug.
         Err(nibble::Error::Backend(e))
-            if !cfg!(target_os = "macos") || e.contains("no Metal device") =>
+            if (options.backend == nibble::BackendKind::Metal
+                && (!cfg!(target_os = "macos") || e.contains("no Metal device")))
+                || (options.backend == nibble::BackendKind::Cuda
+                    && (!cfg!(any(windows, target_os = "linux"))
+                        || e.contains("no CUDA device")
+                        || e.contains("CUDA driver is not available"))) =>
         {
             eprintln!("skipping: {e}");
             None

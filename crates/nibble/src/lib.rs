@@ -30,6 +30,8 @@
 mod backend;
 pub mod chat;
 mod cpu;
+#[cfg(any(windows, target_os = "linux"))]
+mod cuda;
 mod error;
 #[cfg(target_os = "macos")]
 mod metal;

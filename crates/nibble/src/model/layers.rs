@@ -187,6 +187,7 @@ impl Attention {
             weights: self.q_norm.zip(self.k_norm),
             eps: c.rms_eps,
             gated: false,
+            multi_rope: false,
         };
         b.attention(&mut a.q, &mut a.k, &a.v, qk_norm, cache, &mut a.att);
         s.add(b, &self.wo, &a.att, next);

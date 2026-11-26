@@ -1049,21 +1049,28 @@ fn generation_is_deterministic() {
 }
 
 #[test]
-fn metal_matches_a_naive_reference_and_rewinds() {
+fn gpu_matches_a_naive_reference_and_rewinds() {
     let w = Weights::new();
     let model = w.model();
-    let Some(mut s) = common::metal_session(&model, N_CTX) else {
-        return;
-    };
-    let tokens = [17u32, 99, 258, 3, 200, 65, 66];
-    let logits = s.eval(&tokens).unwrap();
-    assert_close(logits, &w.reference_logits(&tokens), 3e-3);
-    // Back to the checkpoint taken 4 tokens before the end, and on.
-    s.truncate(4).unwrap();
-    let logits = s.eval(&[1, 2]).unwrap();
-    let mut expected = tokens[..4].to_vec();
-    expected.extend([1, 2]);
-    assert_close(logits, &w.reference_logits(&expected), 3e-3);
+    for backend in [nibble::BackendKind::Metal, nibble::BackendKind::Cuda] {
+        let options = nibble::SessionOptions {
+            n_ctx: N_CTX,
+            backend,
+            ..nibble::SessionOptions::default()
+        };
+        let Some(mut s) = common::session_or_skip(&model, options) else {
+            continue;
+        };
+        let tokens = [17u32, 99, 258, 3, 200, 65, 66];
+        let logits = s.eval(&tokens).unwrap();
+        assert_close(logits, &w.reference_logits(&tokens), 3e-3);
+        // Back to the checkpoint taken 4 tokens before the end, and on.
+        s.truncate(4).unwrap();
+        let logits = s.eval(&[1, 2]).unwrap();
+        let mut expected = tokens[..4].to_vec();
+        expected.extend([1, 2]);
+        assert_close(logits, &w.reference_logits(&expected), 3e-3);
+    }
 }
 
 /// Batches give every token the logits it gets alone, on the CPU and on Metal.
@@ -1072,7 +1079,11 @@ fn batch_size_does_not_change_the_logits() {
     let model = Weights::new().model();
     let n_vocab = model.config().n_vocab as u32;
     let tokens: Vec<u32> = (0..23u32).map(|i| (i * 37 + 11) % n_vocab).collect();
-    for backend in [nibble::BackendKind::Cpu, nibble::BackendKind::Metal] {
+    for backend in [
+        nibble::BackendKind::Cpu,
+        nibble::BackendKind::Metal,
+        nibble::BackendKind::Cuda,
+    ] {
         common::assert_batches_match_steps(&model, backend, N_CTX, &tokens, 9);
     }
 }
@@ -1083,7 +1094,11 @@ fn short_evaluations_rewind_without_replay() {
     let model = Weights::new().model();
     let n_vocab = model.config().n_vocab as u32;
     let tokens: Vec<u32> = (0..30u32).map(|i| (i * 53 + 7) % n_vocab).collect();
-    for backend in [nibble::BackendKind::Cpu, nibble::BackendKind::Metal] {
+    for backend in [
+        nibble::BackendKind::Cpu,
+        nibble::BackendKind::Metal,
+        nibble::BackendKind::Cuda,
+    ] {
         common::assert_rewinds_into_short_batches(&model, backend, N_CTX, &tokens);
     }
 }
@@ -1186,7 +1201,11 @@ fn drafting(
     common::session_or_skip(model, options)
 }
 
-const BACKENDS: [nibble::BackendKind; 2] = [nibble::BackendKind::Cpu, nibble::BackendKind::Metal];
+const BACKENDS: [nibble::BackendKind; 3] = [
+    nibble::BackendKind::Cpu,
+    nibble::BackendKind::Metal,
+    nibble::BackendKind::Cuda,
+];
 
 #[test]
 fn mtp_head_matches_a_naive_reference() {

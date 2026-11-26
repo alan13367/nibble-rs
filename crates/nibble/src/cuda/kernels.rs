@@ -1,0 +1,201 @@
+//! Embedded CUDA fatbin, kernel argument layouts and dispatch geometry.
+
+use nibble_gguf::GgmlType;
+
+use super::device::{Function, Module};
+
+/// The offline-built kernels. Building nibble never invokes nvcc.
+pub(crate) const FATBIN: &[u8] = include_bytes!("kernels/nibble.fatbin");
+
+macro_rules! args {
+    ($($name:ident { $($field:ident: $ty:ty),* $(,)? })*) => {
+        $(
+            #[derive(Clone, Copy, Debug)]
+            #[repr(C)]
+            pub(crate) struct $name {
+                $(pub(crate) $field: $ty),*
+            }
+            const _: () = assert!(size_of::<$name>() == 4 * [$(stringify!($field)),*].len());
+        )*
+    };
+}
+
+args! {
+    MatvecArgs { cols: u32, rows: u32, row_bytes: u32, ncols: u32, mode: u32 }
+    MoeArgs { k: u32, per_slot: u32, expert_rows: u32, count: u32 }
+    EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
+    CountArgs { n: u32 }
+    RmsArgs { n: u32, eps: f32 }
+    RouteArgs { n_expert: u32, k: u32 }
+    MoeSumArgs { n: u32, k: u32, eps: f32 }
+    RotateArgs {
+        len: u32, block: u32, signs: u32, head_dim: u32, n_k: u32, rep: u32, inverse: u32
+    }
+    AttentionArgs {
+        n_pos: u32, n: u32, head_dim: u32, group: u32, kv_dim: u32, q_stride: u32,
+        gated: u32, n_rot: u32, norm: u32, scale: f32, base: f32, eps: f32,
+        k_type: u32, v_type: u32, k_row: u32, v_row: u32, rot_k: u32, rot_v: u32,
+        n_head: u32, t0: u32, n_kv_max: u32, cap_pad: u32, multi_rope: u32,
+        kq_mma: u32, n_cells: u32, v_trans: u32,
+    }
+    DeltaBatchArgs {
+        n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32,
+        rows: u32, oldest: u32, replay: u32, n: u32, pending: u32, ba_read: u32,
+        ba_write: u32, eps: f32, scale: f32, l2_eps: f32, l2_scale: f32,
+    }
+}
+
+pub(crate) const MATVEC_STORE: u32 = 0;
+pub(crate) const MATVEC_ADD: u32 = 1;
+pub(crate) const MATVEC_SWIGLU: u32 = 2;
+
+/// A weight type's product and embedding entry points.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypeKernels {
+    pub(crate) matvec: Function,
+    pub(crate) matvec_c4: Function,
+    pub(crate) matvec_id: Function,
+    pub(crate) embed: Function,
+    /// `(values per block, warps, output rows per block)`.
+    pub(crate) shape: (u32, u32, u32),
+}
+
+/// Every entry point the backend launches.
+#[derive(Debug)]
+pub(crate) struct Pipelines {
+    types: Vec<(u32, TypeKernels)>,
+    pub(crate) quantize_q8_1: Function,
+    pub(crate) copy: Function,
+    pub(crate) swiglu: Function,
+    pub(crate) rmsnorm: Function,
+    pub(crate) rotate: Function,
+    pub(crate) argmax: Function,
+    pub(crate) moe_route: Function,
+    pub(crate) moe_combine: Function,
+    pub(crate) moe_residual: Function,
+    pub(crate) attention_prep: Function,
+    pub(crate) attention: Function,
+    pub(crate) attention_kq: Function,
+    pub(crate) attention_kq_mma: Function,
+    pub(crate) attention_softmax: Function,
+    pub(crate) attention_kqv: Function,
+    pub(crate) delta_net_batch: Function,
+    pub(crate) delta_norm: Function,
+}
+
+impl Pipelines {
+    /// The kernels of `module` for a device of compute capability `major`.
+    pub(crate) fn new(module: &Module, major: u32) -> Result<Self, String> {
+        let get = |name: &str| module.function(name);
+        let mut types = Vec::new();
+        for (code, name, shape) in TYPE_SPECS {
+            // The kernels' KQUANT_NWARPS: K-quants use 4 warps from Ampere on.
+            let shape = &match *code {
+                10..=14 if major >= 8 => (shape.0, 4, shape.2),
+                _ => *shape,
+            };
+            types.push((
+                *code,
+                TypeKernels {
+                    matvec: get(&format!("matvec_{name}"))?,
+                    matvec_c4: get(&format!("matvec_{name}_c4"))?,
+                    matvec_id: get(&format!("matvec_{name}_id"))?,
+                    embed: get(&format!("embed_{name}"))?,
+                    shape: *shape,
+                },
+            ));
+        }
+        Ok(Self {
+            types,
+            quantize_q8_1: get("quantize_q8_1")?,
+            copy: get("copy_f32")?,
+            swiglu: get("swiglu")?,
+            rmsnorm: get("rmsnorm")?,
+            rotate: get("rotate")?,
+            argmax: get("argmax")?,
+            moe_route: get("moe_route")?,
+            moe_combine: get("moe_combine")?,
+            moe_residual: get("moe_residual")?,
+            attention_prep: get("attention_prep")?,
+            attention: get("attention")?,
+            attention_kq: get("attention_kq")?,
+            attention_kq_mma: get("attention_kq_mma")?,
+            attention_softmax: get("attention_softmax")?,
+            attention_kqv: get("attention_kqv")?,
+            delta_net_batch: get("delta_net_batch")?,
+            delta_norm: get("delta_norm")?,
+        })
+    }
+
+    pub(crate) fn get(&self, ty: GgmlType) -> Option<&TypeKernels> {
+        let code = type_code(ty)?;
+        self.types.iter().find(|(c, _)| *c == code).map(|(_, k)| k)
+    }
+}
+
+/// The numeric type codes shared with `kernels/quant.cuh`.
+pub(crate) const fn type_code(ty: GgmlType) -> Option<u32> {
+    Some(match ty {
+        GgmlType::F32 => 0,
+        GgmlType::F16 => 1,
+        GgmlType::Bf16 => 2,
+        GgmlType::Q8_0 => 3,
+        GgmlType::Q4_0 => 4,
+        GgmlType::Q4_1 => 5,
+        GgmlType::Q5_0 => 6,
+        GgmlType::Q5_1 => 7,
+        GgmlType::Iq4Nl => 8,
+        GgmlType::Mxfp4 => 9,
+        GgmlType::Q2K => 10,
+        GgmlType::Q3K => 11,
+        GgmlType::Q4K => 12,
+        GgmlType::Q5K => 13,
+        GgmlType::Q6K => 14,
+        GgmlType::Iq4Xs => 15,
+        GgmlType::Iq2Xxs => 16,
+        GgmlType::Iq2Xs => 17,
+        GgmlType::Iq2S => 18,
+        GgmlType::Iq3Xxs => 19,
+        GgmlType::Iq3S => 20,
+        GgmlType::Iq1S => 21,
+        GgmlType::Iq1M => 22,
+        GgmlType::Q2_0 => 23,
+        _ => return None,
+    })
+}
+
+pub(crate) const fn is_quantized(ty: GgmlType) -> bool {
+    match type_code(ty) {
+        Some(code) => code >= 3,
+        None => false,
+    }
+}
+
+#[rustfmt::skip]
+const TYPE_SPECS: &[(u32, &str, (u32, u32, u32))] = &[
+    (0, "f32", (1, 4, 1)),
+    (1, "f16", (1, 4, 1)),
+    (2, "bf16", (1, 4, 1)),
+    (3, "q8_0", (32, 4, 1)),
+    (4, "q4_0", (32, 4, 1)),
+    (5, "q4_1", (32, 4, 1)),
+    (6, "q5_0", (32, 4, 1)),
+    (7, "q5_1", (32, 4, 1)),
+    (8, "iq4_nl", (32, 4, 1)),
+    (9, "mxfp4", (32, 4, 1)),
+    // K-quants: 2 warps on Turing (see `Pipelines::new`).
+    (10, "q2_K", (256, 2, 2)),
+    (11, "q3_K", (256, 2, 2)),
+    (12, "q4_K", (256, 2, 1)),
+    (13, "q5_K", (256, 2, 1)),
+    (14, "q6_K", (256, 2, 1)),
+    (15, "iq4_xs", (256, 4, 1)),
+    (16, "iq2_xxs", (256, 4, 1)),
+    (17, "iq2_xs", (256, 4, 1)),
+    (18, "iq2_s", (256, 4, 1)),
+    (19, "iq3_xxs", (256, 4, 1)),
+    (20, "iq3_s", (256, 4, 1)),
+    (21, "iq1_s", (256, 4, 2)),
+    (22, "iq1_m", (256, 4, 2)),
+    (23, "q2_0", (64, 4, 1)),
+];

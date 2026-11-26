@@ -525,3 +525,97 @@ fn bonsai_q2_0_greedy_matches_llama_cpp() {
         assert!(stats.accepted * 3 > stats.drafted, "{backend}: {stats:?}");
     }
 }
+
+const PRESS_PROMPT: &str = "The history of the printing press begins with";
+const PRIME_PROMPT: &str = "Write a short Python function that checks whether a number is \
+                            prime, then explain how it works.";
+
+/// CUDA against llama.cpp's CUDA path: b12675's
+/// `llama-bin-win-cuda-13.5-x64` build with `-ngl 99 -fa off -b 512 -ub 1`
+/// (the command above otherwise) on an RTX 3070 Ti. The backend's logits
+/// equal llama.cpp's bit for bit, so near-ties are included on purpose: the
+/// Qwen3 Q8_0 case picks " The" over " This" by 0.02 and the Q3_K_M case
+/// "," over " in" by 0.005, where the earlier kernels picked the other token.
+#[test]
+#[ignore = "needs models/Qwen3-0.6B-{Q8_0,BF16}.gguf, Qwen3.5-0.8B-{Q8_0,Q3_K_M}.gguf, \
+            Qwen3.5-4B-Q8_0.gguf and an NVIDIA GPU"]
+fn cuda_greedy_matches_llama_cpp_cuda() {
+    let cases = [
+        (
+            "Qwen3-0.6B-Q8_0.gguf",
+            PRESS_PROMPT,
+            " the invention of the printing press by Johannes Gutenberg in the 15th century. \
+             The printing press was a revolutionary invention that allowed for the mass \
+             production of books. This invention had a significant impact on the development \
+             of the world. The printing press was a tool that enabled the spread of ideas, \
+             which led to the rise",
+        ),
+        (
+            "Qwen3.5-0.8B-Q3_K_M.gguf",
+            PRESS_PROMPT,
+            " the invention of movable type, which was first described by the Frenchman \
+             Jean-Baptiste de La Tour in 1470. This invention was a significant milestone in \
+             the history of the printing press, as it allowed for the production of thousands \
+             of copies of a single book or manuscript. The invention of the printing",
+        ),
+        (
+            "Qwen3-0.6B-BF16.gguf",
+            PRESS_PROMPT,
+            " the invention of the printing press by Johannes Gutenberg in the 15th century. \
+             This invention revolutionized the spread of knowledge and the production of \
+             books. The printing press was a major step forward in the development of the \
+             modern world. It allowed for the mass production of books, which in turn led to \
+             the rise of",
+        ),
+        (
+            "Qwen3.5-0.8B-Q8_0.gguf",
+            PRESS_PROMPT,
+            " the invention of movable type, which was first used in the 14th century. The \
+             first movable type was used in the 14th century, and the first movable type was \
+             used in the 14th century. The first movable type was used in the 14th century, \
+             and the first",
+        ),
+        (
+            "Qwen3.5-4B-Q8_0.gguf",
+            PRIME_PROMPT,
+            "\n\nA prime number is a natural number greater than 1 that has no positive \
+             divisors other than 1 and itself. To determine if a number is prime, we can test \
+             divisibility by all integers from 2 up to the square root of the number. If any \
+             of these divide the number evenly, it is",
+        ),
+    ];
+    for (file, prompt, want) in cases {
+        let model = load_model(file);
+        let (text, _, _) = greedy_on(&model, prompt, 64, nibble::BackendKind::Cuda, 0);
+        assert_eq!(text.trim_end(), want, "{file}");
+    }
+}
+
+/// Repeated CUDA runs give the same logits bit for bit. Heads of 128 values
+/// spread each RoPE pair and each block reduction over several warps, which
+/// is where races between threads of a block showed up (about one run in
+/// three differed in its text before they were fixed).
+#[test]
+#[ignore = "needs models/Qwen3.5-0.8B-Q8_0.gguf and an NVIDIA GPU"]
+fn cuda_runs_are_deterministic() {
+    let model = load_model("Qwen3.5-0.8B-Q8_0.gguf");
+    let tokens = model.tokenizer().encode(PRIME_PROMPT, true);
+    let run = || {
+        let mut session = model
+            .session(SessionOptions {
+                n_ctx: 512,
+                backend: nibble::BackendKind::Cuda,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut logits = session.eval(&tokens).unwrap().to_vec();
+        for t in 0..32u32 {
+            logits.extend_from_slice(session.eval(&[t * 101 + 7]).unwrap());
+        }
+        logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    };
+    let first = run();
+    for i in 1..8 {
+        assert!(run() == first, "run {i} differs from the first");
+    }
+}

@@ -2,6 +2,8 @@
 
 use crate::backend::{Backend, BackendKind, KvCacheType, KvTypes, MAX_LOGIT_ROWS};
 use crate::cpu::{self, CpuBackend};
+#[cfg(any(windows, target_os = "linux"))]
+use crate::cuda::CudaBackend;
 use crate::error::{Error, Result};
 #[cfg(target_os = "macos")]
 use crate::metal::MetalBackend;
@@ -21,7 +23,7 @@ pub struct SessionOptions {
     /// The threads live as long as the session.
     pub threads: usize,
     /// The hardware that runs the forward pass (default
-    /// [`BackendKind::Auto`]: Metal where available, else the CPU).
+    /// [`BackendKind::Auto`]: Metal or CUDA where available, else the CPU).
     pub backend: BackendKind,
     /// Most tokens evaluated in one forward pass, which reads each weight
     /// once for all of them. `0` uses [`DEFAULT_BATCH`]. Each token of a
@@ -114,14 +116,19 @@ struct Run<B: Backend> {
 
 /// The session's backend. Each [`Session`] method matches on it once and
 /// runs generic code on the backend inside.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per session, matched on every call: boxing buys nothing"
+#[cfg_attr(
+    any(target_os = "macos", windows, target_os = "linux"),
+    expect(
+        clippy::large_enum_variant,
+        reason = "one per session, matched on every call: boxing buys nothing"
+    )
 )]
 enum Engine<'m> {
     Cpu(Run<CpuBackend<'m>>),
     #[cfg(target_os = "macos")]
     Metal(Run<MetalBackend<'m>>),
+    #[cfg(any(windows, target_os = "linux"))]
+    Cuda(Run<CudaBackend<'m>>),
 }
 
 /// Runs `$body` with `$b` and `$s` bound to the backend and state of `$engine`.
@@ -134,6 +141,11 @@ macro_rules! on_engine {
             }) => $body,
             #[cfg(target_os = "macos")]
             Engine::Metal(Run {
+                backend: $b,
+                state: $s,
+            }) => $body,
+            #[cfg(any(windows, target_os = "linux"))]
+            Engine::Cuda(Run {
                 backend: $b,
                 state: $s,
             }) => $body,
@@ -176,12 +188,26 @@ impl<'m> Engine<'m> {
         match options.backend {
             BackendKind::Cpu => Ok((cpu(options.threads)?, None)),
             BackendKind::Metal => Ok((Self::metal(model, n_ctx, rows, mtp, kv)?, None)),
-            // Only Metal exists to try, and only on macOS.
-            BackendKind::Auto if !cfg!(target_os = "macos") => Ok((cpu(options.threads)?, None)),
-            BackendKind::Auto => match Self::metal(model, n_ctx, rows, mtp, kv) {
-                Ok(engine) => Ok((engine, None)),
-                Err(e) => Ok((cpu(options.threads)?, Some(e.to_string()))),
-            },
+            BackendKind::Cuda => Ok((Self::cuda(model, n_ctx, rows, mtp, kv)?, None)),
+            BackendKind::Auto => {
+                // The GPU backends this platform has, in order of preference.
+                type Start<'m> = fn(&'m Model, usize, usize, bool, KvTypes) -> Result<Engine<'m>>;
+                let gpus: &[Start<'m>] = &[
+                    #[cfg(target_os = "macos")]
+                    Self::metal,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    Self::cuda,
+                ];
+                let mut reasons = Vec::new();
+                for start in gpus {
+                    match start(model, n_ctx, rows, mtp, kv) {
+                        Ok(engine) => return Ok((engine, None)),
+                        Err(e) => reasons.push(e.to_string()),
+                    }
+                }
+                let fallback = (!reasons.is_empty()).then(|| reasons.join("; "));
+                Ok((cpu(options.threads)?, fallback))
+            }
         }
     }
 
@@ -202,6 +228,26 @@ impl<'m> Engine<'m> {
     ) -> Result<Self> {
         Err(Error::Backend(
             "Metal is only available on macOS".to_owned(),
+        ))
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn cuda(model: &'m Model, n_ctx: usize, rows: usize, mtp: bool, kv: KvTypes) -> Result<Self> {
+        let mut backend = CudaBackend::new(model.data(), n_ctx, kv)?;
+        let state = model.new_state(&mut backend, n_ctx, rows, mtp)?;
+        Ok(Self::Cuda(Run { backend, state }))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn cuda(
+        _model: &'m Model,
+        _n_ctx: usize,
+        _rows: usize,
+        _mtp: bool,
+        _kv: KvTypes,
+    ) -> Result<Self> {
+        Err(Error::Backend(
+            "CUDA is only available on Windows and Linux".to_owned(),
         ))
     }
 }
@@ -326,7 +372,7 @@ impl<'m> Session<'m> {
     }
 
     /// The kernels this session runs: `scalar`, `avx2` or `neon` on the
-    /// CPU, `metal` on an Apple GPU.
+    /// CPU, `metal` on an Apple GPU, `cuda` on an NVIDIA GPU.
     #[must_use]
     pub fn kernel(&self) -> &'static str {
         on_engine!(&self.engine, |b, _s| b.name())
@@ -339,6 +385,8 @@ impl<'m> Session<'m> {
             Engine::Cpu(_) => BackendKind::Cpu,
             #[cfg(target_os = "macos")]
             Engine::Metal(_) => BackendKind::Metal,
+            #[cfg(any(windows, target_os = "linux"))]
+            Engine::Cuda(_) => BackendKind::Cuda,
         }
     }
 
@@ -364,7 +412,8 @@ impl<'m> Session<'m> {
     }
 
     /// What runs the session, for logs: `10 threads, neon kernels` on the
-    /// CPU, `Metal on Apple M4 Max` on a GPU.
+    /// CPU, `Metal on Apple M4 Max` or `CUDA on NVIDIA GeForce RTX 3070 Ti`
+    /// on a GPU.
     #[must_use]
     pub fn compute(&self) -> String {
         match &self.engine {
@@ -375,6 +424,8 @@ impl<'m> Session<'m> {
             ),
             #[cfg(target_os = "macos")]
             Engine::Metal(run) => format!("Metal on {}", run.backend.device_name()),
+            #[cfg(any(windows, target_os = "linux"))]
+            Engine::Cuda(run) => format!("CUDA on {}", run.backend.device_name()),
         }
     }
 
@@ -387,6 +438,8 @@ impl<'m> Session<'m> {
             Engine::Cpu(run) => run.backend.threads(),
             #[cfg(target_os = "macos")]
             Engine::Metal(_) => 1,
+            #[cfg(any(windows, target_os = "linux"))]
+            Engine::Cuda(_) => 1,
         }
     }
 

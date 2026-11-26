@@ -511,6 +511,7 @@ fn attention<B: Backend>(
         weights: Some((at.q_norm, at.k_norm)),
         eps: c.rms_eps,
         gated: true,
+        multi_rope: true,
     };
     b.attention(&mut a.qg, &mut a.k, &a.v, qk_norm, cache, &mut a.att);
     add(b, s, rot, &at.wo, r.mixer_out, &a.att, next);

@@ -107,7 +107,7 @@ impl Experts {
     }
 
     /// Every expert as one matrix of `count * rows` rows.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     pub(crate) fn all(&self) -> Weight {
         Weight {
             rows: self.count * self.first.rows,

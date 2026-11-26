@@ -664,6 +664,7 @@ impl GatedAttention {
             weights: Some((self.q_norm, self.k_norm)),
             eps: c.rms_eps,
             gated: true,
+            multi_rope: true,
         };
         b.attention(&mut a.qg, &mut a.k, &a.v, qk_norm, cache, &mut a.att);
         s.add(b, &self.wo, &a.att, next);
