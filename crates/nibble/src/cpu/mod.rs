@@ -56,7 +56,7 @@ const ROW_ALIGN: usize = 16;
 /// A product over a batch multiplies this many bytes of weight rows with
 /// every token's input before it moves on, so that they are read from
 /// memory once per batch and stay in the core's L1 cache meanwhile.
-const BATCH_BLOCK_BYTES: usize = 16 * 1024;
+const BATCH_BLOCK_BYTES: usize = 32 * 1024;
 
 /// A weight matrix inside the model bytes: `rows` rows of `cols` elements each
 /// (ggml shape `[cols, rows]`).
@@ -475,14 +475,36 @@ fn dot_batch(
     }
     let xq_len = xq.len() / n;
     let x = |t: usize| &xq[t * xq_len..(t + 1) * xq_len];
-    let block = (BATCH_BLOCK_BYTES / w.row_bytes.max(1)).max(1);
+    let prompt = n > crate::backend::MAX_LOGIT_ROWS;
+    // Keep weight blocks a multiple of 4 rows so 4-row GEMM tiles stay aligned.
+    let block = (BATCH_BLOCK_BYTES / w.row_bytes.max(1))
+        .max(4)
+        .next_multiple_of(4);
     let mut b0 = 0;
     while b0 < out.len() {
         let b1 = (b0 + block).min(out.len());
         let rows = w.rows_bytes(bytes, first + b0..first + b1);
         let mut t = 0;
+        if prompt {
+            while t + 8 <= n {
+                let o = out.segments_mut::<8>(t).map(|o| &mut o[b0..b1]);
+                let xs = std::array::from_fn(|i| x(t + i));
+                if !kernels.dot_rows_prompt(w.ty, rows, w.row_bytes, xs, o) {
+                    break;
+                }
+                t += 8;
+            }
+            while t + 4 <= n {
+                let o = out.segments_mut::<4>(t).map(|o| &mut o[b0..b1]);
+                let xs = std::array::from_fn(|i| x(t + i));
+                if !kernels.dot_rows_prompt(w.ty, rows, w.row_bytes, xs, o) {
+                    break;
+                }
+                t += 4;
+            }
+        }
         // Groups of 4 inputs, then one of 3 or of 2, where the type has
-        // such kernels.
+        // such kernels (bit-identical to single-token decoding).
         while t + 4 <= n {
             let o = out.segments_mut::<4>(t).map(|o| &mut o[b0..b1]);
             if !kernels.dot_rows_n(

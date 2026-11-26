@@ -46,6 +46,7 @@ macro_rules! neon_call {
 pub(crate) struct Neon {
     dotprod: bool,
     fp16: bool,
+    i8mm: bool,
 }
 
 impl Neon {
@@ -58,6 +59,7 @@ impl Neon {
         Some(Self {
             dotprod: std::arch::is_aarch64_feature_detected!("dotprod"),
             fp16: std::arch::is_aarch64_feature_detected!("fp16"),
+            i8mm: std::arch::is_aarch64_feature_detected!("i8mm"),
         })
     }
 
@@ -162,14 +164,64 @@ impl Neon {
             GgmlType::Q8_0 if self.dotprod && self.fp16 => {
                 neon_call!(dot_q8_0_rows_n(rows, row_bytes, xq, out));
             }
+            GgmlType::Q4K if self.i8mm && N == 4 => {
+                neon_call!(dot_q4_rows_i8mm::<N, 2>(rows, row_bytes, xq, out));
+            }
             GgmlType::Q4K if self.dotprod => neon_call!(dot_q4_rows_n(rows, row_bytes, xq, out)),
+            GgmlType::Q5K if self.i8mm && N == 4 => {
+                neon_call!(dot_q5_rows_i8mm::<N, 2>(rows, row_bytes, xq, out));
+            }
             GgmlType::Q5K if self.dotprod => neon_call!(dot_q5_rows_n(rows, row_bytes, xq, out)),
+            GgmlType::Q6K if self.i8mm && N == 4 => {
+                neon_call!(dot_q6_rows_i8mm::<N, 2>(rows, row_bytes, xq, out));
+            }
             GgmlType::Q6K if self.dotprod => neon_call!(dot_q6_rows_n(rows, row_bytes, xq, out)),
             GgmlType::Bf16 => neon_call!(dot_bf16_rows_n(rows, row_bytes, xq, out)),
             GgmlType::F16 if self.fp16 => neon_call!(dot_f16_rows_n(rows, row_bytes, xq, out)),
             _ => return false,
         }
         true
+    }
+
+    /// See [`super::Kernels::dot_rows_prompt`].
+    pub(crate) fn dot_rows_prompt<const N: usize>(
+        self,
+        ty: GgmlType,
+        rows: &[u8],
+        row_bytes: usize,
+        xq: [&[u8]; N],
+        out: [&mut [f32]; N],
+    ) -> bool {
+        if self.i8mm {
+            match (ty, N) {
+                (GgmlType::Q8_0, 8) if self.fp16 => {
+                    neon_call!(dot_q8_0_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+                    return true;
+                }
+                (GgmlType::Q8_0, 4) if self.fp16 => {
+                    neon_call!(dot_q8_0_rows_i8mm::<N, 2>(rows, row_bytes, xq, out));
+                    return true;
+                }
+                (GgmlType::Q4K, 8) => {
+                    neon_call!(dot_q4_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+                    return true;
+                }
+                (GgmlType::Q5K, 8) => {
+                    neon_call!(dot_q5_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+                    return true;
+                }
+                (GgmlType::Q6K, 8) => {
+                    neon_call!(dot_q6_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if N <= 4 {
+            self.dot_rows_n(ty, rows, row_bytes, xq, out)
+        } else {
+            false
+        }
     }
 
     /// See [`super::Kernels::dot_f16_f32_rows`].
@@ -1335,6 +1387,753 @@ fn q8_0_tile<const R: usize, const N: usize>(
     out
 }
 
+/// Signed `2×8 × 8×2 -> 2×2` int8 matrix multiply-accumulate (`SMMLA`).
+/// `std::arch::aarch64::vmmlaq_s32` is still unstable on Rust 1.100, while
+/// `target_feature(enable = "i8mm")` and `is_aarch64_feature_detected!("i8mm")`
+/// are stable; inline assembly emits the exact instruction behind that token.
+#[inline]
+#[target_feature(enable = "neon,i8mm")]
+fn smmla_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    // SAFETY: caller proved `i8mm` via `Neon::detect()`; `smmla` touches only
+    // its three vector registers.
+    unsafe {
+        std::arch::asm!(
+            "smmla {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
+    }
+    acc
+}
+
+/// Packs two 16-byte vectors `(r0, r1)` into two `2×8` matrices for `smmla_s32`:
+/// first `[r0[0..8], r1[0..8]]`, second `[r0[8..16], r1[8..16]]`.
+#[inline]
+#[target_feature(enable = "neon")]
+fn zip_2x8(r0: int8x16_t, r1: int8x16_t) -> (int8x16_t, int8x16_t) {
+    let a = vreinterpretq_s64_s8(r0);
+    let b = vreinterpretq_s64_s8(r1);
+    (
+        vreinterpretq_s8_s64(vzip1q_s64(a, b)),
+        vreinterpretq_s8_s64(vzip2q_s64(a, b)),
+    )
+}
+
+/// Loads 32 bytes from two rows `(r0, r1)` and packs them into four `2×8`
+/// matrices for `vmmlaq_s32`.
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_2x32_i8mm(r0: &[u8], r1: &[u8]) -> [int8x16_t; 4] {
+    let (a0, a1) = zip_2x8(load_i8(at16(r0, 0)), load_i8(at16(r1, 0)));
+    let (a2, a3) = zip_2x8(load_i8(at16(r0, 16)), load_i8(at16(r1, 16)));
+    [a0, a1, a2, a3]
+}
+
+/// Four `f16` block scales widened in a single `vcvt_f32_f16`.
+#[inline]
+#[target_feature(enable = "neon,fp16")]
+fn q8_scales4_fp16(
+    b0: &[u8; Q8_0_BLOCK_BYTES],
+    b1: &[u8; Q8_0_BLOCK_BYTES],
+    b2: &[u8; Q8_0_BLOCK_BYTES],
+    b3: &[u8; Q8_0_BLOCK_BYTES],
+) -> float32x4_t {
+    let raw = u64::from(u16::from_le_bytes([b0[0], b0[1]]))
+        | (u64::from(u16::from_le_bytes([b1[0], b1[1]])) << 16)
+        | (u64::from(u16::from_le_bytes([b2[0], b2[1]])) << 32)
+        | (u64::from(u16::from_le_bytes([b3[0], b3[1]])) << 48);
+    vcvt_f32_f16(vreinterpret_f16_u64(vcreate_u64(raw)))
+}
+
+/// `[a, a, b, b]` in `i32` in pure registers (no stack round-trip).
+#[inline]
+#[target_feature(enable = "neon")]
+fn dup2_s32(a: i32, b: i32) -> int32x4_t {
+    vcombine_s32(vdup_n_s32(a), vdup_n_s32(b))
+}
+
+/// `Q8_0` prompt GEMM (`4 × N` tiles with `i8mm` `smmla`, `N = 2 * NC_PAIRS`).
+#[target_feature(enable = "neon,dotprod,fp16,i8mm")]
+fn dot_q8_0_rows_i8mm<const N: usize, const NC_PAIRS: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    out: [&mut [f32]; N],
+) {
+    debug_assert_eq!(N, 2 * NC_PAIRS);
+    let x = xq.map(|x| x.as_chunks::<Q8_0_BLOCK_BYTES>().0);
+    let blocks = |r: usize| {
+        rows[r * row_bytes..(r + 1) * row_bytes]
+            .as_chunks::<Q8_0_BLOCK_BYTES>()
+            .0
+    };
+    let n_rows = out[0].len();
+    let zero = vdupq_n_s32(0);
+    let mut r = 0;
+    while r + 4 <= n_rows {
+        let w = [blocks(r), blocks(r + 1), blocks(r + 2), blocks(r + 3)];
+        let nb = w[0].len().min(x[0].len());
+        let mut sum0 = [[vdupq_n_f32(0.0); NC_PAIRS]; 2];
+        let mut sum1 = [[vdupq_n_f32(0.0); NC_PAIRS]; 2];
+        let step = |i: usize, sum: &mut [[float32x4_t; NC_PAIRS]; 2]| {
+            let ws = q8_scales4_fp16(&w[0][i], &w[1][i], &w[2][i], &w[3][i]);
+            let ws01 = vzip1q_f32(ws, ws);
+            let ws23 = vzip2q_f32(ws, ws);
+            let a0 = load_2x32_i8mm(&w[0][i][2..], &w[1][i][2..]);
+            let a1 = load_2x32_i8mm(&w[2][i][2..], &w[3][i][2..]);
+            for cp in 0..NC_PAIRS {
+                let c0 = 2 * cp;
+                let c1 = c0 + 1;
+                let b = load_2x32_i8mm(&x[c0][i][2..], &x[c1][i][2..]);
+                let p0 = smmla_s32(
+                    smmla_s32(
+                        smmla_s32(smmla_s32(zero, a0[0], b[0]), a0[1], b[1]),
+                        a0[2],
+                        b[2],
+                    ),
+                    a0[3],
+                    b[3],
+                );
+                let p1 = smmla_s32(
+                    smmla_s32(
+                        smmla_s32(smmla_s32(zero, a1[0], b[0]), a1[1], b[1]),
+                        a1[2],
+                        b[2],
+                    ),
+                    a1[3],
+                    b[3],
+                );
+                let xraw = u64::from(u16::from_le_bytes([x[c0][i][0], x[c0][i][1]]))
+                    | (u64::from(u16::from_le_bytes([x[c1][i][0], x[c1][i][1]])) << 16);
+                let xs_lo = vget_low_f32(vcvt_f32_f16(vreinterpret_f16_u64(vcreate_u64(xraw))));
+                let xs = vcombine_f32(xs_lo, xs_lo);
+                sum[0][cp] = vfmaq_f32(sum[0][cp], vcvtq_f32_s32(p0), vmulq_f32(ws01, xs));
+                sum[1][cp] = vfmaq_f32(sum[1][cp], vcvtq_f32_s32(p1), vmulq_f32(ws23, xs));
+            }
+        };
+        let mut i = 0;
+        while i + 1 < nb {
+            step(i, &mut sum0);
+            step(i + 1, &mut sum1);
+            i += 2;
+        }
+        if i < nb {
+            step(i, &mut sum0);
+        }
+        for cp in 0..NC_PAIRS {
+            let mut s0 = [0.0f32; 4];
+            let mut s1 = [0.0f32; 4];
+            store_f32(&mut s0, vaddq_f32(sum0[0][cp], sum1[0][cp]));
+            store_f32(&mut s1, vaddq_f32(sum0[1][cp], sum1[1][cp]));
+            let c0 = 2 * cp;
+            let c1 = c0 + 1;
+            out[c0][r] = s0[0];
+            out[c1][r] = s0[1];
+            out[c0][r + 1] = s0[2];
+            out[c1][r + 1] = s0[3];
+            out[c0][r + 2] = s1[0];
+            out[c1][r + 2] = s1[1];
+            out[c0][r + 3] = s1[2];
+            out[c1][r + 3] = s1[3];
+        }
+        r += 4;
+    }
+    if r < n_rows {
+        let rem_rows = &rows[r * row_bytes..];
+        let rem_out = out.map(|o| &mut o[r..]);
+        dot_q8_0_rows_n(rem_rows, row_bytes, xq, rem_out);
+    }
+}
+
+/// `Q4_K` `4 × N` GEMM with `i8mm` `vmmlaq_s32`: computes the exact same
+/// integer block dots and `f32` updates as [`dot_q4_rows`] (bit-identical).
+#[target_feature(enable = "neon,dotprod,i8mm")]
+fn dot_q4_rows_i8mm<const N: usize, const NC_PAIRS: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    out: [&mut [f32]; N],
+) {
+    debug_assert_eq!(N, 2 * NC_PAIRS);
+    let xs = xq.map(|x| x.as_chunks::<Q8_K_BLOCK_BYTES>().0);
+    let blocks = |r: usize| {
+        rows[r * row_bytes..(r + 1) * row_bytes]
+            .as_chunks::<Q4_K_BLOCK_BYTES>()
+            .0
+    };
+    let m4b = vdupq_n_u8(0x0f);
+    let zero = vdupq_n_s32(0);
+    let n_rows = out[0].len();
+    let mut r = 0;
+    while r + 4 <= n_rows {
+        let w = [blocks(r), blocks(r + 1), blocks(r + 2), blocks(r + 3)];
+        let nb = w[0].len().min(xs[0].len());
+        let mut sum = [[0.0f32; N]; 4];
+        for b in 0..nb {
+            let d = [0, 1, 2, 3]
+                .map(|k| quant::f16_to_f32(u16::from_le_bytes([w[k][b][0], w[k][b][1]])));
+            let dmin = [0, 1, 2, 3]
+                .map(|k| quant::f16_to_f32(u16::from_le_bytes([w[k][b][2], w[k][b][3]])));
+            let tables = [0, 1, 2, 3].map(|k| k4_table(&w[k][b][4..16]));
+            let mut sum_mins = [[0i32; N]; 4];
+            for c in 0..N {
+                let bsums = q8k_bsums(&xs[c][b]);
+                let pair_sums: [i32; 8] =
+                    std::array::from_fn(|g| i32::from(bsums[2 * g]) + i32::from(bsums[2 * g + 1]));
+                for k in 0..4 {
+                    let mins = &tables[k].1;
+                    let mut m = 0i32;
+                    for g in 0..8 {
+                        m += pair_sums[g] * i32::from(mins[g]);
+                    }
+                    sum_mins[k][c] = m;
+                }
+            }
+            let mut sumi = [[zero; NC_PAIRS]; 2];
+            for j in 0..4 {
+                let unpack = |k: usize| {
+                    let qs = &w[k][b][16..];
+                    let q0 = load_u8(at16(qs, j * 32));
+                    let q1 = load_u8(at16(qs, j * 32 + 16));
+                    (
+                        vreinterpretq_s8_u8(vandq_u8(q0, m4b)),
+                        vreinterpretq_s8_u8(vandq_u8(q1, m4b)),
+                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(q0)),
+                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(q1)),
+                    )
+                };
+                let (l0a, l0b, h0a, h0b) = unpack(0);
+                let (l1a, l1b, h1a, h1b) = unpack(1);
+                let (l2a, l2b, h2a, h2b) = unpack(2);
+                let (l3a, l3b, h3a, h3b) = unpack(3);
+                let (al00, al01) = zip_2x8(l0a, l1a);
+                let (al02, al03) = zip_2x8(l0b, l1b);
+                let (al10, al11) = zip_2x8(l2a, l3a);
+                let (al12, al13) = zip_2x8(l2b, l3b);
+                let sc01_lo =
+                    dup2_s32(i32::from(tables[0].0[2 * j]), i32::from(tables[1].0[2 * j]));
+                let sc23_lo =
+                    dup2_s32(i32::from(tables[2].0[2 * j]), i32::from(tables[3].0[2 * j]));
+                for cp in 0..NC_PAIRS {
+                    let x0 = &xs[2 * cp][b][4 + j * 64..];
+                    let x1 = &xs[2 * cp + 1][b][4 + j * 64..];
+                    let bl = load_2x32_i8mm(x0, x1);
+                    let p0 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, al00, bl[0]), al01, bl[1]),
+                            al02,
+                            bl[2],
+                        ),
+                        al03,
+                        bl[3],
+                    );
+                    let p1 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, al10, bl[0]), al11, bl[1]),
+                            al12,
+                            bl[2],
+                        ),
+                        al13,
+                        bl[3],
+                    );
+                    sumi[0][cp] = vmlaq_s32(sumi[0][cp], p0, sc01_lo);
+                    sumi[1][cp] = vmlaq_s32(sumi[1][cp], p1, sc23_lo);
+                }
+                let (ah00, ah01) = zip_2x8(h0a, h1a);
+                let (ah02, ah03) = zip_2x8(h0b, h1b);
+                let (ah10, ah11) = zip_2x8(h2a, h3a);
+                let (ah12, ah13) = zip_2x8(h2b, h3b);
+                let sc01_hi = dup2_s32(
+                    i32::from(tables[0].0[2 * j + 1]),
+                    i32::from(tables[1].0[2 * j + 1]),
+                );
+                let sc23_hi = dup2_s32(
+                    i32::from(tables[2].0[2 * j + 1]),
+                    i32::from(tables[3].0[2 * j + 1]),
+                );
+                for cp in 0..NC_PAIRS {
+                    let x0 = &xs[2 * cp][b][4 + j * 64 + 32..];
+                    let x1 = &xs[2 * cp + 1][b][4 + j * 64 + 32..];
+                    let bh = load_2x32_i8mm(x0, x1);
+                    let p0 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, ah00, bh[0]), ah01, bh[1]),
+                            ah02,
+                            bh[2],
+                        ),
+                        ah03,
+                        bh[3],
+                    );
+                    let p1 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, ah10, bh[0]), ah11, bh[1]),
+                            ah12,
+                            bh[2],
+                        ),
+                        ah13,
+                        bh[3],
+                    );
+                    sumi[0][cp] = vmlaq_s32(sumi[0][cp], p0, sc01_hi);
+                    sumi[1][cp] = vmlaq_s32(sumi[1][cp], p1, sc23_hi);
+                }
+            }
+            for cp in 0..NC_PAIRS {
+                let mut i0 = [0i32; 4];
+                let mut i1 = [0i32; 4];
+                // SAFETY: 16 writable bytes.
+                unsafe {
+                    vst1q_s32(i0.as_mut_ptr(), sumi[0][cp]);
+                    vst1q_s32(i1.as_mut_ptr(), sumi[1][cp]);
+                }
+                let c0 = 2 * cp;
+                let c1 = c0 + 1;
+                let xd0 = f32::from_le_bytes(xs[c0][b][0..4].try_into().unwrap());
+                let xd1 = f32::from_le_bytes(xs[c1][b][0..4].try_into().unwrap());
+                sum[0][c0] = quant::q4_k_update(
+                    sum[0][c0],
+                    xd0 * d[0],
+                    xd0 * dmin[0],
+                    i0[0],
+                    sum_mins[0][c0],
+                );
+                sum[0][c1] = quant::q4_k_update(
+                    sum[0][c1],
+                    xd1 * d[0],
+                    xd1 * dmin[0],
+                    i0[1],
+                    sum_mins[0][c1],
+                );
+                sum[1][c0] = quant::q4_k_update(
+                    sum[1][c0],
+                    xd0 * d[1],
+                    xd0 * dmin[1],
+                    i0[2],
+                    sum_mins[1][c0],
+                );
+                sum[1][c1] = quant::q4_k_update(
+                    sum[1][c1],
+                    xd1 * d[1],
+                    xd1 * dmin[1],
+                    i0[3],
+                    sum_mins[1][c1],
+                );
+                sum[2][c0] = quant::q4_k_update(
+                    sum[2][c0],
+                    xd0 * d[2],
+                    xd0 * dmin[2],
+                    i1[0],
+                    sum_mins[2][c0],
+                );
+                sum[2][c1] = quant::q4_k_update(
+                    sum[2][c1],
+                    xd1 * d[2],
+                    xd1 * dmin[2],
+                    i1[1],
+                    sum_mins[2][c1],
+                );
+                sum[3][c0] = quant::q4_k_update(
+                    sum[3][c0],
+                    xd0 * d[3],
+                    xd0 * dmin[3],
+                    i1[2],
+                    sum_mins[3][c0],
+                );
+                sum[3][c1] = quant::q4_k_update(
+                    sum[3][c1],
+                    xd1 * d[3],
+                    xd1 * dmin[3],
+                    i1[3],
+                    sum_mins[3][c1],
+                );
+            }
+        }
+        for c in 0..N {
+            out[c][r] = sum[0][c];
+            out[c][r + 1] = sum[1][c];
+            out[c][r + 2] = sum[2][c];
+            out[c][r + 3] = sum[3][c];
+        }
+        r += 4;
+    }
+    if r < n_rows {
+        let rem_rows = &rows[r * row_bytes..];
+        let rem_out = out.map(|o| &mut o[r..]);
+        dot_q4_rows_n(rem_rows, row_bytes, xq, rem_out);
+    }
+}
+
+/// `Q5_K` `4 × N` GEMM with `i8mm` `vmmlaq_s32`: bit-identical to [`dot_q5_rows`].
+#[target_feature(enable = "neon,dotprod,i8mm")]
+fn dot_q5_rows_i8mm<const N: usize, const NC_PAIRS: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    out: [&mut [f32]; N],
+) {
+    debug_assert_eq!(N, 2 * NC_PAIRS);
+    let xs = xq.map(|x| x.as_chunks::<Q8_K_BLOCK_BYTES>().0);
+    let blocks = |r: usize| {
+        rows[r * row_bytes..(r + 1) * row_bytes]
+            .as_chunks::<Q5_K_BLOCK_BYTES>()
+            .0
+    };
+    let m4b = vdupq_n_u8(0x0f);
+    let one = vdupq_n_u8(1);
+    let two = vdupq_n_u8(2);
+    let zero = vdupq_n_s32(0);
+    let n_rows = out[0].len();
+    let mut r = 0;
+    while r + 4 <= n_rows {
+        let w = [blocks(r), blocks(r + 1), blocks(r + 2), blocks(r + 3)];
+        let nb = w[0].len().min(xs[0].len());
+        let mut sum = [[0.0f32; N]; 4];
+        for b in 0..nb {
+            let d = [0, 1, 2, 3]
+                .map(|k| quant::f16_to_f32(u16::from_le_bytes([w[k][b][0], w[k][b][1]])));
+            let dmin = [0, 1, 2, 3]
+                .map(|k| quant::f16_to_f32(u16::from_le_bytes([w[k][b][2], w[k][b][3]])));
+            let tables = [0, 1, 2, 3].map(|k| k4_table(&w[k][b][4..16]));
+            let mut sum_mins = [[0i32; N]; 4];
+            for c in 0..N {
+                let bsums = q8k_bsums(&xs[c][b]);
+                let pair_sums: [i32; 8] =
+                    std::array::from_fn(|g| i32::from(bsums[2 * g]) + i32::from(bsums[2 * g + 1]));
+                for k in 0..4 {
+                    let mins = &tables[k].1;
+                    let mut m = 0i32;
+                    for g in 0..8 {
+                        m += pair_sums[g] * i32::from(mins[g]);
+                    }
+                    sum_mins[k][c] = m;
+                }
+            }
+            let mut qh0 = [0, 1, 2, 3].map(|k| load_u8(at16(&w[k][b][16..], 0)));
+            let mut qh1 = [0, 1, 2, 3].map(|k| load_u8(at16(&w[k][b][16..], 16)));
+            let mut isum = [[zero; NC_PAIRS]; 2];
+            for j in 0..4 {
+                let mut unpack = |k: usize| {
+                    let ql = &w[k][b][48..];
+                    let q0 = load_u8(at16(ql, j * 32));
+                    let q1 = load_u8(at16(ql, j * 32 + 16));
+                    let h0 = vshlq_n_u8::<4>(vandq_u8(one, qh0[k]));
+                    let h1 = vshlq_n_u8::<4>(vandq_u8(one, qh1[k]));
+                    let h2 = vshlq_n_u8::<3>(vandq_u8(two, qh0[k]));
+                    let h3 = vshlq_n_u8::<3>(vandq_u8(two, qh1[k]));
+                    qh0[k] = vshrq_n_u8::<2>(qh0[k]);
+                    qh1[k] = vshrq_n_u8::<2>(qh1[k]);
+                    (
+                        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q0, m4b), h0)),
+                        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q1, m4b), h1)),
+                        vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q0), h2)),
+                        vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q1), h3)),
+                    )
+                };
+                let (l0a, l0b, h0a, h0b) = unpack(0);
+                let (l1a, l1b, h1a, h1b) = unpack(1);
+                let (l2a, l2b, h2a, h2b) = unpack(2);
+                let (l3a, l3b, h3a, h3b) = unpack(3);
+                let (al00, al01) = zip_2x8(l0a, l1a);
+                let (al02, al03) = zip_2x8(l0b, l1b);
+                let (al10, al11) = zip_2x8(l2a, l3a);
+                let (al12, al13) = zip_2x8(l2b, l3b);
+                let sc01_lo =
+                    dup2_s32(i32::from(tables[0].0[2 * j]), i32::from(tables[1].0[2 * j]));
+                let sc23_lo =
+                    dup2_s32(i32::from(tables[2].0[2 * j]), i32::from(tables[3].0[2 * j]));
+                for cp in 0..NC_PAIRS {
+                    let x0 = &xs[2 * cp][b][4 + j * 64..];
+                    let x1 = &xs[2 * cp + 1][b][4 + j * 64..];
+                    let bl = load_2x32_i8mm(x0, x1);
+                    let p0 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, al00, bl[0]), al01, bl[1]),
+                            al02,
+                            bl[2],
+                        ),
+                        al03,
+                        bl[3],
+                    );
+                    let p1 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, al10, bl[0]), al11, bl[1]),
+                            al12,
+                            bl[2],
+                        ),
+                        al13,
+                        bl[3],
+                    );
+                    isum[0][cp] = vmlaq_s32(isum[0][cp], p0, sc01_lo);
+                    isum[1][cp] = vmlaq_s32(isum[1][cp], p1, sc23_lo);
+                }
+                let (ah00, ah01) = zip_2x8(h0a, h1a);
+                let (ah02, ah03) = zip_2x8(h0b, h1b);
+                let (ah10, ah11) = zip_2x8(h2a, h3a);
+                let (ah12, ah13) = zip_2x8(h2b, h3b);
+                let sc01_hi = dup2_s32(
+                    i32::from(tables[0].0[2 * j + 1]),
+                    i32::from(tables[1].0[2 * j + 1]),
+                );
+                let sc23_hi = dup2_s32(
+                    i32::from(tables[2].0[2 * j + 1]),
+                    i32::from(tables[3].0[2 * j + 1]),
+                );
+                for cp in 0..NC_PAIRS {
+                    let x0 = &xs[2 * cp][b][4 + j * 64 + 32..];
+                    let x1 = &xs[2 * cp + 1][b][4 + j * 64 + 32..];
+                    let bh = load_2x32_i8mm(x0, x1);
+                    let p0 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, ah00, bh[0]), ah01, bh[1]),
+                            ah02,
+                            bh[2],
+                        ),
+                        ah03,
+                        bh[3],
+                    );
+                    let p1 = smmla_s32(
+                        smmla_s32(
+                            smmla_s32(smmla_s32(zero, ah10, bh[0]), ah11, bh[1]),
+                            ah12,
+                            bh[2],
+                        ),
+                        ah13,
+                        bh[3],
+                    );
+                    isum[0][cp] = vmlaq_s32(isum[0][cp], p0, sc01_hi);
+                    isum[1][cp] = vmlaq_s32(isum[1][cp], p1, sc23_hi);
+                }
+            }
+            for cp in 0..NC_PAIRS {
+                let mut i0 = [0i32; 4];
+                let mut i1 = [0i32; 4];
+                // SAFETY: 16 writable bytes.
+                unsafe {
+                    vst1q_s32(i0.as_mut_ptr(), isum[0][cp]);
+                    vst1q_s32(i1.as_mut_ptr(), isum[1][cp]);
+                }
+                let c0 = 2 * cp;
+                let c1 = c0 + 1;
+                let xd0 = f32::from_le_bytes(xs[c0][b][0..4].try_into().unwrap());
+                let xd1 = f32::from_le_bytes(xs[c1][b][0..4].try_into().unwrap());
+                sum[0][c0] = quant::q5_k_update(
+                    sum[0][c0],
+                    xd0 * d[0],
+                    xd0 * dmin[0],
+                    i0[0],
+                    sum_mins[0][c0],
+                );
+                sum[0][c1] = quant::q5_k_update(
+                    sum[0][c1],
+                    xd1 * d[0],
+                    xd1 * dmin[0],
+                    i0[1],
+                    sum_mins[0][c1],
+                );
+                sum[1][c0] = quant::q5_k_update(
+                    sum[1][c0],
+                    xd0 * d[1],
+                    xd0 * dmin[1],
+                    i0[2],
+                    sum_mins[1][c0],
+                );
+                sum[1][c1] = quant::q5_k_update(
+                    sum[1][c1],
+                    xd1 * d[1],
+                    xd1 * dmin[1],
+                    i0[3],
+                    sum_mins[1][c1],
+                );
+                sum[2][c0] = quant::q5_k_update(
+                    sum[2][c0],
+                    xd0 * d[2],
+                    xd0 * dmin[2],
+                    i1[0],
+                    sum_mins[2][c0],
+                );
+                sum[2][c1] = quant::q5_k_update(
+                    sum[2][c1],
+                    xd1 * d[2],
+                    xd1 * dmin[2],
+                    i1[1],
+                    sum_mins[2][c1],
+                );
+                sum[3][c0] = quant::q5_k_update(
+                    sum[3][c0],
+                    xd0 * d[3],
+                    xd0 * dmin[3],
+                    i1[2],
+                    sum_mins[3][c0],
+                );
+                sum[3][c1] = quant::q5_k_update(
+                    sum[3][c1],
+                    xd1 * d[3],
+                    xd1 * dmin[3],
+                    i1[3],
+                    sum_mins[3][c1],
+                );
+            }
+        }
+        for c in 0..N {
+            out[c][r] = sum[0][c];
+            out[c][r + 1] = sum[1][c];
+            out[c][r + 2] = sum[2][c];
+            out[c][r + 3] = sum[3][c];
+        }
+        r += 4;
+    }
+    if r < n_rows {
+        let rem_rows = &rows[r * row_bytes..];
+        let rem_out = out.map(|o| &mut o[r..]);
+        dot_q5_rows_n(rem_rows, row_bytes, xq, rem_out);
+    }
+}
+
+/// `Q6_K` `4 × N` GEMM with `i8mm` `vmmlaq_s32`: bit-identical to [`dot_q6_rows`].
+#[target_feature(enable = "neon,dotprod,i8mm")]
+fn dot_q6_rows_i8mm<const N: usize, const NC_PAIRS: usize>(
+    rows: &[u8],
+    row_bytes: usize,
+    xq: [&[u8]; N],
+    out: [&mut [f32]; N],
+) {
+    debug_assert_eq!(N, 2 * NC_PAIRS);
+    let xs = xq.map(|x| x.as_chunks::<Q8_K_BLOCK_BYTES>().0);
+    let blocks = |r: usize| {
+        rows[r * row_bytes..(r + 1) * row_bytes]
+            .as_chunks::<Q6_K_BLOCK_BYTES>()
+            .0
+    };
+    let m4b = vdupq_n_u8(0x0f);
+    let three = vdupq_n_u8(3);
+    let zero = vdupq_n_s32(0);
+    let n_rows = out[0].len();
+    let mut r = 0;
+    while r + 4 <= n_rows {
+        let w = [blocks(r), blocks(r + 1), blocks(r + 2), blocks(r + 3)];
+        let nb = w[0].len().min(xs[0].len());
+        let mut sum = [[0.0f32; N]; 4];
+        for b in 0..nb {
+            let d = [0, 1, 2, 3]
+                .map(|k| quant::f16_to_f32(u16::from_le_bytes([w[k][b][208], w[k][b][209]])));
+            let scales: [[i8; 16]; 4] =
+                std::array::from_fn(|k| std::array::from_fn(|j| w[k][b][192 + j] as i8));
+            let mut bias = [[0i32; N]; 4];
+            for c in 0..N {
+                let bsums = q8k_bsums(&xs[c][b]);
+                for k in 0..4 {
+                    let mut bi = 0i32;
+                    for j in 0..16 {
+                        bi += i32::from(bsums[j]) * i32::from(scales[k][j]);
+                    }
+                    bias[k][c] = bi;
+                }
+            }
+            let mut isum = [[zero; NC_PAIRS]; 2];
+            for half in 0..2 {
+                let ql = half * 64;
+                let qh = 128 + half * 32;
+                let xoff = 4 + half * 128;
+                let sc = half * 8;
+                let unpack = |k: usize| -> [int8x16_t; 8] {
+                    let wb = &w[k][b];
+                    let qh0 = load_u8(at16(wb, qh));
+                    let qh1 = load_u8(at16(wb, qh + 16));
+                    let q0 = load_u8(at16(wb, ql));
+                    let q1 = load_u8(at16(wb, ql + 16));
+                    let q2 = load_u8(at16(wb, ql + 32));
+                    let q3 = load_u8(at16(wb, ql + 48));
+                    [
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vandq_u8(q0, m4b),
+                            vshlq_n_u8::<4>(vandq_u8(three, qh0)),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vandq_u8(q1, m4b),
+                            vshlq_n_u8::<4>(vandq_u8(three, qh1)),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vandq_u8(q2, m4b),
+                            vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<2>(qh0))),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vandq_u8(q3, m4b),
+                            vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<2>(qh1))),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vshrq_n_u8::<4>(q0),
+                            vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<4>(qh0))),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vshrq_n_u8::<4>(q1),
+                            vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<4>(qh1))),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vshrq_n_u8::<4>(q2),
+                            vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<6>(qh0))),
+                        )),
+                        vreinterpretq_s8_u8(vorrq_u8(
+                            vshrq_n_u8::<4>(q3),
+                            vshlq_n_u8::<4>(vandq_u8(three, vshrq_n_u8::<6>(qh1))),
+                        )),
+                    ]
+                };
+                let u = [unpack(0), unpack(1), unpack(2), unpack(3)];
+                for g in 0..8 {
+                    let (a00, a01) = zip_2x8(u[0][g], u[1][g]);
+                    let (a10, a11) = zip_2x8(u[2][g], u[3][g]);
+                    let sc01 = dup2_s32(i32::from(scales[0][sc + g]), i32::from(scales[1][sc + g]));
+                    let sc23 = dup2_s32(i32::from(scales[2][sc + g]), i32::from(scales[3][sc + g]));
+                    for cp in 0..NC_PAIRS {
+                        let (b0, b1) = zip_2x8(
+                            load_i8(at16(&xs[2 * cp][b], xoff + 16 * g)),
+                            load_i8(at16(&xs[2 * cp + 1][b], xoff + 16 * g)),
+                        );
+                        let p0 = smmla_s32(smmla_s32(zero, a00, b0), a01, b1);
+                        let p1 = smmla_s32(smmla_s32(zero, a10, b0), a11, b1);
+                        isum[0][cp] = vmlaq_s32(isum[0][cp], p0, sc01);
+                        isum[1][cp] = vmlaq_s32(isum[1][cp], p1, sc23);
+                    }
+                }
+            }
+            for cp in 0..NC_PAIRS {
+                let mut i0 = [0i32; 4];
+                let mut i1 = [0i32; 4];
+                // SAFETY: 16 writable bytes.
+                unsafe {
+                    vst1q_s32(i0.as_mut_ptr(), isum[0][cp]);
+                    vst1q_s32(i1.as_mut_ptr(), isum[1][cp]);
+                }
+                let c0 = 2 * cp;
+                let c1 = c0 + 1;
+                let xd0 = f32::from_le_bytes(xs[c0][b][0..4].try_into().unwrap());
+                let xd1 = f32::from_le_bytes(xs[c1][b][0..4].try_into().unwrap());
+                sum[0][c0] = (xd0 * d[0]).mul_add((i0[0] - 32 * bias[0][c0]) as f32, sum[0][c0]);
+                sum[0][c1] = (xd1 * d[0]).mul_add((i0[1] - 32 * bias[0][c1]) as f32, sum[0][c1]);
+                sum[1][c0] = (xd0 * d[1]).mul_add((i0[2] - 32 * bias[1][c0]) as f32, sum[1][c0]);
+                sum[1][c1] = (xd1 * d[1]).mul_add((i0[3] - 32 * bias[1][c1]) as f32, sum[1][c1]);
+                sum[2][c0] = (xd0 * d[2]).mul_add((i1[0] - 32 * bias[2][c0]) as f32, sum[2][c0]);
+                sum[2][c1] = (xd1 * d[2]).mul_add((i1[1] - 32 * bias[2][c1]) as f32, sum[2][c1]);
+                sum[3][c0] = (xd0 * d[3]).mul_add((i1[2] - 32 * bias[3][c0]) as f32, sum[3][c0]);
+                sum[3][c1] = (xd1 * d[3]).mul_add((i1[3] - 32 * bias[3][c1]) as f32, sum[3][c1]);
+            }
+        }
+        for c in 0..N {
+            out[c][r] = sum[0][c];
+            out[c][r + 1] = sum[1][c];
+            out[c][r + 2] = sum[2][c];
+            out[c][r + 3] = sum[3][c];
+        }
+        r += 4;
+    }
+    if r < n_rows {
+        let rem_rows = &rows[r * row_bytes..];
+        let rem_out = out.map(|o| &mut o[r..]);
+        dot_q6_rows_n(rem_rows, row_bytes, xq, rem_out);
+    }
+}
+
 /// [`q8_scale`] with the hardware conversion: the same exact value in one
 /// instruction instead of a software decode, which costs as much as a
 /// block's products.
@@ -2002,6 +2801,7 @@ mod tests {
         let baseline = Neon {
             dotprod: false,
             fp16: false,
+            i8mm: false,
         };
         if k.dotprod || k.fp16 {
             vec![k, baseline]
@@ -2566,6 +3366,76 @@ mod tests {
             }
             for (i, (&a, &b)) in s_got.iter().zip(&s_want).enumerate() {
                 assert_near(a, b, 1e-5, 1.0, &format!("d = {d} state[{i}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn dot_rows_prompt_matches_scalar_reference() {
+        let Some(k) = Neon::detect() else { return };
+        let cols = 512;
+        let rows_count = 11;
+        for ty in [GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K] {
+            let mut rows = Vec::new();
+            for r in 0..rows_count {
+                rows.extend(quant::sample_row(ty, cols, 200 + r as u32));
+            }
+            let row_bytes = rows.len() / rows_count;
+            let dt = DotType::of(ty);
+            let xs: Vec<Vec<u8>> = (0..8)
+                .map(|c| quant::encoded(dt, &values(cols, 50 + c as u32)))
+                .collect();
+            let want: Vec<Vec<f32>> = xs
+                .iter()
+                .map(|xq| {
+                    rows.chunks_exact(row_bytes)
+                        .map(|row| quant::dot_row(ty, row, xq))
+                        .collect()
+                })
+                .collect();
+
+            let mut out4 = std::array::from_fn::<_, 4, _>(|_| vec![0.0f32; rows_count]);
+            let xq4: [&[u8]; 4] = std::array::from_fn(|c| xs[c].as_slice());
+            assert!(k.dot_rows_prompt(
+                ty,
+                &rows,
+                row_bytes,
+                xq4,
+                out4.each_mut().map(Vec::as_mut_slice),
+            ));
+            for c in 0..4 {
+                for r in 0..rows_count {
+                    assert_near(
+                        out4[c][r],
+                        want[c][r],
+                        1e-5,
+                        f64::from(want[c][r].abs().max(1.0)),
+                        &format!("{ty} N=4 row {r} col {c}"),
+                    );
+                }
+            }
+
+            if k.i8mm {
+                let mut out8 = std::array::from_fn::<_, 8, _>(|_| vec![0.0f32; rows_count]);
+                let xq8: [&[u8]; 8] = std::array::from_fn(|c| xs[c].as_slice());
+                assert!(k.dot_rows_prompt(
+                    ty,
+                    &rows,
+                    row_bytes,
+                    xq8,
+                    out8.each_mut().map(Vec::as_mut_slice),
+                ));
+                for c in 0..8 {
+                    for r in 0..rows_count {
+                        assert_near(
+                            out8[c][r],
+                            want[c][r],
+                            1e-5,
+                            f64::from(want[c][r].abs().max(1.0)),
+                            &format!("{ty} N=8 row {r} col {c}"),
+                        );
+                    }
+                }
             }
         }
     }

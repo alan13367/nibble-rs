@@ -135,6 +135,24 @@ impl Kernels {
         }
     }
 
+    /// [`Kernels::dot_rows_n`] for prompt batches (`n > MAX_LOGIT_ROWS`),
+    /// where kernels such as AArch64 `i8mm` (`vmmlaq_s32`) may sum each block
+    /// as an exact integer dot before scaling in `f32`, rounding within 1 ULP
+    /// of [`Kernels::dot_rows`]. Falls back to [`Kernels::dot_rows_n`].
+    pub(crate) fn dot_rows_prompt<const N: usize>(
+        self,
+        ty: GgmlType,
+        rows: &[u8],
+        row_bytes: usize,
+        xq: [&[u8]; N],
+        out: [&mut [f32]; N],
+    ) -> bool {
+        match self {
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Self::Neon(k) => k.dot_rows_prompt(ty, rows, row_bytes, xq, out),
+            _ => self.dot_rows_n(ty, rows, row_bytes, xq, out),
+        }
+    }
     /// `out[r] = a_r · b`, where `a_r` is the f16 vector of `b.len()`
     /// little-endian values at byte `r * stride` of `a` (the cached keys of
     /// a head, or its rows of transposed values) and `b` is f32. Each result
