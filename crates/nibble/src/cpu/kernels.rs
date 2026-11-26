@@ -109,7 +109,8 @@ impl Kernels {
 
     /// [`Kernels::dot_rows`] for `N` encoded inputs at once, one output each,
     /// if this type has a kernel that shares the weights' loads between
-    /// them (false otherwise, writing nothing). Each output is what
+    /// them (false otherwise, writing nothing): `N` of 2 to 4, and 8 for the
+    /// K-quants on CPUs with `i8mm`. Each output is, bit for bit, what
     /// [`Kernels::dot_rows`] gives for its input.
     pub(crate) fn dot_rows_n<const N: usize>(
         self,
@@ -135,24 +136,6 @@ impl Kernels {
         }
     }
 
-    /// [`Kernels::dot_rows_n`] for prompt batches (`n > MAX_LOGIT_ROWS`),
-    /// where kernels such as AArch64 `i8mm` (`vmmlaq_s32`) may sum each block
-    /// as an exact integer dot before scaling in `f32`, rounding within 1 ULP
-    /// of [`Kernels::dot_rows`]. Falls back to [`Kernels::dot_rows_n`].
-    pub(crate) fn dot_rows_prompt<const N: usize>(
-        self,
-        ty: GgmlType,
-        rows: &[u8],
-        row_bytes: usize,
-        xq: [&[u8]; N],
-        out: [&mut [f32]; N],
-    ) -> bool {
-        match self {
-            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-            Self::Neon(k) => k.dot_rows_prompt(ty, rows, row_bytes, xq, out),
-            _ => self.dot_rows_n(ty, rows, row_bytes, xq, out),
-        }
-    }
     /// `out[r] = a_r · b`, where `a_r` is the f16 vector of `b.len()`
     /// little-endian values at byte `r * stride` of `a` (the cached keys of
     /// a head, or its rows of transposed values) and `b` is f32. Each result

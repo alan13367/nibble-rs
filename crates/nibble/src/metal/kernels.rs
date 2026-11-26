@@ -5,10 +5,16 @@ use nibble_gguf::GgmlType;
 
 use super::device::{Device, KernelArgs, Pipeline, Size};
 
-/// The shader source, compiled once per backend: the files in order, with
-/// the I-quant codebooks ([`codebooks`]) after the shared definitions.
+/// The shader source, compiled once per backend: the files in order, after
+/// the constants shared with the host, with the I-quant codebooks
+/// ([`codebooks`]) after the shared definitions.
 pub(crate) fn source() -> String {
+    let shared = format!(
+        "#define RMS_FP_SCALE {:.1}f\n#define RMS_FP_INV (1.0f / RMS_FP_SCALE)\n",
+        super::RMS_FP_SCALE
+    );
     [
+        shared.as_str(),
         include_str!("shaders/common.metal"),
         &codebooks(),
         include_str!("shaders/matvec.metal"),

@@ -160,7 +160,22 @@ impl Neon {
         xq: [&[u8]; N],
         out: [&mut [f32]; N],
     ) -> bool {
+        // The K-quant `i8mm` kernels sum each sub-block as an exact integer,
+        // as the one-input kernels do, so they keep their results. A Q8_0
+        // `i8mm` kernel would not: ggml's one-input kernel converts four
+        // lanes of partial sums per block to f32, which a block's single
+        // `smmla` total cannot reproduce.
         match ty {
+            GgmlType::Q4K if self.i8mm && N == 8 => {
+                neon_call!(dot_q4_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+            }
+            GgmlType::Q5K if self.i8mm && N == 8 => {
+                neon_call!(dot_q5_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+            }
+            GgmlType::Q6K if self.i8mm && N == 8 => {
+                neon_call!(dot_q6_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
+            }
+            _ if N > 4 => return false,
             GgmlType::Q8_0 if self.dotprod && self.fp16 => {
                 neon_call!(dot_q8_0_rows_n(rows, row_bytes, xq, out));
             }
@@ -181,47 +196,6 @@ impl Neon {
             _ => return false,
         }
         true
-    }
-
-    /// See [`super::Kernels::dot_rows_prompt`].
-    pub(crate) fn dot_rows_prompt<const N: usize>(
-        self,
-        ty: GgmlType,
-        rows: &[u8],
-        row_bytes: usize,
-        xq: [&[u8]; N],
-        out: [&mut [f32]; N],
-    ) -> bool {
-        if self.i8mm {
-            match (ty, N) {
-                (GgmlType::Q8_0, 8) if self.fp16 => {
-                    neon_call!(dot_q8_0_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
-                    return true;
-                }
-                (GgmlType::Q8_0, 4) if self.fp16 => {
-                    neon_call!(dot_q8_0_rows_i8mm::<N, 2>(rows, row_bytes, xq, out));
-                    return true;
-                }
-                (GgmlType::Q4K, 8) => {
-                    neon_call!(dot_q4_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
-                    return true;
-                }
-                (GgmlType::Q5K, 8) => {
-                    neon_call!(dot_q5_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
-                    return true;
-                }
-                (GgmlType::Q6K, 8) => {
-                    neon_call!(dot_q6_rows_i8mm::<N, 4>(rows, row_bytes, xq, out));
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        if N <= 4 {
-            self.dot_rows_n(ty, rows, row_bytes, xq, out)
-        } else {
-            false
-        }
     }
 
     /// See [`super::Kernels::dot_f16_f32_rows`].
@@ -1431,120 +1405,11 @@ fn load_2x32_i8mm(r0: &[u8], r1: &[u8]) -> [int8x16_t; 4] {
     [a0, a1, a2, a3]
 }
 
-/// Four `f16` block scales widened in a single `vcvt_f32_f16`.
-#[inline]
-#[target_feature(enable = "neon,fp16")]
-fn q8_scales4_fp16(
-    b0: &[u8; Q8_0_BLOCK_BYTES],
-    b1: &[u8; Q8_0_BLOCK_BYTES],
-    b2: &[u8; Q8_0_BLOCK_BYTES],
-    b3: &[u8; Q8_0_BLOCK_BYTES],
-) -> float32x4_t {
-    let raw = u64::from(u16::from_le_bytes([b0[0], b0[1]]))
-        | (u64::from(u16::from_le_bytes([b1[0], b1[1]])) << 16)
-        | (u64::from(u16::from_le_bytes([b2[0], b2[1]])) << 32)
-        | (u64::from(u16::from_le_bytes([b3[0], b3[1]])) << 48);
-    vcvt_f32_f16(vreinterpret_f16_u64(vcreate_u64(raw)))
-}
-
 /// `[a, a, b, b]` in `i32` in pure registers (no stack round-trip).
 #[inline]
 #[target_feature(enable = "neon")]
 fn dup2_s32(a: i32, b: i32) -> int32x4_t {
     vcombine_s32(vdup_n_s32(a), vdup_n_s32(b))
-}
-
-/// `Q8_0` prompt GEMM (`4 × N` tiles with `i8mm` `smmla`, `N = 2 * NC_PAIRS`).
-#[target_feature(enable = "neon,dotprod,fp16,i8mm")]
-fn dot_q8_0_rows_i8mm<const N: usize, const NC_PAIRS: usize>(
-    rows: &[u8],
-    row_bytes: usize,
-    xq: [&[u8]; N],
-    out: [&mut [f32]; N],
-) {
-    debug_assert_eq!(N, 2 * NC_PAIRS);
-    let x = xq.map(|x| x.as_chunks::<Q8_0_BLOCK_BYTES>().0);
-    let blocks = |r: usize| {
-        rows[r * row_bytes..(r + 1) * row_bytes]
-            .as_chunks::<Q8_0_BLOCK_BYTES>()
-            .0
-    };
-    let n_rows = out[0].len();
-    let zero = vdupq_n_s32(0);
-    let mut r = 0;
-    while r + 4 <= n_rows {
-        let w = [blocks(r), blocks(r + 1), blocks(r + 2), blocks(r + 3)];
-        let nb = w[0].len().min(x[0].len());
-        let mut sum0 = [[vdupq_n_f32(0.0); NC_PAIRS]; 2];
-        let mut sum1 = [[vdupq_n_f32(0.0); NC_PAIRS]; 2];
-        let step = |i: usize, sum: &mut [[float32x4_t; NC_PAIRS]; 2]| {
-            let ws = q8_scales4_fp16(&w[0][i], &w[1][i], &w[2][i], &w[3][i]);
-            let ws01 = vzip1q_f32(ws, ws);
-            let ws23 = vzip2q_f32(ws, ws);
-            let a0 = load_2x32_i8mm(&w[0][i][2..], &w[1][i][2..]);
-            let a1 = load_2x32_i8mm(&w[2][i][2..], &w[3][i][2..]);
-            for cp in 0..NC_PAIRS {
-                let c0 = 2 * cp;
-                let c1 = c0 + 1;
-                let b = load_2x32_i8mm(&x[c0][i][2..], &x[c1][i][2..]);
-                let p0 = smmla_s32(
-                    smmla_s32(
-                        smmla_s32(smmla_s32(zero, a0[0], b[0]), a0[1], b[1]),
-                        a0[2],
-                        b[2],
-                    ),
-                    a0[3],
-                    b[3],
-                );
-                let p1 = smmla_s32(
-                    smmla_s32(
-                        smmla_s32(smmla_s32(zero, a1[0], b[0]), a1[1], b[1]),
-                        a1[2],
-                        b[2],
-                    ),
-                    a1[3],
-                    b[3],
-                );
-                let xraw = u64::from(u16::from_le_bytes([x[c0][i][0], x[c0][i][1]]))
-                    | (u64::from(u16::from_le_bytes([x[c1][i][0], x[c1][i][1]])) << 16);
-                let xs_lo = vget_low_f32(vcvt_f32_f16(vreinterpret_f16_u64(vcreate_u64(xraw))));
-                let xs = vcombine_f32(xs_lo, xs_lo);
-                sum[0][cp] = vfmaq_f32(sum[0][cp], vcvtq_f32_s32(p0), vmulq_f32(ws01, xs));
-                sum[1][cp] = vfmaq_f32(sum[1][cp], vcvtq_f32_s32(p1), vmulq_f32(ws23, xs));
-            }
-        };
-        let mut i = 0;
-        while i + 1 < nb {
-            step(i, &mut sum0);
-            step(i + 1, &mut sum1);
-            i += 2;
-        }
-        if i < nb {
-            step(i, &mut sum0);
-        }
-        for cp in 0..NC_PAIRS {
-            let mut s0 = [0.0f32; 4];
-            let mut s1 = [0.0f32; 4];
-            store_f32(&mut s0, vaddq_f32(sum0[0][cp], sum1[0][cp]));
-            store_f32(&mut s1, vaddq_f32(sum0[1][cp], sum1[1][cp]));
-            let c0 = 2 * cp;
-            let c1 = c0 + 1;
-            out[c0][r] = s0[0];
-            out[c1][r] = s0[1];
-            out[c0][r + 1] = s0[2];
-            out[c1][r + 1] = s0[3];
-            out[c0][r + 2] = s1[0];
-            out[c1][r + 2] = s1[1];
-            out[c0][r + 3] = s1[2];
-            out[c1][r + 3] = s1[3];
-        }
-        r += 4;
-    }
-    if r < n_rows {
-        let rem_rows = &rows[r * row_bytes..];
-        let rem_out = out.map(|o| &mut o[r..]);
-        dot_q8_0_rows_n(rem_rows, row_bytes, xq, rem_out);
-    }
 }
 
 /// `Q4_K` `4 × N` GEMM with `i8mm` `vmmlaq_s32`: computes the exact same
@@ -3370,12 +3235,22 @@ mod tests {
         }
     }
 
+    /// The kernels for 4 and 8 inputs at once (`i8mm` where the CPU has
+    /// it) give every input the one-input kernel's result bit for bit, so a
+    /// batch matches evaluating its tokens one at a time: with an even and
+    /// an odd number of Q8_0 blocks, and a number of rows that leaves 4-row
+    /// tiles a tail. Q8_0 has no 8-input kernel (see [`Neon::dot_rows_n`]).
     #[test]
-    fn dot_rows_prompt_matches_scalar_reference() {
+    fn wide_dots_equal_one_input_dots() {
         let Some(k) = Neon::detect() else { return };
-        let cols = 512;
         let rows_count = 11;
-        for ty in [GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K] {
+        for (ty, cols) in [
+            (GgmlType::Q8_0, 512),
+            (GgmlType::Q8_0, 544),
+            (GgmlType::Q4K, 768),
+            (GgmlType::Q5K, 768),
+            (GgmlType::Q6K, 768),
+        ] {
             let mut rows = Vec::new();
             for r in 0..rows_count {
                 rows.extend(quant::sample_row(ty, cols, 200 + r as u32));
@@ -3388,54 +3263,46 @@ mod tests {
             let want: Vec<Vec<f32>> = xs
                 .iter()
                 .map(|xq| {
-                    rows.chunks_exact(row_bytes)
-                        .map(|row| quant::dot_row(ty, row, xq))
-                        .collect()
+                    let mut out = vec![0.0f32; rows_count];
+                    k.dot_rows(ty, &rows, row_bytes, xq, &mut out);
+                    out
                 })
                 .collect();
+            let check = |got: &[Vec<f32>], n: usize| {
+                for (c, (got, want)) in got.iter().zip(&want).enumerate() {
+                    for (r, (g, w)) in got.iter().zip(want).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "{ty} {cols} N={n} row {r} input {c}: {g} vs {w}, {k:?}"
+                        );
+                    }
+                }
+            };
 
             let mut out4 = std::array::from_fn::<_, 4, _>(|_| vec![0.0f32; rows_count]);
             let xq4: [&[u8]; 4] = std::array::from_fn(|c| xs[c].as_slice());
-            assert!(k.dot_rows_prompt(
+            assert!(k.dot_rows_n(
                 ty,
                 &rows,
                 row_bytes,
                 xq4,
                 out4.each_mut().map(Vec::as_mut_slice),
             ));
-            for c in 0..4 {
-                for r in 0..rows_count {
-                    assert_near(
-                        out4[c][r],
-                        want[c][r],
-                        1e-5,
-                        f64::from(want[c][r].abs().max(1.0)),
-                        &format!("{ty} N=4 row {r} col {c}"),
-                    );
-                }
-            }
+            check(&out4, 4);
 
-            if k.i8mm {
-                let mut out8 = std::array::from_fn::<_, 8, _>(|_| vec![0.0f32; rows_count]);
-                let xq8: [&[u8]; 8] = std::array::from_fn(|c| xs[c].as_slice());
-                assert!(k.dot_rows_prompt(
-                    ty,
-                    &rows,
-                    row_bytes,
-                    xq8,
-                    out8.each_mut().map(Vec::as_mut_slice),
-                ));
-                for c in 0..8 {
-                    for r in 0..rows_count {
-                        assert_near(
-                            out8[c][r],
-                            want[c][r],
-                            1e-5,
-                            f64::from(want[c][r].abs().max(1.0)),
-                            &format!("{ty} N=8 row {r} col {c}"),
-                        );
-                    }
-                }
+            let mut out8 = std::array::from_fn::<_, 8, _>(|_| vec![0.0f32; rows_count]);
+            let xq8: [&[u8]; 8] = std::array::from_fn(|c| xs[c].as_slice());
+            let wide = k.dot_rows_n(
+                ty,
+                &rows,
+                row_bytes,
+                xq8,
+                out8.each_mut().map(Vec::as_mut_slice),
+            );
+            assert_eq!(wide, k.i8mm && ty != GgmlType::Q8_0, "{ty} N=8, {k:?}");
+            if wide {
+                check(&out8, 8);
             }
         }
     }

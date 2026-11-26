@@ -62,12 +62,12 @@ typedef struct {
 // even number, are whole pairs.
 #define MATVEC_SWIGLU 2
 // `dst += W · x`, `xn = dst * norm`, and accumulates `dst^2` in 64-bit
-// fixed-point (2^20 scale, exact commutative+associative integer addition),
-// so the next product reads one 8-byte scalar and gets a bit-deterministic
-// RMS scale without an `rmsnorm` dispatch or barrier.
+// fixed point (`RMS_FP_SCALE`, defined from `metal::RMS_FP_SCALE` before
+// this file). Integer addition is associative, so the sum does not depend
+// on the order the threadgroups add in, and the next product reads one
+// 8-byte scalar for a bit-deterministic RMS scale without an `rmsnorm`
+// dispatch or barrier.
 #define MATVEC_RESIDUAL_NORM 3
-#define RMS_FP_SCALE 1048576.0f
-#define RMS_FP_INV (1.0f / 1048576.0f)
 
 
 // `MatvecArgs` in `metal/kernels.rs`: `dst = W · x` (or as `mode` says) for
@@ -105,14 +105,15 @@ static inline void rms_add_u64(device atomic_uint * pair, ulong val) {
     }
 }
 
-// Loads the deterministic fixed-point sum-of-squares for token `tok`.
+// The RMS scale of token `tok` from its fixed-point sum of squares, as
+// `rmsnorm` computes it from a float sum.
 static inline float rms_load_scale(constant MatvecArgs & a, device atomic_uint * sums, uint tok) {
     if (a.rms_in_len == 0) {
         return 1.0f;
     }
     device const uint * p = (device const uint *) (sums + 2 * (a.rms_in_off + tok));
     const ulong raw = (ulong) p[0] | ((ulong) p[1] << 32);
-    return rsqrt((float(raw) * RMS_FP_INV) / float(a.rms_in_len) + a.rms_in_eps);
+    return 1.0f / sqrt((float(raw) * RMS_FP_INV) / float(a.rms_in_len) + a.rms_in_eps);
 }
 
 // `EmbedArgs`: decode row `row` (of `cols` elements) of a weight matrix, or

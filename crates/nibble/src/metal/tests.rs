@@ -1210,3 +1210,100 @@ fn attention_timing() {
         eprintln!("{label}: n=512: {ms:.3} ms/layer, n=508: {ms508:.3} ms/layer");
     }
 }
+
+/// The deferred RMSNorm of `residual` (batches of up to `MATMUL_MIN_BATCH`
+/// tokens): the fixed-point sum of squares is within 2e-6 of the exact sum
+/// (a few float roundings of the scale), for activations as small as an
+/// embedding's (RMS near 0.007, where rounding each square to the fixed
+/// point costs the most) and large ones, and the scale it gives reaches
+/// both a product that reads the vector and a `read` of it.
+#[test]
+fn deferred_rmsnorm_matches_the_exact_norm() {
+    if gpu().is_none() {
+        return;
+    }
+    let (rows, cols, rows2) = (1024, 256, 64);
+    let (bytes1, w, _) = matrix(GgmlType::F16, rows, cols, 1);
+    let (bytes2, mut w2, decoded2) = matrix(GgmlType::F16, rows2, rows, 5000);
+    w2.offset = bytes1.len();
+    let bytes = [bytes1, bytes2].concat();
+    let mut params = Params::default();
+    let norm_w: Vec<f32> = values(rows, 7).iter().map(|v| 1.0 + 0.5 * v).collect();
+    let norm = params.push(&norm_w);
+    let params = params.into_vec();
+    let config = attention_config(1, 1, 64, 64);
+    let data = ModelData {
+        bytes: &bytes,
+        mapped: false,
+        params: &params,
+        config: &config,
+        largest_tensor: bytes.len(),
+    };
+    let eps = 1e-6;
+    for scale in [0.01f32, 4.0] {
+        for n in [1, 3] {
+            let mut metal =
+                MetalBackend::new(data, 64, crate::backend::KvTypes::default()).unwrap();
+            let a0: Vec<f32> = values(n * cols, 11)
+                .iter()
+                .map(|v| v * scale / 16.0)
+                .collect();
+            let x0: Vec<f32> = values(n * rows, 13).iter().map(|v| v * scale).collect();
+            let mut a = metal.vector(n * cols).unwrap();
+            let mut x = metal.vector(n * rows).unwrap();
+            let mut out = metal.vector(n * rows).unwrap();
+            let mut y = metal.vector(n * rows2).unwrap();
+            metal.write(&mut a, &a0).unwrap();
+            metal.write(&mut x, &x0).unwrap();
+            metal.begin(0, n).unwrap();
+            metal.residual(&w, &a, &mut x, norm, eps, &mut out);
+            metal.matvecs(&out, [(&w2, &mut y)]);
+            metal.end().unwrap();
+            let mut xs = vec![0.0; n * rows];
+            metal.read(&x, &mut xs).unwrap();
+            let mut ys = vec![0.0; n * rows2];
+            metal.read(&y, &mut ys).unwrap();
+            // `read` synced and moved the pending sums to the first slots.
+            // SAFETY: every committed command buffer has completed.
+            let sums = unsafe { metal.rms_sums.bytes() }[..8 * n].to_vec();
+            let mut outs = vec![0.0; n * rows];
+            metal.read(&out, &mut outs).unwrap();
+            for t in 0..n {
+                let x = &xs[t * rows..(t + 1) * rows];
+                let exact: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+                let raw = u64::from_ne_bytes(sums[8 * t..8 * t + 8].try_into().unwrap());
+                let fixed = raw as f64 / f64::from(super::RMS_FP_SCALE);
+                let rms = (exact / rows as f64).sqrt();
+                let rel = (fixed - exact).abs() / exact;
+                assert!(
+                    rel <= 2e-6,
+                    "RMS {rms:.4}, token {t} of {n}: sum of squares {fixed} vs {exact} (relative error {rel:e})"
+                );
+                let s = 1.0 / (exact / rows as f64 + f64::from(eps)).sqrt();
+                let xn: Vec<f64> = x
+                    .iter()
+                    .zip(&norm_w)
+                    .map(|(&v, &w)| f64::from(v) * f64::from(w) * s)
+                    .collect();
+                for (i, (&got, &want)) in outs[t * rows..(t + 1) * rows].iter().zip(&xn).enumerate()
+                {
+                    assert!(
+                        (f64::from(got) - want).abs() <= 2e-6 * want.abs(),
+                        "RMS {rms:.4}, token {t} of {n}, read value {i}: {got} vs {want}"
+                    );
+                }
+                for (r, row) in decoded2.iter().enumerate() {
+                    let (want, magnitude) =
+                        row.iter().zip(&xn).fold((0.0, 0.0), |(s, m), (&w, &v)| {
+                            (s + f64::from(w) * v, m + (f64::from(w) * v).abs())
+                        });
+                    let got = f64::from(ys[t * rows2 + r]);
+                    assert!(
+                        (got - want).abs() <= 4e-6 * magnitude,
+                        "RMS {rms:.4}, token {t} of {n}, product row {r}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+}

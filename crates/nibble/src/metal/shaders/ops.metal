@@ -40,7 +40,8 @@ struct RmsApplyArgs {
 };
 
 // Materializes rows `tgpig` of a vector whose elements hold `x * norm` by
-// applying its deferred RMS scale from the fixed-point `atomic_ulong` sum.
+// applying its deferred RMS scale from its fixed-point sum of squares (the
+// `(lo, hi)` pair of 32-bit words that `rms_add_u64` adds to).
 kernel void rms_apply(
         constant RmsApplyArgs & a [[buffer(0)]],
         device float * x [[buffer(1)]],
@@ -48,8 +49,8 @@ kernel void rms_apply(
         uint t [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort ntg [[threads_per_threadgroup]]) {
-    const float sum = float(sums[a.off + t]) * (1.0f / 1048576.0f);
-    const float scale = rsqrt(sum / float(a.n) + a.eps);
+    const float sum = float(sums[a.off + t]) * RMS_FP_INV;
+    const float scale = 1.0f / sqrt(sum / float(a.n) + a.eps);
     device float * row = x + (uint64_t) t * a.n;
     for (uint i = tid; i < a.n; i += ntg) {
         row[i] *= scale;

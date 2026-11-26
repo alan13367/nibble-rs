@@ -475,7 +475,6 @@ fn dot_batch(
     }
     let xq_len = xq.len() / n;
     let x = |t: usize| &xq[t * xq_len..(t + 1) * xq_len];
-    let prompt = n > crate::backend::MAX_LOGIT_ROWS;
     // Keep weight blocks a multiple of 4 rows so 4-row GEMM tiles stay aligned.
     let block = (BATCH_BLOCK_BYTES / w.row_bytes.max(1))
         .max(4)
@@ -485,26 +484,21 @@ fn dot_batch(
         let b1 = (b0 + block).min(out.len());
         let rows = w.rows_bytes(bytes, first + b0..first + b1);
         let mut t = 0;
-        if prompt {
-            while t + 8 <= n {
-                let o = out.segments_mut::<8>(t).map(|o| &mut o[b0..b1]);
-                let xs = std::array::from_fn(|i| x(t + i));
-                if !kernels.dot_rows_prompt(w.ty, rows, w.row_bytes, xs, o) {
-                    break;
-                }
-                t += 8;
+        // Groups of 8 inputs, then of 4, then one of 3 or of 2, where the
+        // type has such kernels.
+        while t + 8 <= n {
+            let o = out.segments_mut::<8>(t).map(|o| &mut o[b0..b1]);
+            if !kernels.dot_rows_n(
+                w.ty,
+                rows,
+                w.row_bytes,
+                std::array::from_fn(|i| x(t + i)),
+                o,
+            ) {
+                break;
             }
-            while t + 4 <= n {
-                let o = out.segments_mut::<4>(t).map(|o| &mut o[b0..b1]);
-                let xs = std::array::from_fn(|i| x(t + i));
-                if !kernels.dot_rows_prompt(w.ty, rows, w.row_bytes, xs, o) {
-                    break;
-                }
-                t += 4;
-            }
+            t += 8;
         }
-        // Groups of 4 inputs, then one of 3 or of 2, where the type has
-        // such kernels (bit-identical to single-token decoding).
         while t + 4 <= n {
             let o = out.segments_mut::<4>(t).map(|o| &mut o[b0..b1]);
             if !kernels.dot_rows_n(
@@ -910,7 +904,9 @@ mod tests {
 
     /// Each token's output of a product over a batch, bit for bit, is that
     /// of the product over the token alone: on one thread (one task covers
-    /// the matrix, so it walks several blocks of rows) and on four.
+    /// the matrix, so it walks several blocks of rows) and on four, and in
+    /// batches longer than [`crate::backend::MAX_LOGIT_ROWS`], which take
+    /// groups of 8 inputs where the CPU has such kernels.
     #[test]
     fn batched_products_equal_per_token_products() {
         let types = [
@@ -931,7 +927,7 @@ mod tests {
             for kernels in [Kernels::Scalar, Kernels::detect()] {
                 for threads in [1, 4] {
                     let cpu = Cpu::with_kernels(threads, kernels);
-                    for n in [2, 3, 5, 7] {
+                    for n in [2, 3, 5, 7, 8, 13, 19] {
                         let x = batch_input(cols, n);
                         let mut input = EncodedInput::new();
                         let mut batch = vec![0.0; n * w.rows];

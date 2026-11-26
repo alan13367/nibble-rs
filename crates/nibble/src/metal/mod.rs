@@ -130,8 +130,19 @@ const MAX_IN_FLIGHT: usize = 64;
 /// Deferred RMSNorm fixed-point sum-of-squares groups (`MAX_LOGIT_ROWS` `u64`s each).
 const RMS_GROUPS: usize = 256;
 
+/// The deferred RMSNorm's fixed-point scale: each `x²` adds
+/// `round(x² * RMS_FP_SCALE)` to its token's 64-bit sum. The shaders get the
+/// same number as `RMS_FP_SCALE` ([`kernels::source`]).
+///
+/// 2^28 keeps the sum within a float reduction's error of the exact one
+/// down to an RMS of about 0.005 (2^20 was 350 times further off there),
+/// and holds sums of squares up to 2^36 (an RMS near 2900 over 8192 values,
+/// far above what hidden states reach, outlier dimensions included).
+pub(crate) const RMS_FP_SCALE: f32 = 268_435_456.0;
+
 /// A vector whose rows (`0..n`) currently hold `x * norm` and still need
-/// multiplying by `rsqrt((sums[off + t] * 2^-20) / len + eps)` before non-matvec use.
+/// multiplying by `1 / sqrt(sums[off + t] / RMS_FP_SCALE / len + eps)`
+/// before non-matvec use.
 #[derive(Clone, Copy, Debug)]
 struct PendingRms {
     buf: usize,
@@ -1493,7 +1504,7 @@ impl Backend for MetalBackend<'_> {
             for t in 0..p.n {
                 let at = (p.off as usize + t) * 8;
                 let raw = u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
-                let sum = (raw as f32) * (1.0 / 1_048_576.0);
+                let sum = (raw as f32) * (1.0 / RMS_FP_SCALE);
                 scales.push(1.0 / (sum / p.len as f32 + p.eps).sqrt());
             }
         }
@@ -1840,9 +1851,10 @@ impl Backend for MetalBackend<'_> {
     ) {
         // For decode and draft-verification batches (up to `MATMUL_MIN_BATCH`),
         // fuse `x += w · a` with `out = x * norm` and accumulate `Σ x²` in
-        // 64-bit fixed-point (`atomic_ulong`), eliminating the separate
-        // `rmsnorm` dispatch and barrier while staying bit-identical across
-        // runs and across batch sizes 1..=16.
+        // 64-bit fixed point (a `(lo, hi)` pair of `atomic_uint`s; Metal has
+        // no 64-bit atomic add), eliminating the separate `rmsnorm` dispatch
+        // and barrier while staying bit-identical across runs and across
+        // batch sizes 1..=16.
         if (1..=MATMUL_MIN_BATCH).contains(&self.n)
             && self.rms_used + self.n <= RMS_GROUPS * MAX_LOGIT_ROWS
             && a.buffer.contents() != x.buffer.contents()

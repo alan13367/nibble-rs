@@ -48,7 +48,7 @@ performance cores on Apple Silicon, else one per physical core), and
 token with the model's MTP head, if the file has one (`nibble inspect`
 shows `nextn_predict_layers`), and checks them all in one forward pass.
 The tokens generated are the same as without it. On an M4 Max, Qwen3.5-4B
-Q8_0 decodes at about 131 tok/s with `--draft 3` on Metal (73 without) and
+Q8_0 decodes at about 131 tok/s with `--draft 3` on Metal (74 without) and
 80 on the CPU (49); 2 or 3 drafts are best.
 
 `-ctk T` / `-ctv T` (`--cache-type-k`, `--cache-type-v`) choose the type of
@@ -124,8 +124,8 @@ For example, in [Yawl](https://github.com/alan13367/yawl)'s
 ```
 
 `yawl --reasoning minimal` then answers without thinking. The first request
-evaluates the harness's whole system prompt (about 2,000 tokens for Yawl,
-some 9 s on the 4B today: prompt processing is not optimized yet); later
+evaluates the harness's whole system prompt (about 2,000 tokens for Yawl:
+some 1.5 s on the 4B with Metal on an M4 Max, 11 s on its CPU); later
 requests reuse it from the cache.
 
 ## Inspecting files

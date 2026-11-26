@@ -82,6 +82,11 @@ When you report back:
   Objective-C runtime), SIMD intrinsics, reinterpreting byte buffers, and
   the CPU thread pool (`cpu/pool.rs`), which lends borrowed buffers to its
   persistent workers. Keep the pool's unsafe inside its safe API.
+- **Inline assembly** only for a single SIMD instruction whose intrinsic is
+  not stable at the `rust-version` (AArch64 `smmla`: `vmmlaq_s32` is
+  unstable on 1.100). Wrap it like the intrinsic it stands for, in a
+  `#[target_feature]` function reached only through the CPU-feature token,
+  with `options(pure, nomem, nostack)`.
 - **Every `unsafe` block** has a `// SAFETY:` comment saying why it is sound.
   Every `unsafe fn` has a `# Safety` section. Keep blocks as small as possible.
 - **Unsafe contracts stay visible.** Memory-mapped loading is `unsafe` because
@@ -230,7 +235,17 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
   Report the model file, quantization, thread count, prompt and generated
   token counts, and the machine.
 - **Compare against `llama-bench`** on the same file and thread count when
-  claiming a speed result.
+  claiming a speed result. It spells the repack switch `--repack 0`. On
+  macOS, llama.cpp's release runs every CPU matrix product of 32 or more
+  tokens in its BLAS backend (Accelerate), even with `-ngl 0 -dev none`,
+  so its CPU prompt speed is Accelerate's, not ggml-cpu's: say so when
+  comparing.
+- **Batched kernels keep the one-input kernel's rounding.** A kernel for
+  several inputs must give each the one-input kernel's result bit for bit
+  (`batched_products_equal_per_token_products`, and per kernel tests such
+  as `wide_dots_equal_one_input_dots`): prompt batches then match `-ub 1`
+  and drafts match plain decoding. A GEMM that sums differently (e.g. a
+  Q8_0 `i8mm` tile) changes greedy output; do not add one.
 - **An optimization must not change results** beyond the tolerance its kernel
   test documents. Greedy output on the comparison prompts should stay the same.
 - **Prefer clear code** unless a measurement shows the faster version matters.
@@ -257,9 +272,13 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
   ```
 
   Metal kernels transcribe ggml-metal's for the matvecs, and every kernel is
-  checked against the CPU reference in `metal/tests.rs`. Also compare after
-  a prompt of several thousand tokens (`-c 8192 -b 8192`): attention is
-  split into chunks only past a few dozen positions. Without a Mac, run
+  checked against the CPU reference in `metal/tests.rs`. One deliberate
+  difference: decode batches fold RMSNorm into the residual product before
+  it, with a 64-bit fixed-point sum of squares (`RMS_FP_SCALE`) that does
+  not depend on the order of threadgroups;
+  `deferred_rmsnorm_matches_the_exact_norm` bounds its error. Also compare
+  after a prompt of several thousand tokens (`-c 8192 -b 8192`): attention
+  is split into chunks only past a few dozen positions. Without a Mac, run
   `cargo check --target aarch64-apple-darwin` and label the work as
   untested on real hardware.
 - **`auto` is the default backend.** It picks Metal unless the device, the

@@ -12,14 +12,14 @@ has the full record of phases 0–6 and the first steps of phase 7).
 
 | Area | State |
 |---|---|
-| Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; Ternary Bonsai (`qwen35` with `prism.hadamard` folded weights, Q2_0) on CPU and Metal; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0/Q2_0); Metal backend, the default (`auto`); OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; llama.cpp's KV cache types on both backends |
-| Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot; kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta |
-| Decode (M4 Max) | Faster than llama.cpp on every local file on Metal (empty context and 4096 tokens, `-fa` off and on) and on the CPU (tie on Qwen3-0.6B Q8_0). Qwen3.5-4B Q8_0 Metal 73 tok/s, 131 with `--draft 3` (llama.cpp 64, 124) |
-| Prompt (M4 Max, pp512) | Metal level with llama.cpp on the 0.8B files, 1–3% behind on the 4B–27B, 8% behind on the 35B MoE, 11% on Qwen3-0.6B, about 45% behind with a quantized KV cache at depth (Phase 7 step 6). CPU far behind (no prompt tiles) |
-| Tests | 259 pass in `cargo test --workspace` (Metal tests skip without a device); 14 reference tests on real models with `--ignored` (13 pass here; `qwen35_bf16` needs a file not on this machine) |
-| Not started | CUDA; PrismML's PTQ1_0 and PQ2_0 (their llama.cpp fork's types); AVX2 kernels beyond F32/F16/BF16/Q8_0/Q2_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; CPU prompt tiles; parallel server slots |
+| Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; Ternary Bonsai (`qwen35` with `prism.hadamard` folded weights, Q2_0) on CPU and Metal; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0/Q2_0); Metal backend, the default (`auto`); OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; CPU prompt batches (parallel batch ops and attention, NEON `i8mm` 8-input K-quant tiles); llama.cpp's KV cache types on both backends |
+| Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot (rechecked after the CPU prompt work on Qwen3-0.6B Q8_0, Qwen3.5-0.8B Q4_K_M and 4B Q8_0); kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta |
+| Decode (M4 Max) | Faster than llama.cpp on every local file on Metal (empty context and 4096 tokens, `-fa` off and on) and on the CPU. Qwen3.5-4B Q8_0 Metal 74 tok/s, 131 with `--draft 3` (llama.cpp 64, 124); Qwen3-0.6B Q8_0 CPU 295 (261) |
+| Prompt (M4 Max, pp512) | Metal level with llama.cpp on the 0.8B Q4_K_M, the 35B MoE and the 4B with a q8_0 cache at depth 4096; 5% behind on the 4B and on Qwen3-0.6B (its flash attention). CPU 11–23% behind llama.cpp, whose CPU prompt products run in Accelerate (Phase 7 step 6) |
+| Tests | 261 pass in `cargo test --workspace` (Metal tests skip without a device); 14 reference tests on real models with `--ignored` (13 pass here; `qwen35_bf16` needs a file not on this machine) |
+| Not started | CUDA; PrismML's PTQ1_0 and PQ2_0 (their llama.cpp fork's types); AVX2 kernels beyond F32/F16/BF16/Q8_0/Q2_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; AVX2 prompt tiles; parallel server slots |
 | To rerun | The 5600X comparisons (correctness and speed) predate the attention and fused-multiply-add fixes |
-| Git | Five commits; the cache types and the prompt work since 8f000c7 are not committed |
+| Git | Committed through `94f7d5b` (not pushed); the fixes from the 2026-11-26 review (Q8_0 prompt tiles dropped, deferred RMSNorm precision) are not committed |
 
 ## Decisions
 
@@ -173,7 +173,7 @@ Design rules:
 | **4. CPU speed** (AVX2 and NEON done) | Still to do: AVX2 K-quant kernels, measured on x86; NEON for Q2_K and the IQ1–IQ3 codebooks; the 9B's CPU decode gap (27.1 tok/s against llama.cpp's 35.6 with repacking, not investigated) | Decode at least as fast as llama.cpp on the CPU |
 | **5. CUDA backend** | Loader, bindings, memory, fatbin kernels, CUDA graphs, CPU fallback | Same greedy tokens as CPU; decode at least as fast as llama.cpp CUDA on the 3070 Ti |
 | **6. Metal backend** ✅ | Left for later: other Apple chips and older macOS versions (untested; `auto` falls back to the CPU and prints why), fewer dependent steps per token on small models | — |
-| **7. Batched evaluation and MTP** (in progress) | Batches, rollback, MTP and drafting done; prompt GEMM on Metal done; CPU prompt tiles, parallel server slots and MTP sidecars to do | pp512 within 25% of llama.cpp on each backend (met on Metal); speculative decoding gives the same tokens as plain decoding (met) and decodes faster on the MTP files (met) |
+| **7. Batched evaluation and MTP** (in progress) | Batches, rollback, MTP and drafting done; prompt GEMM on Metal and NEON prompt tiles done; AVX2 prompt tiles, parallel server slots and MTP sidecars to do | pp512 within 25% of llama.cpp on each backend (met on Metal and on the NEON CPU); speculative decoding gives the same tokens as plain decoding (met) and decodes faster on the MTP files (met) |
 | **8. Breadth** | Qwen3.5 2B, `llama` and further dense archs, Vulkan for AMD/Intel, an AVX2 IQ4_XS kernel | The local `qwen35` files run correctly on every backend |
 | **9. Packaging** | Stable Rust API, C ABI (`cdylib` + header), WASM (simd128, in-memory weights), prebuilt release binaries | — |
 
@@ -185,7 +185,14 @@ Design rules:
   `begin(pos, n)`; decoding is n = 1.
 - **CPU batches and Metal batches up to 16 are bit-identical to decoding**,
   so speculative decoding gives exactly the tokens of plain decoding, and
-  CPU prompts still compare with llama.cpp at `-ub 1`.
+  CPU prompts still compare with llama.cpp at `-ub 1`. This holds for every
+  CPU tile, the 8-input `i8mm` ones included; a kernel that rounds
+  differently (a Q8_0 `i8mm` GEMM) is not kept, however fast.
+- **Metal decode folds RMSNorm into the residual product** before it: the
+  product adds `x²` to a 64-bit fixed-point sum (`RMS_FP_SCALE` = 2^28;
+  integer adds do not depend on the order of threadgroups) and the next
+  product applies the scale. Its error is bounded against f64 in
+  `metal/tests.rs`.
 - **Metal prompt batches above 16** (`MATMUL_MIN_BATCH`) use transcriptions
   of ggml-metal's `mul_mm`/`mul_mm_id` and nibble's own attention and
   chunked DeltaNet kernels, compared with llama.cpp's Metal path at its
@@ -205,11 +212,24 @@ Design rules:
    against the one-input ones when it starts and drops any that differ).
    Measured and not kept: 4 rows per threadgroup for the Metal wide
    kernels, loading a block's weights first, two 2-input groups instead of
-   one 4-input group, a 2-row CPU tile for one input. Still to do: better
+   one 4-input group, a 2-row CPU tile for one input, a Q8_0 `i8mm` tile
+   (fast, but one integer per block instead of ggml's four lanes rounds
+   differently and changed greedy output; a bit-identical one needs the
+   same float work per lane as the dotprod kernel and gains little). Still
+   to do: better
    K-quant multi-input kernels on Metal (the 27B is slower with drafts: no
    multi-input Q5_K/IQ4_XS kernels; llama.cpp's `mul_mv_ext` layout rounds
    differently from the one-input kernel), AVX2 tiles.
-6. **Prompt speed:** Metal done, CPU tiles to do.
+6. **Prompt speed:** Metal and NEON done, AVX2 tiles to do.
+   - **CPU** (`fb05552`, `94f7d5b`): the batch's norms, residuals,
+     activation encoding, DeltaNet convolution and gated norms run on the
+     thread pool, attention runs once per batch over the heads instead of
+     once per token, weight blocks are 32 KiB, and Q4_K/Q5_K/Q6_K take
+     8-input `i8mm` tiles. pp512 on 10 threads (llama.cpp b12722
+     `-ngl 0 --repack 0`): Qwen3-0.6B Q8_0 1110 (920 before; llama.cpp
+     1370–1440), 0.8B Q4_K_M 895 (545; 1000–1070), 4B Q8_0 195 (153;
+     232–236). llama.cpp's macOS release runs those products in its BLAS
+     backend (Accelerate) rather than ggml-cpu (see Known pitfalls).
    - **Kernels:** `matmul_*` and `matmul_*_id` (ggml's `kernel_mul_mm`
      and `kernel_mul_mm_id`, 64 × 32 tiles); attention `attention_prep` then
      `attention_prompt_d{64,128,256}` (a simdgroup per query head and 8
@@ -235,12 +255,17 @@ Design rules:
      slower at depth); a DeltaNet scan with one reduction per token; expert
      tiles of 16 slots (experts with 17–32 slots dequantize twice);
      batching the embedding dispatches.
+   - **After `61962e3`** (prompt attention, fused SwiGLU and expert
+     products, batched embedding; alternating runs against `b15af98`):
+     Qwen3-0.6B Q8_0 8840 (8420; llama.cpp 9250 with `-fa 1`, 8200 with
+     `-fa 0`), 0.8B Q4_K_M 6865 (6670; 6786), 35B-A3B 1310 (1233; 1296),
+     4B Q8_0 about 1250 (unchanged; 1311), and the 4B at depth 4096 with a
+     q8_0 cache 1136 (793; 1136). Decode gained 4–5% on the dense files
+     (deferred RMSNorm).
    - **Where llama.cpp is still ahead:** attention-only models (Qwen3-0.6B,
-     11%, its flash attention), the 35B's expert products (8%), the 4B–27B
-     by 1–3%, and quantized caches at depth (the 4B at 8192 with q8_0: 498
-     tok/s against 903; the staged kernel is the gap). Next: an attention
-     kernel along the lines of ggml's tiled flash attention, better expert
-     tiles.
+     5% behind its flash attention, 7% ahead of its non-flash path) and the
+     4B–27B by a few percent. Next: an attention kernel along the lines of
+     ggml's tiled flash attention.
    - **Not done:** matching llama.cpp's non-flash attention for a prompt
      bit for bit (it multiplies with `mul_mm` and a softmax over the padded
      row), CPU prompt tiles.
@@ -322,6 +347,12 @@ Design rules:
   end-of-generation token (keep `-b` large). Its macOS arm64 release has
   `dotprod` but no fp16 arithmetic and no i8mm; Homebrew or `-mcpu=native`
   builds differ (f16 accumulation, i8mm kernels) and are not the reference.
+- **llama.cpp's CPU prompt numbers on macOS are Accelerate's:** the
+  release links a BLAS backend, and every matrix product of 32 or more
+  tokens goes there (dequantized to f32) even with `-ngl 0 -dev none -nopo
+  1`; `GGML_SCHED_DEBUG=2 llama-bench ... -v` shows the splits. Its CPU
+  pp512 is not a ggml-cpu number. llama-bench spells the repack switch
+  `--repack 0`, llama-completion `--no-repack`.
 - **Quantized KV caches in llama.cpp:** a quantized V cache needs flash
   attention; quantized caches are Hadamard-rotated; ggml-metal has no
   kernel for `iq4_nl` keys, so llama.cpp runs that attention on its CPU
