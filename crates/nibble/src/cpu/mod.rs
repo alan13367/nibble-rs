@@ -131,14 +131,16 @@ impl EncodedInput {
     }
 
     /// Encodes each `cols`-element vector of `x` in the dot type of each
-    /// weight type in `types`, once per dot type.
+    /// weight type in `types`, once per dot type, using `pool` for batches.
     fn encode(
         &mut self,
+        pool: &ThreadPool,
         kernels: Kernels,
         x: &[f32],
         cols: usize,
         types: impl IntoIterator<Item = GgmlType>,
     ) {
+        let n = x.len() / cols;
         let mut done = [false; DotType::COUNT];
         for dt in types.into_iter().map(DotType::of) {
             if std::mem::replace(&mut done[dt.index()], true) {
@@ -146,9 +148,25 @@ impl EncodedInput {
             }
             let len = dt.encoded_len(cols);
             let buf = &mut self.by_dot_type[dt.index()];
-            buf.resize(len * (x.len() / cols), 0);
-            for (x, out) in x.chunks_exact(cols).zip(buf.chunks_exact_mut(len)) {
-                kernels.encode(dt, x, out);
+            buf.resize(len * n, 0);
+            if n >= 4 && pool.threads() > 1 && n * cols >= PARALLEL_MIN_MACS {
+                let per_task = n.div_ceil(pool.threads() * 2).max(1);
+                let split = Split {
+                    segments: 1,
+                    chunk_len: per_task * len,
+                };
+                pool.for_each_segment_chunk([buf.as_mut_slice()], split, |_, _, chunk| {
+                    let t0 = chunk.start() / len;
+                    let out = chunk.segment(0);
+                    for (i, dst) in out.chunks_exact_mut(len).enumerate() {
+                        let t = t0 + i;
+                        kernels.encode(dt, &x[t * cols..(t + 1) * cols], dst);
+                    }
+                });
+            } else {
+                for (x, out) in x.chunks_exact(cols).zip(buf.chunks_exact_mut(len)) {
+                    kernels.encode(dt, x, out);
+                }
             }
         }
     }
@@ -239,7 +257,13 @@ impl Cpu {
         if n == 0 {
             return;
         }
-        input.encode(self.kernels, x, cols, weights.iter().map(|w| w.ty));
+        input.encode(
+            &self.pool,
+            self.kernels,
+            x,
+            cols,
+            weights.iter().map(|w| w.ty),
+        );
         let input = &*input;
         let kernels = self.kernels;
         let rows: usize = weights.iter().map(|w| w.rows).sum();
@@ -277,7 +301,7 @@ impl Cpu {
         if n == 0 {
             return;
         }
-        input.encode(self.kernels, x, gate.cols, [gate.ty, up.ty]);
+        input.encode(&self.pool, self.kernels, x, gate.cols, [gate.ty, up.ty]);
         let input = &*input;
         let kernels = self.kernels;
         let (pool, chunk_len) = self.split_rows(2 * gate.rows, x.len());
@@ -322,7 +346,7 @@ impl Cpu {
             return;
         }
         let k = ids.len() / n;
-        input.encode(self.kernels, x, g0.cols, [g0.ty, u0.ty]);
+        input.encode(&self.pool, self.kernels, x, g0.cols, [g0.ty, u0.ty]);
         let (xg, xu) = (input.get(g0.ty), input.get(u0.ty));
         let (lg, lu) = (xg.len() / n, xu.len() / n);
         let kernels = self.kernels;
@@ -373,7 +397,7 @@ impl Cpu {
         if ids.is_empty() {
             return;
         }
-        input.encode(self.kernels, hidden, w0.cols, [w0.ty]);
+        input.encode(&self.pool, self.kernels, hidden, w0.cols, [w0.ty]);
         let xq = input.get(w0.ty);
         let len = xq.len() / ids.len();
         let kernels = self.kernels;

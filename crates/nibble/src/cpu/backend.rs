@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use super::attention::{AttentionScratch, KvCache, attend};
+use super::attention::{AttentionScratch, KvCache, attend, attend_batch};
 use super::{
     Cpu, DeltaStep, EncodedInput, Experts, Kernels, Split, Weight, add_in_place, hadamard,
     l2_norm_chunks, rmsnorm, rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
@@ -221,8 +221,29 @@ impl Backend for CpuBackend<'_> {
     }
 
     fn rmsnorm(&mut self, x: &Vec<f32>, w: Param, eps: f32, out: &mut Vec<f32>) {
-        let (d, weight) = (w.len(), self.param(w));
-        for (out, x) in out.chunks_exact_mut(d).zip(x.chunks_exact(d)).take(self.n) {
+        let (d, weight, n) = (w.len(), self.param(w), self.n);
+        if n >= 4 && self.cpu.threads() > 1 {
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let split = Split {
+                segments: 1,
+                chunk_len: per_task * d,
+            };
+            self.cpu
+                .pool()
+                .for_each_segment_chunk([&mut out[..n * d]], split, |_, _, chunk| {
+                    let start = chunk.start();
+                    let out = chunk.segment(0);
+                    let len = out.len();
+                    for (o, x) in out
+                        .chunks_exact_mut(d)
+                        .zip(x[start..start + len].chunks_exact(d))
+                    {
+                        rmsnorm(o, x, weight, eps);
+                    }
+                });
+            return;
+        }
+        for (out, x) in out.chunks_exact_mut(d).zip(x.chunks_exact(d)).take(n) {
             rmsnorm(out, x, weight, eps);
         }
     }
@@ -279,8 +300,34 @@ impl Backend for CpuBackend<'_> {
         self.cpu
             .matvec(self.model.bytes, w, a, product, &mut self.input);
         let x = &mut x[..n * w.rows];
+        let out = &mut out[..n * w.rows];
+        let weight = &self.model.params[norm.range()];
+        if n >= 4 && self.cpu.threads() > 1 {
+            let d = w.rows;
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let split = Split {
+                segments: 1,
+                chunk_len: per_task * d,
+            };
+            self.cpu.pool().for_each_segment_chunk_pair(
+                x,
+                split,
+                out,
+                split,
+                |_, x_chunk, out_chunk| {
+                    let start = x_chunk.start();
+                    let xs = x_chunk.segment(0);
+                    let os = out_chunk.segment(0);
+                    let ps = &product[start..start + xs.len()];
+                    add_in_place(xs, ps);
+                    for (o, x) in os.chunks_exact_mut(d).zip(xs.chunks_exact(d)) {
+                        rmsnorm(o, x, weight, eps);
+                    }
+                },
+            );
+            return;
+        }
         add_in_place(x, product);
-        let weight = self.param(norm);
         for (out, x) in out.chunks_exact_mut(w.rows).zip(x.chunks_exact(w.rows)) {
             rmsnorm(out, x, weight, eps);
         }
@@ -453,9 +500,90 @@ impl Backend for CpuBackend<'_> {
     ) {
         let c = self.model.config;
         let hd = c.head_dim;
-        let q_len = c.n_head * hd * if norm.gated { 2 } else { 1 };
+        let q_stride = if norm.gated { 2 * hd } else { hd };
+        let q_len = c.n_head * q_stride;
         let kv_len = c.n_head_kv * hd;
         let half = c.rope_dims / 2;
+        if self.n > 1 {
+            let n = self.n;
+            let start_pos = cache.len();
+            let params = self.model.params;
+            let rope = &self.rope;
+            let rot_k = self.kv.rot_k(hd);
+            let rot_v = self.kv.rot_v(hd);
+            // Prepare every token's queries and keys in parallel.
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let q_split = Split {
+                segments: 1,
+                chunk_len: per_task * q_len,
+            };
+            let k_split = Split {
+                segments: 1,
+                chunk_len: per_task * kv_len,
+            };
+            self.cpu.pool().for_each_segment_chunk_pair(
+                &mut q[..n * q_len],
+                q_split,
+                &mut k[..n * kv_len],
+                k_split,
+                |_, q_chunk, k_chunk| {
+                    let t0 = q_chunk.start() / q_len;
+                    for (i, (qt, kt)) in q_chunk
+                        .segment(0)
+                        .chunks_exact_mut(q_len)
+                        .zip(k_chunk.segment(0).chunks_exact_mut(kv_len))
+                        .enumerate()
+                    {
+                        let r = &rope[(t0 + i) * half..(t0 + i + 1) * half];
+                        if let Some((q_norm, k_norm)) = norm.weights {
+                            let qw = &params[q_norm.range()];
+                            for slot in qt.chunks_exact_mut(q_stride) {
+                                rmsnorm_chunks(&mut slot[..hd], qw, norm.eps);
+                            }
+                            rmsnorm_chunks(kt, &params[k_norm.range()], norm.eps);
+                        }
+                        for slot in qt.chunks_exact_mut(q_stride) {
+                            rope_neox(&mut slot[..hd], hd, r);
+                        }
+                        rope_neox(kt, hd, r);
+                        if let Some(rot) = rot_k {
+                            for slot in qt.chunks_exact_mut(q_stride) {
+                                hadamard(&mut slot[..hd], rot);
+                            }
+                            hadamard(kt, rot);
+                        }
+                    }
+                },
+            );
+            let kernels = self.cpu.kernels();
+            for (kt, vt) in k[..n * kv_len]
+                .chunks_exact(kv_len)
+                .zip(v[..n * kv_len].chunks_exact(kv_len))
+            {
+                let vt = if let Some(rot) = rot_v {
+                    self.value.copy_from_slice(vt);
+                    hadamard(&mut self.value, rot);
+                    &self.value
+                } else {
+                    vt
+                };
+                cache.push(kernels, kt, vt);
+            }
+            attend_batch(
+                &self.cpu,
+                c,
+                &q[..n * q_len],
+                q_stride,
+                norm.gated,
+                start_pos,
+                n,
+                cache,
+                rot_v,
+                &mut self.attention,
+                &mut out[..n * c.n_head * hd],
+            );
+            return;
+        }
         let rows = q
             .chunks_exact_mut(q_len)
             .zip(k.chunks_exact_mut(kv_len))
@@ -594,11 +722,38 @@ impl Backend for CpuBackend<'_> {
         // Gated RMSNorm per head: rmsnorm(o) * ssm_norm * silu(z).
         let norm = self.param(p.norm);
         let kernels = self.cpu.kernels();
-        for (out, z) in out.chunks_exact_mut(vd).zip(z.chunks_exact_mut(vd)) {
-            rmsnorm_chunks(out, norm, eps);
-            kernels.silu(z);
-            for (o, &z) in out.iter_mut().zip(z.iter()) {
-                *o *= z;
+        if n >= 4 && self.cpu.threads() > 1 {
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let split = Split {
+                segments: 1,
+                chunk_len: per_task * vd,
+            };
+            self.cpu.pool().for_each_segment_chunk_pair(
+                out,
+                split,
+                z,
+                split,
+                |_, o_chunk, z_chunk| {
+                    for (out, z) in o_chunk
+                        .segment(0)
+                        .chunks_exact_mut(vd)
+                        .zip(z_chunk.segment(0).chunks_exact_mut(vd))
+                    {
+                        rmsnorm_chunks(out, norm, eps);
+                        kernels.silu(z);
+                        for (o, &z) in out.iter_mut().zip(z.iter()) {
+                            *o *= z;
+                        }
+                    }
+                },
+            );
+        } else {
+            for (out, z) in out.chunks_exact_mut(vd).zip(z.chunks_exact_mut(vd)) {
+                rmsnorm_chunks(out, norm, eps);
+                kernels.silu(z);
+                for (o, &z) in out.iter_mut().zip(z.iter()) {
+                    *o *= z;
+                }
             }
         }
     }
@@ -663,10 +818,83 @@ impl DeltaLayer<'_> {
         let d = self.d;
         let (cd, nh) = (d.conv_dim(), d.n_v_heads);
         let kernels = self.cpu.kernels();
+        let n = conv.len() / cd;
+        let ring_rows = ring.len() / cd;
+        if let Some(inputs) = inputs
+            && n >= 4
+            && self.cpu.threads() > 1
+        {
+            // Parallel causal conv + SiLU + L2 norm + beta/alpha across tokens,
+            // reading the committed window from `ring` and earlier batch tokens
+            // from `inputs`, then updating `ring` afterwards.
+            let win = d.conv_kernel - 1;
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let c_split = Split {
+                segments: 1,
+                chunk_len: per_task * cd,
+            };
+            let b_split = Split {
+                segments: 1,
+                chunk_len: per_task * nh,
+            };
+            let ring_ro: &[f32] = ring;
+            self.cpu.pool().for_each_segment_chunk_pair(
+                conv,
+                c_split,
+                beta,
+                b_split,
+                |_, c_chunk, b_chunk| {
+                    let t0 = c_chunk.start() / cd;
+                    let cs = c_chunk.segment(0);
+                    let bs = b_chunk.segment(0);
+                    for (i, (c_row, b_row)) in cs
+                        .chunks_exact_mut(cd)
+                        .zip(bs.chunks_exact_mut(nh))
+                        .enumerate()
+                    {
+                        let t = t0 + i;
+                        c_row.fill(0.0);
+                        for (tap_i, taps) in self.taps.chunks_exact(cd).enumerate() {
+                            let seq = t + tap_i;
+                            let src = if seq < win {
+                                let row = (first + seq) % ring_rows;
+                                &ring_ro[row * cd..(row + 1) * cd]
+                            } else {
+                                let idx = seq - win;
+                                &inputs[idx * cd..(idx + 1) * cd]
+                            };
+                            for ((o, &x), &w) in c_row.iter_mut().zip(src).zip(taps) {
+                                *o = x.mul_add(w, *o);
+                            }
+                        }
+                        kernels.silu(c_row);
+                        let (q, rest) = c_row.split_at_mut(d.key_dim());
+                        let (k, _) = rest.split_at_mut(d.key_dim());
+                        l2_norm_chunks(q, d.d_k, self.eps);
+                        l2_norm_chunks(k, d.d_k, self.eps);
+                        for b in b_row.iter_mut() {
+                            *b = sigmoid(*b);
+                        }
+                    }
+                },
+            );
+            for a_row in alpha.chunks_exact_mut(nh) {
+                for ((a, &dt_bias), &a_log) in a_row.iter_mut().zip(self.dt_bias).zip(self.a) {
+                    *a = (softplus(*a + dt_bias) * a_log).exp();
+                }
+            }
+            // Write the batch's tail into `ring` in the exact slots the serial
+            // loop would leave them in.
+            let keep = n.min(ring_rows);
+            for t in (n - keep)..n {
+                let row = (first + t + win) % ring_rows;
+                ring[row * cd..(row + 1) * cd].copy_from_slice(&inputs[t * cd..(t + 1) * cd]);
+            }
+            return;
+        }
         let rows = conv
             .chunks_exact_mut(cd)
             .zip(beta.chunks_exact_mut(nh).zip(alpha.chunks_exact_mut(nh)));
-        let ring_rows = ring.len() / cd;
         for (t, (conv, (beta, alpha))) in rows.enumerate() {
             if let Some(inputs) = inputs {
                 let row = (first + t + d.conv_kernel - 1) % ring_rows;

@@ -195,10 +195,10 @@ impl KvCache {
         self.len = n_pos;
     }
 
-    /// The `len` cached keys of KV head `g`, rows of `k_row` bytes.
-    fn keys(&self, g: usize) -> &[u8] {
+    /// The first `n_pos` cached keys of KV head `g`, rows of `k_row` bytes.
+    fn keys_up_to(&self, g: usize, n_pos: usize) -> &[u8] {
         let at = g * self.capacity * self.k_row;
-        &self.k[at..at + self.len * self.k_row]
+        &self.k[at..at + n_pos * self.k_row]
     }
 
     /// Row `i` of the transposed values: element `i` of every position.
@@ -246,9 +246,7 @@ impl AttentionScratch {
     }
 }
 
-/// Causal softmax attention of the query heads `q` over every cached position,
-/// with grouped-query sharing (query head `h` reads KV head `h / (n_head / n_head_kv)`).
-/// Writes `n_head * head_dim` values to `out`. Heads run in parallel.
+/// Causal softmax attention for one query head over cached positions `0..n_pos`.
 ///
 /// Each query head meets its keys as ggml's CPU `mul_mat` does: f16 and f32
 /// keys meet the f32 query, the others the query encoded in their dot type
@@ -262,6 +260,65 @@ impl AttentionScratch {
 ///   `ggml_compute_forward_flash_attn_ext_f16_one_chunk`, which every row
 ///   takes for these types: an online softmax over the positions in order,
 ///   each value dequantized and added with a fused multiply-add.
+#[expect(clippy::too_many_arguments, reason = "one head attention step")]
+fn attend_head(
+    kernels: Kernels,
+    cache: &KvCache,
+    kv_head: usize,
+    hd: usize,
+    scale: f32,
+    n_pos: usize,
+    q: &[f32],
+    head: &mut HeadScratch,
+    out: &mut [f32],
+) {
+    let padded = n_pos.next_multiple_of(KV_BLOCK);
+    let types = cache.types;
+    let k_type = types.stored_k();
+    let keys = cache.keys_up_to(kv_head, n_pos);
+    let scores = &mut head.probs[..n_pos];
+    if k_type == KvCacheType::F16 {
+        kernels.dot_f16_f32_rows(keys, cache.k_row, q, scores);
+    } else {
+        let ty = k_type.ggml_type();
+        let dt = DotType::of(ty);
+        let xq = &mut head.encoded[..dt.encoded_len(hd)];
+        kernels.encode(dt, q, xq);
+        dot_rows(kernels, k_type, keys, cache.k_row, xq, scores);
+    }
+    if types.flash() {
+        return flash(cache, kv_head, n_pos, scale, head, out);
+    }
+    let probs = &mut head.probs[..padded];
+    let (scores, masked) = probs.split_at_mut(n_pos);
+    for score in scores.iter_mut() {
+        *score *= scale;
+    }
+    masked.fill(f32::NEG_INFINITY);
+    kernels.softmax(probs);
+    let es = cache.v_elem;
+    if types.v == KvCacheType::F16 {
+        let values = &cache.v[es * kv_head * hd * cache.stride..];
+        kernels.dot_f16_f32_rows(values, es * cache.stride, probs, out);
+        return;
+    }
+    let ty = types.v.ggml_type();
+    let dt = DotType::of(ty);
+    let xq = &mut head.encoded[..dt.encoded_len(padded)];
+    kernels.encode(dt, probs, xq);
+    for (i, o) in out.iter_mut().enumerate() {
+        let row = &cache.value_row(kv_head * hd + i)[..es * padded];
+        dot_rows(
+            kernels,
+            types.v,
+            row,
+            es * padded,
+            xq,
+            std::slice::from_mut(o),
+        );
+    }
+}
+
 pub(crate) fn attend(
     cpu: &Cpu,
     c: &ModelConfig,
@@ -275,70 +332,106 @@ pub(crate) fn attend(
     let scale = 1.0 / (hd as f32).sqrt();
     let kernels = cpu.kernels();
     let n_pos = cache.len();
-    let padded = n_pos.next_multiple_of(KV_BLOCK);
-    let types = cache.types;
-    let k_type = types.stored_k();
     cpu.pool()
         .for_each_chunk_pair(out, hd, &mut s.heads, 1, |h, out, head| {
-            let head = &mut head[0];
-            let kv_head = h / group;
-            let q = &q[h * hd..(h + 1) * hd];
-            let keys = cache.keys(kv_head);
-            let scores = &mut head.probs[..n_pos];
-            if k_type == KvCacheType::F16 {
-                kernels.dot_f16_f32_rows(keys, cache.k_row, q, scores);
-            } else {
-                let ty = k_type.ggml_type();
-                let dt = DotType::of(ty);
-                let xq = &mut head.encoded[..dt.encoded_len(hd)];
-                kernels.encode(dt, q, xq);
-                dot_rows(kernels, k_type, keys, cache.k_row, xq, scores);
-            }
-            if types.flash() {
-                return flash(cache, kv_head, scale, head, out);
-            }
-            let probs = &mut head.probs[..padded];
-            let (scores, masked) = probs.split_at_mut(n_pos);
-            for score in scores.iter_mut() {
-                *score *= scale;
-            }
-            masked.fill(f32::NEG_INFINITY);
-            kernels.softmax(probs);
-            let es = cache.v_elem;
-            if types.v == KvCacheType::F16 {
-                let values = &cache.v[es * kv_head * hd * cache.stride..];
-                kernels.dot_f16_f32_rows(values, es * cache.stride, probs, out);
-                return;
-            }
-            let ty = types.v.ggml_type();
-            let dt = DotType::of(ty);
-            let xq = &mut head.encoded[..dt.encoded_len(padded)];
-            kernels.encode(dt, probs, xq);
-            for (i, o) in out.iter_mut().enumerate() {
-                let row = &cache.value_row(kv_head * hd + i)[..es * padded];
-                dot_rows(
-                    kernels,
-                    types.v,
-                    row,
-                    es * padded,
-                    xq,
-                    std::slice::from_mut(o),
-                );
-            }
+            attend_head(
+                kernels,
+                cache,
+                h / group,
+                hd,
+                scale,
+                n_pos,
+                &q[h * hd..(h + 1) * hd],
+                &mut head[0],
+                out,
+            );
         });
+}
+
+/// Batched causal softmax attention for `n` tokens whose keys and values have
+/// already been appended at `start_pos..start_pos + n` in `cache`: one parallel
+/// pass over query heads (instead of `n` thread-pool barriers), also applying
+/// `rot_v` inverse Hadamard and `gated` sigmoid in the same pass.
+#[expect(clippy::too_many_arguments, reason = "one batched attention pass")]
+pub(crate) fn attend_batch(
+    cpu: &Cpu,
+    c: &ModelConfig,
+    q: &[f32],
+    q_stride: usize,
+    gated: bool,
+    start_pos: usize,
+    n: usize,
+    cache: &KvCache,
+    rot_v: Option<usize>,
+    s: &mut AttentionScratch,
+    out: &mut [f32],
+) {
+    let hd = c.head_dim;
+    let group = c.n_head / c.n_head_kv;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let kernels = cpu.kernels();
+    let q_row = c.n_head * q_stride;
+    let out_split = super::Split {
+        segments: n,
+        chunk_len: hd,
+    };
+    let head_split = super::Split {
+        segments: 1,
+        chunk_len: 1,
+    };
+    cpu.pool().for_each_segment_chunk_pair(
+        out,
+        out_split,
+        &mut s.heads,
+        head_split,
+        |h, out_h, head| {
+            let head = &mut head.segment(0)[0];
+            let kv_head = h / group;
+            for t in 0..n {
+                let q_at = t * q_row + h * q_stride;
+                let o = out_h.segment(t);
+                attend_head(
+                    kernels,
+                    cache,
+                    kv_head,
+                    hd,
+                    scale,
+                    start_pos + t + 1,
+                    &q[q_at..q_at + hd],
+                    head,
+                    o,
+                );
+                if let Some(rot) = rot_v {
+                    super::hadamard(o, rot);
+                }
+                if gated {
+                    for (a, &g) in o.iter_mut().zip(&q[q_at + hd..q_at + 2 * hd]) {
+                        *a *= super::sigmoid(g);
+                    }
+                }
+            }
+        },
+    );
 }
 
 /// The flash-attention loop of one query head over the scores in
 /// `head.probs` (ggml's online softmax, `ggml_vec_scale_f32` and
 /// `ggml_vec_mad_f32`, the latter fused per value).
-fn flash(cache: &KvCache, kv_head: usize, scale: f32, head: &mut HeadScratch, out: &mut [f32]) {
+fn flash(
+    cache: &KvCache,
+    kv_head: usize,
+    n_pos: usize,
+    scale: f32,
+    head: &mut HeadScratch,
+    out: &mut [f32],
+) {
     let ty = cache.types.v.ggml_type();
     let acc = &mut head.acc[..];
     let value = &mut head.value[..];
     acc.fill(0.0);
     let mut max = f32::NEG_INFINITY;
     let mut sum = 0.0f32;
-    for (p, &score) in head.probs[..cache.len()].iter().enumerate() {
+    for (p, &score) in head.probs[..n_pos].iter().enumerate() {
         // The mask of a visible position adds zero.
         let s = score * scale;
         let (ms, vs) = if s > max {
