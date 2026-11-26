@@ -9,6 +9,7 @@ static inline void matvec_float4(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         threadgroup char * shmem,
         uint3 tgpig,
         ushort tiisg,
@@ -62,25 +63,25 @@ static inline void matvec_float4(
         }
     }
 
-    reduce_and_write<NR0>(a, dst, sumf, r0, tiisg, sgitg, shmem);
+    reduce_and_write<NR0>(a, dst, rms, sumf, r0, tiisg, sgitg, shmem);
 }
 
 template <short NR0>
 static inline void matvec_f32_impl(constant MatvecArgs & a, device const char * w, device const char * w2,
-        device const float * y, device float * dst, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
-    matvec_float4<float4, NR0>(a, w, w2, y, dst, shmem, tgpig, tiisg, sgitg);
+        device const float * y, device float * dst, RmsCtx rms, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    matvec_float4<float4, NR0>(a, w, w2, y, dst, rms, shmem, tgpig, tiisg, sgitg);
 }
 
 template <short NR0>
 static inline void matvec_f16_impl(constant MatvecArgs & a, device const char * w, device const char * w2,
-        device const float * y, device float * dst, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
-    matvec_float4<half4, NR0>(a, w, w2, y, dst, shmem, tgpig, tiisg, sgitg);
+        device const float * y, device float * dst, RmsCtx rms, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    matvec_float4<half4, NR0>(a, w, w2, y, dst, rms, shmem, tgpig, tiisg, sgitg);
 }
 
 template <short NR0>
 static inline void matvec_bf16_impl(constant MatvecArgs & a, device const char * w, device const char * w2,
-        device const float * y, device float * dst, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
-    matvec_float4<bfloat4, NR0>(a, w, w2, y, dst, shmem, tgpig, tiisg, sgitg);
+        device const float * y, device float * dst, RmsCtx rms, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    matvec_float4<bfloat4, NR0>(a, w, w2, y, dst, rms, shmem, tgpig, tiisg, sgitg);
 }
 
 MATVEC_KERNEL(matvec_f32, matvec_f32_impl, 2)
@@ -96,6 +97,7 @@ static inline void matvec_float4_nc(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         short nc,
         threadgroup char * shmem,
         uint3 tgpig,
@@ -158,25 +160,25 @@ static inline void matvec_float4_nc(
         }
     }
 
-    reduce_and_write_nc<NR0, NC>(a, dst, sumf, nc, r0, tiisg, sgitg, shmem);
+    reduce_and_write_nc<NR0, NC>(a, dst, rms, sumf, nc, r0, tiisg, sgitg, shmem);
 }
 
 template <short NR0, short NC>
 static inline void matvec_f32_nc(constant MatvecArgs & a, device const char * w, device const char * w2,
-        device const float * y, device float * dst, short nc, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
-    matvec_float4_nc<float4, NR0, NC>(a, w, w2, y, dst, nc, shmem, tgpig, tiisg, sgitg);
+        device const float * y, device float * dst, RmsCtx rms, short nc, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    matvec_float4_nc<float4, NR0, NC>(a, w, w2, y, dst, rms, nc, shmem, tgpig, tiisg, sgitg);
 }
 
 template <short NR0, short NC>
 static inline void matvec_f16_nc(constant MatvecArgs & a, device const char * w, device const char * w2,
-        device const float * y, device float * dst, short nc, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
-    matvec_float4_nc<half4, NR0, NC>(a, w, w2, y, dst, nc, shmem, tgpig, tiisg, sgitg);
+        device const float * y, device float * dst, RmsCtx rms, short nc, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    matvec_float4_nc<half4, NR0, NC>(a, w, w2, y, dst, rms, nc, shmem, tgpig, tiisg, sgitg);
 }
 
 template <short NR0, short NC>
 static inline void matvec_bf16_nc(constant MatvecArgs & a, device const char * w, device const char * w2,
-        device const float * y, device float * dst, short nc, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
-    matvec_float4_nc<bfloat4, NR0, NC>(a, w, w2, y, dst, nc, shmem, tgpig, tiisg, sgitg);
+        device const float * y, device float * dst, RmsCtx rms, short nc, threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    matvec_float4_nc<bfloat4, NR0, NC>(a, w, w2, y, dst, rms, nc, shmem, tgpig, tiisg, sgitg);
 }
 
 MATVEC_KERNEL_NC(matvec_f32_c2, matvec_f32_nc, 2, 2)
@@ -193,6 +195,7 @@ static inline void matvec_q8_0_impl(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         short nc,
         threadgroup char * shmem,
         uint3 tgpig,
@@ -260,7 +263,7 @@ static inline void matvec_q8_0_impl(
         }
     }
 
-    reduce_and_write_nc<NR0, NC>(a, dst, sumf, nc, r0, tiisg, sgitg, shmem);
+    reduce_and_write_nc<NR0, NC>(a, dst, rms, sumf, nc, r0, tiisg, sgitg, shmem);
 }
 
 MATVEC_KERNEL_NC(matvec_q8_0, matvec_q8_0_impl, 2, 1)
@@ -268,38 +271,42 @@ MATVEC_KERNEL_NC_ID(matvec_q8_0_id, matvec_q8_0_impl, 2)
 MATVEC_KERNEL_NC(matvec_q8_0_c2, matvec_q8_0_impl, 2, 2)
 MATVEC_KERNEL_NC(matvec_q8_0_c4, matvec_q8_0_impl, 2, 4)
 
-// Embedding lookups: one thread per value.
+// Embedding lookups: one thread per value, `pos.y` selects the token of the batch.
 
 template <typename T>
-static inline void embed_float(constant EmbedArgs & a, device const char * w, device float * x, device const uint * slot, uint i) {
+static inline void embed_float(constant EmbedArgs & a, device const char * w, device float * x, device const uint * slot, uint2 pos) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols) {
-        x[i] = float(((device const T *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes))[i]);
+        x[(uint64_t) t * a.cols + i] = float(((device const T *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes))[i]);
     }
 }
 
 kernel void embed_f32(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
-    embed_float<float>(a, w, x, slot, i);
+        uint2 pos [[thread_position_in_grid]]) {
+    embed_float<float>(a, w, x, slot, pos);
 }
 
 kernel void embed_f16(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
-    embed_float<half>(a, w, x, slot, i);
+        uint2 pos [[thread_position_in_grid]]) {
+    embed_float<half>(a, w, x, slot, pos);
 }
 
 kernel void embed_bf16(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
-    embed_float<bfloat>(a, w, x, slot, i);
+        uint2 pos [[thread_position_in_grid]]) {
+    embed_float<bfloat>(a, w, x, slot, pos);
 }
 
 kernel void embed_q8_0(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
+        uint2 pos [[thread_position_in_grid]]) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols) {
-        device const block_q8_0 * b = (device const block_q8_0 *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / QK8_0;
-        x[i] = float(b->d) * float(b->qs[i % QK8_0]);
+        device const block_q8_0 * b = (device const block_q8_0 *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes) + i / QK8_0;
+        x[(uint64_t) t * a.cols + i] = float(b->d) * float(b->qs[i % QK8_0]);
     }
 }

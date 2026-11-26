@@ -39,11 +39,11 @@ mod weights;
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use device::{Buffer, Commands, Device, Pipeline, Size};
+use device::{Buffer, Commands, Device, Size};
 use kernels::{
     AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, FlashArgs, MatmulArgs,
-    MatmulIdArgs, MatvecArgs, MoeArgs, MoeMapArgs, MoeSumArgs, Pipelines, RmsArgs, RotateArgs,
-    RouteArgs,
+    MatmulIdArgs, MatvecArgs, MoeArgs, MoeMapArgs, MoeSumArgs, Pipelines, RmsApplyArgs, RmsArgs,
+    RotateArgs, RouteArgs,
 };
 
 use crate::backend::{
@@ -127,6 +127,20 @@ const DISPATCHES_PER_COMMIT: usize = 64;
 /// unfinished ones by default.
 const MAX_IN_FLIGHT: usize = 64;
 
+/// Deferred RMSNorm fixed-point sum-of-squares groups (`MAX_LOGIT_ROWS` `u64`s each).
+const RMS_GROUPS: usize = 256;
+
+/// A vector whose rows (`0..n`) currently hold `x * norm` and still need
+/// multiplying by `rsqrt((sums[off + t] * 2^-20) / len + eps)` before non-matvec use.
+#[derive(Clone, Copy, Debug)]
+struct PendingRms {
+    buf: usize,
+    off: u32,
+    n: usize,
+    len: u32,
+    eps: f32,
+}
+
 /// A vector of `f32` in a shared buffer.
 #[derive(Debug)]
 pub(crate) struct MetalVector {
@@ -152,6 +166,13 @@ pub(crate) enum Output<'a> {
     Add,
     /// `out = silu(w · x) * (up · x)`, for `up` of the same type and shape.
     SwiGlu(&'a Weight),
+    /// `out += w · x`, `xn = out * norm`, and accumulate `out^2` in 64-bit
+    /// fixed-point at `rms_sums[out_off + tok]`.
+    ResidualNorm {
+        norm_offset: usize,
+        xn: &'a Buffer,
+        out_off: u32,
+    },
 }
 
 /// The buffers of one token of a DeltaNet layer, with their byte offsets.
@@ -177,9 +198,17 @@ pub(crate) struct MetalBackend<'m> {
     params: Buffer,
     /// The token slots of [`Backend::argmax`], one `u32` each.
     slots: Buffer,
+    /// Fixed-point 64-bit sum-of-squares slots for deterministic deferred
+    /// RMSNorm (for batches up to `MATMUL_MIN_BATCH`).
+    rms_sums: Buffer,
+    rms_used: usize,
+    pending_rms: Option<PendingRms>,
     logits: Buffer,
     /// Each attention chunk's output, maximum score and sum of exponentials.
     partials: Buffer,
+    /// Prompt attention's normalized+rotated queries in `[n_head, n_padded, head_dim]`
+    /// `half` layout, and the halfs it has room for; allocated on first prompt batch.
+    q_half: Option<(Buffer, usize)>,
     /// One DeltaNet layer's state, which a batch that stays pending runs
     /// on; allocated by the first batch that needs it.
     delta_work: Option<Buffer>,
@@ -193,6 +222,9 @@ pub(crate) struct MetalBackend<'m> {
     /// the slots they have room for; allocated by the first batch that
     /// needs them.
     moe_map: Option<(Buffer, Buffer, usize)>,
+    /// The `(route buffer address, k, n_expert)` currently described by `moe_map`,
+    /// cleared on `begin` and `moe_route` so `moe_down` reuses `moe_swiglu`'s map.
+    moe_mapped: Option<(usize, usize, usize)>,
     /// Buffers replaced while commands that use them may still run (command
     /// buffers do not retain them), freed at the next sync.
     retired: Vec<Buffer>,
@@ -294,6 +326,9 @@ impl<'m> MetalBackend<'m> {
         let c = model.config;
         let logits = floats(MAX_LOGIT_ROWS * c.n_vocab)?;
         let slots = floats(MAX_LOGIT_ROWS)?;
+        let rms_sums = device
+            .buffer(8 * RMS_GROUPS * MAX_LOGIT_ROWS)
+            .map_err(backend_error)?;
         // Checked here so that `Auto` falls back to the CPU for a model the
         // kernels do not cover.
         let attention = Self::attention_plan(&device, &pipelines, c).ok_or_else(|| {
@@ -315,12 +350,17 @@ impl<'m> MetalBackend<'m> {
             params,
             logits,
             slots,
+            rms_sums,
+            rms_used: 0,
+            pending_rms: None,
             partials,
+            q_half: None,
             delta_work: None,
             kv,
             kv_bytes: 0,
             delta_chunks: None,
             moe_map: None,
+            moe_mapped: None,
             retired: Vec::new(),
             attention,
             n_ctx,
@@ -393,7 +433,7 @@ impl<'m> MetalBackend<'m> {
         self.device.name()
     }
 
-    /// Waits for every committed token.
+    /// Waits for every committed token and zeroes unused deferred-RMS slots.
     fn sync(&mut self) -> Result<()> {
         while let Some(commands) = self.in_flight.pop_front() {
             if let Err(e) = commands.wait() {
@@ -402,8 +442,69 @@ impl<'m> MetalBackend<'m> {
         }
         if self.commands.is_none() {
             self.retired.clear();
+            if self.rms_used > 0 {
+                // SAFETY: every committed command buffer has completed, and no
+                // batch is being encoded.
+                let bytes = unsafe { self.rms_sums.bytes_mut() };
+                if let Some(p) = self.pending_rms.as_mut() {
+                    let src = p.off as usize * 8;
+                    let len = p.n * 8;
+                    bytes.copy_within(src..src + len, 0);
+                    bytes[len..self.rms_used * 8].fill(0);
+                    p.off = 0;
+                    self.rms_used = p.n;
+                } else {
+                    bytes[..self.rms_used * 8].fill(0);
+                    self.rms_used = 0;
+                }
+            }
         }
         self.gpu_result()
+    }
+
+    /// Deferred RMS parameters if `x` is the currently pending vector:
+    /// `(len, off, eps)`.
+    fn rms_input_for(&self, x: &Buffer, row_start: usize) -> Option<(u32, u32, f32)> {
+        self.pending_rms
+            .filter(|p| p.buf == x.contents() as usize)
+            .map(|p| (p.len, p.off + row_start as u32, p.eps))
+    }
+
+    /// Clears `pending_rms` when its vector is overwritten.
+    fn clear_rms_if(&mut self, dst: &Buffer) {
+        if self
+            .pending_rms
+            .is_some_and(|p| p.buf == dst.contents() as usize)
+        {
+            self.pending_rms = None;
+        }
+    }
+
+    /// Materializes `pending_rms` onto `x` before an op that cannot apply the
+    /// deferred scale inline.
+    fn flush_rms_if(&mut self, x: &Buffer) {
+        let Some(p) = self.pending_rms.take_if(|p| p.buf == x.contents() as usize) else {
+            return;
+        };
+        if p.n == 0 || !self.reserve(1) {
+            return;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return;
+        };
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.rms_apply);
+        commands.set_bytes(
+            0,
+            &RmsApplyArgs {
+                n: p.len,
+                off: p.off,
+                eps: p.eps,
+            },
+        );
+        commands.set_buffer(1, x, 0);
+        commands.set_buffer(2, &self.rms_sums, 0);
+        commands.dispatch(Size::new(p.n, 1, 1), Size::new(THREADS, 1, 1));
     }
 
     /// The first failure of committed commands since the last report.
@@ -622,31 +723,52 @@ impl<'m> MetalBackend<'m> {
         output: Output<'_>,
         barrier: bool,
     ) {
+        let use_matmul = self.n > MATMUL_MIN_BATCH && matmul_covers(&self.pipelines, w);
+        if use_matmul {
+            self.flush_rms_if(x);
+        }
         if self.n == 0 || !self.reserve(1) {
             return;
         }
+        let rms_in = if use_matmul {
+            None
+        } else {
+            self.rms_input_for(x, 0)
+        };
         let Some(commands) = self.commands.as_mut() else {
             return;
         };
         if barrier {
             commands.barrier();
         }
-        let (pipelines, weights, n) = (&self.pipelines, &self.weights, self.n);
-        let result = if n > MATMUL_MIN_BATCH && matmul_covers(pipelines, w) {
-            let add = match output {
-                Output::Store => false,
-                Output::Add => true,
-                Output::SwiGlu(_) => {
-                    return self.fail("a SwiGLU product of a prompt batch".to_owned());
-                }
-            };
-            encode_matmul(commands, pipelines, weights, w, x, out, add, n)
+        let (pipelines, weights, params, rms_sums, n) = (
+            &self.pipelines,
+            &self.weights,
+            &self.params,
+            &self.rms_sums,
+            self.n,
+        );
+        let result = if use_matmul {
+            encode_matmul(commands, pipelines, weights, w, x, out, output, n)
         } else {
-            encode_matvec(commands, pipelines, weights, w, (x, 0), (out, 0), output, n)
+            encode_matvec(
+                commands,
+                pipelines,
+                weights,
+                params,
+                rms_sums,
+                rms_in,
+                w,
+                (x, 0),
+                (out, 0),
+                output,
+                n,
+            )
         };
         if let Err(e) = result {
             self.fail(e);
         }
+        self.clear_rms_if(out);
     }
 }
 
@@ -663,8 +785,13 @@ impl MetalBackend<'_> {
     }
 
     /// Encodes `moe_map` for the batch's `route` of `k` slots per token
-    /// over `n_expert` experts. False after a failure.
+    /// over `n_expert` experts. Reuses the map if it was already built for
+    /// this `route` in the current batch. False after a failure.
     fn encode_moe_map(&mut self, route: &Buffer, k: usize, n_expert: usize) -> bool {
+        let key = (route.contents() as usize, k, n_expert);
+        if self.moe_mapped == Some(key) {
+            return true;
+        }
         let slots = self.n * k;
         if self.moe_map.as_ref().is_none_or(|m| m.2 < slots) {
             // The most tiles: the full ones, and a partial one per expert.
@@ -709,19 +836,23 @@ impl MetalBackend<'_> {
             (2 * 4 * n_expert + 2 * n_expert * k).next_multiple_of(16),
         );
         commands.dispatch(Size::new(1, 1, 1), Size::new(n_expert, 1, 1));
+        self.moe_mapped = Some(key);
         true
     }
 
     /// Encodes the expert products of every slot with `matmul_*_id`, after
-    /// [`Self::encode_moe_map`]: `out_s = w_e · x`, the input row `s` of `x`
-    /// with `per_slot`, else row `s / k`.
+    /// [`Self::encode_moe_map`]: `out_s = w_e · x` (or fused SwiGLU with `up`),
+    /// the input row `s` of `x` with `per_slot`, else row `s / k`.
+    #[expect(clippy::too_many_arguments, reason = "one dispatch")]
     fn encode_matmul_id(
         &mut self,
         w: &Experts,
+        up: Option<&Experts>,
         x: &Buffer,
         out: &Buffer,
         k: usize,
         per_slot: bool,
+        barrier: bool,
     ) {
         if !self.reserve(1) {
             return;
@@ -733,6 +864,10 @@ impl MetalBackend<'_> {
                 .matmul_id(f.ty)
                 .ok_or_else(|| format!("no expert matrix kernel for {} weights", f.ty))?;
             let (tiles, ids, _) = self.moe_map.as_ref().ok_or("no expert map")?;
+            let (mode, w2, row_tile) = match up {
+                Some(u) => (kernels::MATVEC_SWIGLU, u, kernels::MATMUL_ROWS / 2),
+                None => (kernels::MATVEC_STORE, w, kernels::MATMUL_ROWS),
+            };
             let args = MatmulIdArgs {
                 cols: u32_of(f.cols, "a matrix width")?,
                 rows: u32_of(f.rows, "a matrix height")?,
@@ -740,15 +875,21 @@ impl MetalBackend<'_> {
                 expert_bytes: u32_of(f.rows * f.row_bytes, "an expert")?,
                 k: u32_of(k, "an expert count")?,
                 per_slot: u32::from(per_slot),
+                mode,
             };
-            let (w_buffer, w_offset) = self
-                .weights
-                .locate(&w.all())
-                .ok_or_else(|| format!("experts at byte {} are outside the model", f.offset))?;
+            let locate = |e: &Experts| {
+                self.weights.locate(&e.all()).ok_or_else(|| {
+                    format!("experts at byte {} are outside the model", e.first.offset)
+                })
+            };
+            let (w_buffer, w_offset) = locate(w)?;
+            let (w2_buffer, w2_offset) = locate(w2)?;
             let slots = self.n * k;
             let max_tiles = slots.div_ceil(32) + w.count.min(slots);
             let commands = self.commands.as_mut().ok_or("no commands")?;
-            commands.barrier();
+            if barrier {
+                commands.barrier();
+            }
             commands.set_pipeline(pipeline);
             commands.set_bytes(0, &args);
             commands.set_buffer(1, w_buffer, w_offset);
@@ -756,9 +897,10 @@ impl MetalBackend<'_> {
             commands.set_buffer(3, tiles, 0);
             commands.set_buffer(4, ids, 0);
             commands.set_buffer(5, out, 0);
+            commands.set_buffer(6, w2_buffer, w2_offset);
             commands.set_threadgroup_memory(0, kernels::MATMUL_SMEM);
             commands.dispatch(
-                Size::new(max_tiles, f.rows.div_ceil(kernels::MATMUL_ROWS), 1),
+                Size::new(max_tiles, f.rows.div_ceil(row_tile), 1),
                 Size::new(kernels::MATMUL_THREADS, 1, 1),
             );
             Ok::<_, String>(())
@@ -788,6 +930,7 @@ impl MetalBackend<'_> {
         if self.n == 0 || !self.reserve(1) {
             return;
         }
+        let rms_in = self.rms_input_for(x, 0);
         let Some(commands) = self.commands.as_mut() else {
             return;
         };
@@ -807,6 +950,7 @@ impl MetalBackend<'_> {
             };
             let nsg = mv.nsg(f.cols);
             let (_, nr0, _) = mv.pipeline(1);
+            let (rms_in_len, rms_in_off, rms_in_eps) = rms_in.unwrap_or((0, 0, 0.0));
             let args = MatvecArgs {
                 cols: u32_of(f.cols, "a matrix width")?,
                 rows: u32_of(f.rows, "a matrix height")?,
@@ -814,6 +958,10 @@ impl MetalBackend<'_> {
                 nsg,
                 mode,
                 ncols: 1,
+                rms_in_len,
+                rms_in_off,
+                rms_in_eps,
+                rms_out_off: 0,
             };
             let moe = MoeArgs {
                 k: u32_of(k, "an expert count")?,
@@ -836,6 +984,7 @@ impl MetalBackend<'_> {
             commands.set_buffer(4, w2_buffer, w2_offset);
             commands.set_buffer(5, route, 0);
             commands.set_bytes(6, &moe);
+            commands.set_buffer(7, &self.rms_sums, 0);
             if mv.smem(nr0) > 0 {
                 commands.set_threadgroup_memory(0, mv.smem(nr0));
             }
@@ -846,6 +995,7 @@ impl MetalBackend<'_> {
         if let Err(e) = result {
             self.fail(e);
         }
+        self.clear_rms_if(out);
     }
 }
 
@@ -854,8 +1004,8 @@ fn matmul_covers(pipelines: &Pipelines, w: &Weight) -> bool {
     w.cols.is_multiple_of(32) && pipelines.matmul(w.ty).is_some()
 }
 
-/// Encodes `out = w · x` (`out += w · x` with `add`) for the `n` rows of
-/// `x` into `commands`, with the matrix-matrix kernel of `w`'s type.
+/// Encodes `out = w · x` (or as `output` says) for the `n` rows of `x` into
+/// `commands`, with the matrix-matrix kernel of `w`'s type.
 #[expect(clippy::too_many_arguments, reason = "one dispatch")]
 fn encode_matmul(
     commands: &mut Commands,
@@ -864,7 +1014,7 @@ fn encode_matmul(
     w: &Weight,
     x: &Buffer,
     out: &Buffer,
-    add: bool,
+    output: Output<'_>,
     n: usize,
 ) -> std::result::Result<(), String> {
     let pipeline = pipelines
@@ -873,30 +1023,44 @@ fn encode_matmul(
     if !w.cols.is_multiple_of(32) {
         return Err(format!("{} columns is not a multiple of 32", w.cols));
     }
+    let (mode, w2, row_tile) = match output {
+        Output::Store => (kernels::MATVEC_STORE, w, kernels::MATMUL_ROWS),
+        Output::Add => (kernels::MATVEC_ADD, w, kernels::MATMUL_ROWS),
+        Output::SwiGlu(up) => {
+            if (up.ty, up.cols, up.rows, up.row_bytes) != (w.ty, w.cols, w.rows, w.row_bytes) {
+                return Err("the SwiGLU products differ in type or shape".to_owned());
+            }
+            (kernels::MATVEC_SWIGLU, up, kernels::MATMUL_ROWS / 2)
+        }
+        Output::ResidualNorm { .. } => {
+            return Err("residual-norm fusion is decode-only".to_owned());
+        }
+    };
     let args = MatmulArgs {
         cols: u32_of(w.cols, "a matrix width")?,
         rows: u32_of(w.rows, "a matrix height")?,
         row_bytes: u32_of(w.row_bytes, "a matrix row")?,
         n: u32_of(n, "a batch")?,
-        mode: if add {
-            kernels::MATVEC_ADD
-        } else {
-            kernels::MATVEC_STORE
-        },
+        mode,
     };
-    let (w_buffer, w_offset) = weights
-        .locate(w)
-        .ok_or_else(|| format!("a weight at byte {} is outside the model", w.offset))?;
+    let locate = |w: &Weight| {
+        weights
+            .locate(w)
+            .ok_or_else(|| format!("a weight at byte {} is outside the model", w.offset))
+    };
+    let (w_buffer, w_offset) = locate(w)?;
+    let (w2_buffer, w2_offset) = locate(w2)?;
     commands.set_pipeline(pipeline);
     commands.set_bytes(0, &args);
     commands.set_buffer(1, w_buffer, w_offset);
     commands.set_buffer(2, x, 0);
     commands.set_buffer(3, out, 0);
+    commands.set_buffer(4, w2_buffer, w2_offset);
     commands.set_threadgroup_memory(0, kernels::MATMUL_SMEM);
     commands.dispatch(
         Size::new(
             n.div_ceil(kernels::MATMUL_INPUTS),
-            w.rows.div_ceil(kernels::MATMUL_ROWS),
+            w.rows.div_ceil(row_tile),
             1,
         ),
         Size::new(kernels::MATMUL_THREADS, 1, 1),
@@ -911,6 +1075,9 @@ fn encode_matvec(
     commands: &mut Commands,
     pipelines: &Pipelines,
     weights: &Weights<'_>,
+    params: &Buffer,
+    rms_sums: &Buffer,
+    rms_in: Option<(u32, u32, f32)>,
     w: &Weight,
     (x, x_at): (&Buffer, usize),
     (out, out_at): (&Buffer, usize),
@@ -923,20 +1090,33 @@ fn encode_matvec(
     if !w.cols.is_multiple_of(4) {
         return Err(format!("{} columns is not a multiple of 4", w.cols));
     }
-    let (mode, w2, virtual_rows) = match output {
-        Output::Store => (kernels::MATVEC_STORE, w, w.rows),
-        Output::Add => (kernels::MATVEC_ADD, w, w.rows),
+    let (mode, w2, virtual_rows, norm_offset, xn, rms_out_off) = match output {
+        Output::Store => (kernels::MATVEC_STORE, w, w.rows, 0, out, 0),
+        Output::Add => (kernels::MATVEC_ADD, w, w.rows, 0, out, 0),
         Output::SwiGlu(up) => {
             if (up.ty, up.cols, up.rows, up.row_bytes) != (w.ty, w.cols, w.rows, w.row_bytes) {
                 return Err("the SwiGLU products differ in type or shape".to_owned());
             }
-            (kernels::MATVEC_SWIGLU, up, 2 * w.rows)
+            (kernels::MATVEC_SWIGLU, up, 2 * w.rows, 0, out, 0)
         }
+        Output::ResidualNorm {
+            norm_offset,
+            xn,
+            out_off,
+        } => (
+            kernels::MATVEC_RESIDUAL_NORM,
+            w,
+            w.rows,
+            norm_offset,
+            xn,
+            out_off,
+        ),
     };
     let nsg = mv.nsg(w.cols);
     let (pipeline, nr0, nc) = mv.pipeline(ncols);
     // The one-input kernel goes through the inputs itself.
     let col_groups = if nc == 1 { 1 } else { ncols.div_ceil(nc) };
+    let (rms_in_len, rms_in_off, rms_in_eps) = rms_in.unwrap_or((0, 0, 0.0));
     let args = MatvecArgs {
         cols: u32_of(w.cols, "a matrix width")?,
         rows: u32_of(w.rows, "a matrix height")?,
@@ -944,6 +1124,10 @@ fn encode_matvec(
         nsg,
         mode,
         ncols: u32_of(ncols, "a batch")?,
+        rms_in_len,
+        rms_in_off,
+        rms_in_eps,
+        rms_out_off,
     };
     commands.set_pipeline(pipeline);
     commands.set_buffer(2, x, x_at);
@@ -958,6 +1142,9 @@ fn encode_matvec(
     commands.set_buffer(1, w_buffer, w_offset);
     commands.set_buffer(3, out, out_at);
     commands.set_buffer(4, w2_buffer, w2_offset);
+    commands.set_buffer(5, params, norm_offset);
+    commands.set_buffer(6, xn, 0);
+    commands.set_buffer(7, rms_sums, 0);
     if mv.smem(nr0) > 0 {
         commands.set_threadgroup_memory(0, mv.smem(nr0));
     }
@@ -1003,6 +1190,7 @@ fn check_wide_matvecs(
          -> std::result::Result<Vec<f32>, String> {
             let mut xbuf = device.buffer(4 * x.len())?;
             let out = device.buffer(4 * ncols * rows)?;
+            let dummy = device.buffer(4)?;
             // SAFETY: the buffers are new; no command uses them yet.
             unsafe { store(&mut xbuf, x) };
             let mut commands = device.commands()?;
@@ -1010,6 +1198,9 @@ fn check_wide_matvecs(
                 &mut commands,
                 pipelines,
                 &weights,
+                &dummy,
+                &dummy,
+                None,
                 &w,
                 (&xbuf, 0),
                 (&out, 0),
@@ -1104,6 +1295,7 @@ impl Backend for MetalBackend<'_> {
         if self.n == 0 || !self.reserve(1) {
             return;
         }
+        self.moe_mapped = None;
         let Some(commands) = self.commands.as_mut() else {
             return;
         };
@@ -1128,16 +1320,21 @@ impl Backend for MetalBackend<'_> {
     ) {
         let (g, u) = (&gate.first, &up.first);
         let route = &route.buffer;
+        let same_shape = (g.ty, g.cols, g.rows, g.row_bytes) == (u.ty, u.cols, u.rows, u.row_bytes);
         if self.moe_matmul(gate) && self.moe_matmul(up) {
             if self.encode_moe_map(route, k, gate.count) {
-                self.encode_matmul_id(gate, &x.buffer, &out.buffer, k, false);
-                self.encode_matmul_id(up, &x.buffer, &up_out.buffer, k, false);
-                let n = self.n * k * g.rows;
-                self.elementwise(|p| &p.swiglu, n, &[&out.buffer, &up_out.buffer]);
+                if same_shape {
+                    self.encode_matmul_id(gate, Some(up), &x.buffer, &out.buffer, k, false, true);
+                } else {
+                    self.encode_matmul_id(gate, None, &x.buffer, &out.buffer, k, false, true);
+                    self.encode_matmul_id(up, None, &x.buffer, &up_out.buffer, k, false, false);
+                    let n = self.n * k * g.rows;
+                    self.elementwise(|p| &p.swiglu, n, &[&out.buffer, &up_out.buffer]);
+                }
             }
             return;
         }
-        if (g.ty, g.cols, g.rows, g.row_bytes) == (u.ty, u.cols, u.rows, u.row_bytes) {
+        if same_shape {
             let output = Output::SwiGlu(&up.first);
             return self.encode_matvec_id(
                 gate,
@@ -1184,7 +1381,7 @@ impl Backend for MetalBackend<'_> {
         let (route, products) = (&route.buffer, &products.buffer);
         if self.moe_matmul(down) {
             if self.encode_moe_map(route, k, down.count) {
-                self.encode_matmul_id(down, &hidden.buffer, products, k, true);
+                self.encode_matmul_id(down, None, &hidden.buffer, products, k, true, true);
             }
         } else {
             self.encode_matvec_id(
@@ -1200,6 +1397,7 @@ impl Backend for MetalBackend<'_> {
         let args = MoeSumArgs {
             n: e as u32,
             k: k as u32,
+            eps: 0.0,
         };
         if self.n > 0
             && self.reserve(1)
@@ -1235,17 +1433,23 @@ impl Backend for MetalBackend<'_> {
         {
             commands.barrier();
             commands.set_pipeline(&self.pipelines.moe_residual);
-            commands.set_bytes(0, &MoeSumArgs { n: e as u32, k: 0 });
+            commands.set_bytes(
+                0,
+                &MoeSumArgs {
+                    n: e as u32,
+                    k: 0,
+                    eps,
+                },
+            );
             commands.set_buffer(1, &moe.buffer, 0);
             commands.set_buffer(2, &shared.buffer, 0);
             commands.set_buffer(3, &gate.buffer, 0);
             commands.set_buffer(4, &x.buffer, 0);
-            commands.dispatch(
-                Size::new(e.div_ceil(THREADS), self.n, 1),
-                Size::new(THREADS, 1, 1),
-            );
+            commands.set_buffer(5, &self.params, Self::param_offset(norm));
+            commands.set_buffer(6, &out.buffer, 0);
+            commands.dispatch(Size::new(self.n, 1, 1), Size::new(THREADS, 1, 1));
+            self.clear_rms_if(&out.buffer);
         }
-        self.rmsnorm(x, norm, eps, out);
     }
 
     fn check_delta_net(&self, d: DeltaNetDims) -> Result<()> {
@@ -1274,15 +1478,43 @@ impl Backend for MetalBackend<'_> {
     }
 
     fn read(&mut self, v: &MetalVector, out: &mut [f32]) -> Result<()> {
+        let pending = self
+            .pending_rms
+            .take_if(|p| p.buf == v.buffer.contents() as usize);
+        let mut scales = Vec::new();
+        if let Some(p) = pending {
+            while let Some(commands) = self.in_flight.pop_front() {
+                if let Err(e) = commands.wait() {
+                    self.gpu_error.get_or_insert(e);
+                }
+            }
+            // SAFETY: every committed command buffer has completed.
+            let bytes = unsafe { self.rms_sums.bytes() };
+            for t in 0..p.n {
+                let at = (p.off as usize + t) * 8;
+                let raw = u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+                let sum = (raw as f32) * (1.0 / 1_048_576.0);
+                scales.push(1.0 / (sum / p.len as f32 + p.eps).sqrt());
+            }
+        }
         self.sync()?;
         debug_assert!(self.commands.is_none(), "read inside a token");
         // SAFETY: every committed command buffer has completed, and no
         // token is being encoded, so nothing writes the buffer.
         unsafe { load(&v.buffer, &mut out[..v.len]) };
+        if let Some(p) = pending {
+            let len = p.len as usize;
+            for (t, &scale) in scales.iter().enumerate() {
+                for o in &mut out[t * len..(t + 1) * len] {
+                    *o *= scale;
+                }
+            }
+        }
         Ok(())
     }
 
     fn write(&mut self, v: &mut MetalVector, data: &[f32]) -> Result<()> {
+        self.clear_rms_if(&v.buffer);
         self.sync()?;
         debug_assert!(self.commands.is_none(), "write inside a token");
         // SAFETY: as in `read`.
@@ -1296,6 +1528,7 @@ impl Backend for MetalBackend<'_> {
         self.error = None;
         self.dispatches = 0;
         self.chunks = 0;
+        self.moe_mapped = None;
         self.commands = Some(self.device.commands().map_err(backend_error)?);
         Ok(())
     }
@@ -1319,6 +1552,7 @@ impl Backend for MetalBackend<'_> {
                 w.rows
             ));
         }
+        let rms_in = self.rms_input_for(&x.buffer, rows.start);
         // The logits are encoded into the last commands, which `commit`
         // takes: no `reserve`, which could commit them early.
         if let Some(commands) = self.commands.as_mut().filter(|_| self.error.is_none()) {
@@ -1327,6 +1561,9 @@ impl Backend for MetalBackend<'_> {
                 commands,
                 &self.pipelines,
                 &self.weights,
+                &self.params,
+                &self.rms_sums,
+                rms_in,
                 w,
                 (&x.buffer, 4 * rows.start * w.cols),
                 (&self.logits, 0),
@@ -1364,7 +1601,11 @@ impl Backend for MetalBackend<'_> {
                 w.offset
             ));
         }
-        for (t, &token) in tokens.iter().enumerate() {
+        self.clear_rms_if(&x.buffer);
+        // Batch up to 1024 tokens per dispatch (Metal's 4096-byte `setBytes`
+        // limit), turning `pp512` from 512 dispatches into 1.
+        const MAX_TOKENS: usize = 1024;
+        for (c, chunk) in tokens.chunks(MAX_TOKENS).enumerate() {
             if !self.reserve(1) {
                 return;
             }
@@ -1375,8 +1616,7 @@ impl Backend for MetalBackend<'_> {
             ) else {
                 return;
             };
-            // The rows are independent: one barrier before them all.
-            if t == 0 {
+            if c == 0 {
                 commands.barrier();
             }
             commands.set_pipeline(pipeline);
@@ -1384,16 +1624,16 @@ impl Backend for MetalBackend<'_> {
                 0,
                 &EmbedArgs {
                     cols,
-                    row: token,
+                    row: 0,
                     row_bytes,
-                    from_slot: 0,
+                    from_slot: 1,
                 },
             );
             commands.set_buffer(1, weights, offset);
-            commands.set_buffer(2, &x.buffer, 4 * t * w.cols);
-            commands.set_buffer(3, &self.slots, 0);
+            commands.set_buffer(2, &x.buffer, 4 * c * MAX_TOKENS * w.cols);
+            commands.set_slice(3, chunk);
             let (groups, threads) = Self::groups(w.cols.div_ceil(per_thread));
-            commands.dispatch(groups, threads);
+            commands.dispatch(Size::new(groups.width, chunk.len(), 1), threads);
         }
     }
 
@@ -1433,9 +1673,11 @@ impl Backend for MetalBackend<'_> {
         commands.set_buffer(3, &self.slots, 4 * slot);
         let (groups, threads) = Self::groups(w.cols.div_ceil(per_thread));
         commands.dispatch(groups, threads);
+        self.clear_rms_if(&x.buffer);
     }
 
     fn argmax(&mut self, x: &MetalVector, len: usize, slot: usize) {
+        self.flush_rms_if(&x.buffer);
         let n = match u32_of(len, "a vector length") {
             Ok(n) => n,
             Err(e) => return self.fail(e),
@@ -1482,14 +1724,18 @@ impl Backend for MetalBackend<'_> {
     }
 
     fn rotate(&mut self, x: &MetalVector, r: Rotation, out: &mut MetalVector) {
+        self.flush_rms_if(&x.buffer);
         self.encode_rotate(&x.buffer, r, false, &out.buffer);
+        self.clear_rms_if(&out.buffer);
     }
 
     fn unrotate(&mut self, x: &mut MetalVector, r: Rotation) {
+        self.flush_rms_if(&x.buffer);
         self.encode_rotate(&x.buffer, r, true, &x.buffer);
     }
 
     fn rmsnorm(&mut self, x: &MetalVector, w: Param, eps: f32, out: &mut MetalVector) {
+        self.flush_rms_if(&x.buffer);
         let args = RmsArgs {
             n: w.len() as u32,
             eps,
@@ -1508,6 +1754,7 @@ impl Backend for MetalBackend<'_> {
         commands.set_buffer(2, &self.params, Self::param_offset(w));
         commands.set_buffer(3, &out.buffer, 0);
         commands.dispatch(Size::new(self.n, 1, 1), Size::new(THREADS, 1, 1));
+        self.clear_rms_if(&out.buffer);
     }
 
     fn norm_pair(
@@ -1519,6 +1766,8 @@ impl Backend for MetalBackend<'_> {
         eps: f32,
         out: &mut MetalVector,
     ) {
+        self.flush_rms_if(&a.buffer);
+        self.flush_rms_if(&b.buffer);
         let (da, db) = (wa.len(), wb.len());
         // Every norm reads and writes rows of its own: one barrier first.
         for t in 0..self.n {
@@ -1550,6 +1799,7 @@ impl Backend for MetalBackend<'_> {
                 commands.dispatch(Size::new(1, 1, 1), Size::new(THREADS, 1, 1));
             }
         }
+        self.clear_rms_if(&out.buffer);
     }
 
     fn copy_rows(
@@ -1561,6 +1811,7 @@ impl Backend for MetalBackend<'_> {
         rows: usize,
         len: usize,
     ) {
+        self.flush_rms_if(&src.buffer);
         let n = rows * len;
         if n == 0 || !self.reserve(1) {
             return;
@@ -1575,6 +1826,7 @@ impl Backend for MetalBackend<'_> {
         commands.set_buffer(2, &dst.buffer, 4 * to * len);
         let (groups, threads) = Self::groups(n);
         commands.dispatch(groups, threads);
+        self.clear_rms_if(&dst.buffer);
     }
 
     fn residual(
@@ -1586,6 +1838,38 @@ impl Backend for MetalBackend<'_> {
         eps: f32,
         out: &mut MetalVector,
     ) {
+        // For decode and draft-verification batches (up to `MATMUL_MIN_BATCH`),
+        // fuse `x += w · a` with `out = x * norm` and accumulate `Σ x²` in
+        // 64-bit fixed-point (`atomic_ulong`), eliminating the separate
+        // `rmsnorm` dispatch and barrier while staying bit-identical across
+        // runs and across batch sizes 1..=16.
+        if (1..=MATMUL_MIN_BATCH).contains(&self.n)
+            && self.rms_used + self.n <= RMS_GROUPS * MAX_LOGIT_ROWS
+            && a.buffer.contents() != x.buffer.contents()
+            && out.buffer.contents() != x.buffer.contents()
+        {
+            let out_off = self.rms_used as u32;
+            self.rms_used += self.n;
+            self.encode_matvec(
+                w,
+                &a.buffer,
+                &x.buffer,
+                Output::ResidualNorm {
+                    norm_offset: Self::param_offset(norm),
+                    xn: &out.buffer,
+                    out_off,
+                },
+                true,
+            );
+            self.pending_rms = Some(PendingRms {
+                buf: out.buffer.contents() as usize,
+                off: out_off,
+                n: self.n,
+                len: w.rows as u32,
+                eps,
+            });
+            return;
+        }
         self.encode_matvec(w, &a.buffer, &x.buffer, Output::Add, true);
         self.rmsnorm(x, norm, eps, out);
     }
@@ -1611,12 +1895,8 @@ impl Backend for MetalBackend<'_> {
         up_out: &mut MetalVector,
     ) {
         let x = &x.buffer;
-        // A prompt batch multiplies both matrices, then applies the SwiGLU,
-        // as llama.cpp does.
-        let matmul = self.n > MATMUL_MIN_BATCH && matmul_covers(&self.pipelines, gate);
-        if !matmul
-            && (gate.ty, gate.cols, gate.rows, gate.row_bytes)
-                == (up.ty, up.cols, up.rows, up.row_bytes)
+        if (gate.ty, gate.cols, gate.rows, gate.row_bytes)
+            == (up.ty, up.cols, up.rows, up.row_bytes)
         {
             return self.encode_matvec(gate, x, &out.buffer, Output::SwiGlu(up), true);
         }
@@ -1688,19 +1968,27 @@ impl Backend for MetalBackend<'_> {
         let staged = kv != KvTypes::default();
         let shape =
             kernels::PromptAttention::new(group, hd, staged, self.device.max_threadgroup_memory());
-        fn flash(p: &Pipelines, staged: bool, hd: usize) -> Option<&Pipeline> {
-            if staged {
-                p.attention_prompt_staged(hd)
-            } else {
-                p.attention_prompt(hd)
-            }
-        }
         let prompt = n > MATMUL_MIN_BATCH
             && shape.is_some_and(|s| {
-                flash(&self.pipelines, staged, hd).is_some_and(|p| p.max_threads() >= 32 * s.nsg)
+                self.pipelines
+                    .attention_prompt_for(kv, hd)
+                    .is_some_and(|p| p.max_threads() >= 32 * s.nsg)
             });
         if let (true, Some(shape)) = (prompt, shape) {
-            let prep = args(cache.len, 0, 0);
+            let n_padded = n.next_multiple_of(8);
+            let q_half_len = c.n_head * n_padded * hd;
+            if self.q_half.as_ref().is_none_or(|q| q.1 < q_half_len) {
+                match self.device.buffer(2 * q_half_len) {
+                    Ok(buf) => {
+                        if let Some((old, _)) = self.q_half.replace((buf, q_half_len)) {
+                            self.retired.push(old);
+                        }
+                    }
+                    Err(e) => return self.fail(e),
+                }
+            }
+            // `chunk` carries `n` and `n_chunks` carries `n_padded` for `attention_prep`.
+            let prep = args(cache.len, n, n_padded);
             let flash_args = FlashArgs {
                 n: n as u32,
                 n_past: cache.len as u32,
@@ -1716,16 +2004,19 @@ impl Backend for MetalBackend<'_> {
                 v_type: prep.v_type,
                 k_row: prep.k_row,
                 v_row: prep.v_row,
+                n_padded: n_padded as u32,
             };
             cache.len += n;
             if !self.reserve(2) {
                 return;
             }
-            let Some(commands) = self.commands.as_mut() else {
+            let (Some(commands), Some((q_half, _))) =
+                (self.commands.as_mut(), self.q_half.as_ref())
+            else {
                 return;
             };
             let p = &self.pipelines;
-            let Some(flash) = flash(p, staged, hd) else {
+            let Some(flash) = p.attention_prompt_for(kv, hd) else {
                 return;
             };
             commands.barrier();
@@ -1738,9 +2029,10 @@ impl Backend for MetalBackend<'_> {
             commands.set_buffer(5, &self.params, k_norm);
             commands.set_buffer(6, &cache.k, 0);
             commands.set_buffer(7, &cache.v, 0);
+            commands.set_buffer(8, q_half, 0);
             commands.set_threadgroup_memory(0, 4 * 2 * hd);
             commands.dispatch(
-                Size::new(c.n_head + c.n_head_kv, n, 1),
+                Size::new(c.n_head + c.n_head_kv, n_padded, 1),
                 Size::new(32 * ATTENTION_SIMDGROUPS, 1, 1),
             );
             commands.barrier();
@@ -1750,6 +2042,7 @@ impl Backend for MetalBackend<'_> {
             commands.set_buffer(2, &cache.k, 0);
             commands.set_buffer(3, &cache.v, 0);
             commands.set_buffer(4, &out.buffer, 0);
+            commands.set_buffer(5, q_half, 0);
             commands.set_threadgroup_memory(0, shape.smem);
             commands.dispatch(
                 Size::new(

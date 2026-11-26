@@ -78,6 +78,7 @@ kernel void moe_route(
 struct MoeSumArgs {
     uint n;
     uint k;
+    float eps;
 };
 
 // `out[t][i] = Σ_j w_tj * e[t·k + j][i]`, from the first slot on, for rows
@@ -101,20 +102,36 @@ kernel void moe_combine(
     out[(uint64_t) t * a.n + i] = acc;
 }
 
-// `x[t][i] += moe[t][i] + shared[t][i] * sigmoid(gate[t])`.
+// Fused `x[t][i] += moe[t][i] + shared[t][i] * sigmoid(gate[t])`, then
+// `out[t][i] = rmsnorm(x[t])[i] * norm[i]`: one threadgroup per token.
 kernel void moe_residual(
         constant MoeSumArgs & a [[buffer(0)]],
         device const float * moe [[buffer(1)]],
         device const float * shared [[buffer(2)]],
         device const float * gate [[buffer(3)]],
         device float * x [[buffer(4)]],
-        uint2 pos [[thread_position_in_grid]]) {
-    const uint i = pos.x, t = pos.y;
-    if (i >= a.n) {
-        return;
+        device const float * norm [[buffer(5)]],
+        device float * out [[buffer(6)]],
+        uint t [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[N_SIMDWIDTH];
+    const uint64_t row = (uint64_t) t * a.n;
+    const float g = sigmoid(gate[t]);
+    float sum = 0.0f;
+    for (uint i = tid; i < a.n; i += ntg) {
+        const float v = x[row + i] + (moe[row + i] + shared[row + i] * g);
+        x[row + i] = v;
+        sum += v * v;
     }
-    const uint64_t at = (uint64_t) t * a.n + i;
-    x[at] += moe[at] + shared[at] * sigmoid(gate[t]);
+    sum = threadgroup_sum(sum, buf, tiisg, sgitg, nsg);
+    const float scale = 1.0f / sqrt(sum / a.n + a.eps);
+    for (uint i = tid; i < a.n; i += ntg) {
+        out[row + i] = x[row + i] * scale * norm[i];
+    }
 }
 
 // --- Expert products of a prompt batch ---------------------------------------
@@ -241,6 +258,7 @@ struct MatmulIdArgs {
     uint expert_bytes;
     uint k;
     uint per_slot;
+    uint mode;
 };
 
 template <typename S0, typename S1, typename block_q, short nl,
@@ -249,6 +267,7 @@ template <typename S0, typename S1, typename block_q, short nl,
 void matmul_id_impl(
         constant MatmulIdArgs & args,
         device const char * src0,
+        device const char * src0_up,
         device const char * src1,
         device const uint * tpe,
         device const int * ids,
@@ -274,18 +293,23 @@ void matmul_id_impl(
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*NK*sizeof(S0));
 
     const int tile = tgpig.x;
-    const int r0 = tgpig.y*NR0;
     if (tile >= (int) tpe[0]) {
         return;
     }
+    const bool is_swiglu = args.mode == MATVEC_SWIGLU;
+    const int r0 = is_swiglu ? tgpig.y * (NR0 / 2) : tgpig.y * NR0;
     const int im = tpe[1 + 3*tile];
     const int idb = tpe[1 + 3*tile + 1];
     const short nr1 = (short) min(tpe[1 + 3*tile + 2], (uint) NR1);
 
     const int ne0 = args.rows;
     const int ne00 = args.cols;
-    const short nr0 = (ne0 - r0 < NR0) ? (ne0 - r0) : NR0;
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short row_tile = is_swiglu ? (NR0 / 2) : NR0;
+    const short nr0 = (ne0 - r0 < row_tile) ? (ne0 - r0) : row_tile;
+    const short row_id = (short) tiitg / NL0;
+    const bool is_up = is_swiglu && row_id >= (NR0 / 2);
+    const short raw_row = is_up ? (row_id - NR0 / 2) : row_id;
+    const short lr0 = raw_row < nr0 ? raw_row : nr0 - 1;
     const short il0 = (tiitg % NL0);
     const short offset1 = il0/nl;
     const short iy = 8*(tiitg % NL1);
@@ -300,18 +324,19 @@ void matmul_id_impl(
     const int id = ids[idb + lr1];
     const int in_row = args.per_slot != 0 ? id : id / (int) args.k;
 
-    device const block_q * x = (device const block_q *)(src0 + (uint64_t) im*args.expert_bytes + (uint64_t) args.row_bytes*(r0 + lr0)) + offset1;
+    device const char * w_src = is_up ? src0_up : src0;
+    device const block_q * x = (device const block_q *)(w_src + (uint64_t) im*args.expert_bytes + (uint64_t) args.row_bytes*(r0 + lr0)) + offset1;
     device const T1 * y = (device const T1 *)(src1 + (uint64_t) 4*ne00*in_row + 4*iy);
 
     const bool has_hi = nr1 > NR1H;
     for (short i = 0; i < 8; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
-    const bool sg_active = has_hi || sgitg < 2;
 
     for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
         S0_4x4 temp_a;
         dequantize_func(x, il, temp_a);
+        const S1_2x4 temp_b = (S1_2x4)(*((device T1_2x4 *) y));
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -329,7 +354,7 @@ void matmul_id_impl(
             const short sy = (tiitg/NL1)/8;
             const short ly = (tiitg/NL1)%8;
             const short ib = 4*sx + sy;
-            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
+            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = temp_b;
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -338,7 +363,7 @@ void matmul_id_impl(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sg_active) {
+        if (has_hi) {
             threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
             threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
             FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
@@ -357,31 +382,71 @@ void matmul_id_impl(
                 lsma += 8*64;
                 lsmb += 4*64;
             }
+        } else {
+            // Up to 16 slots: all 4 simdgroups split the 64 rows as 16 rows
+            // each instead of leaving simdgroups 2 and 3 idle.
+            threadgroup const S0 * lsma = (sa + 2*64*sgitg);
+            threadgroup const S1 * lsmb = sb;
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                FOR_UNROLL (short i = 0; i < 4; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[i/2], ma[i%2], mc[i]);
+                }
+                lsma += 8*64;
+                lsmb += 4*64;
+            }
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg_active) {
+    if (has_hi) {
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
+    } else {
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 16*sgitg;
+        for (short i = 0; i < 4; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%2) + 8*NR0*(i/2), NR0, 0, false);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short j = sgitg; j < nr1; j += 4) {
-        const int slot = ids[idb + j];
-        device float  * D  = dst + r0 + (uint64_t) slot*ne0;
-        device float4 * D4 = (device float4 *) D;
-        threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
-        threadgroup float4 * C4 = (threadgroup float4 *) C;
-        int i = tiisg;
-        for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
+    if (is_swiglu) {
+        constexpr int H = NR0 / 2;
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int slot = ids[idb + j];
+            device float * D = dst + r0 + (uint64_t) slot * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+            if (tiisg < (ushort) nr0) {
+                const float g = C[tiisg];
+                const float u = C[H + tiisg];
+                D[tiisg] = silu(g) * u;
+            }
         }
-        i = (4*(nr0/4)) + tiisg;
-        for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
+    } else {
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int slot = ids[idb + j];
+            device float  * D  = dst + r0 + (uint64_t) slot*ne0;
+            device float4 * D4 = (device float4 *) D;
+            threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
+            threadgroup float4 * C4 = (threadgroup float4 *) C;
+            int i = tiisg;
+            for (; i < nr0/4; i += 32) {
+                *(D4 + i) = *(C4 + i);
+            }
+            i = (4*(nr0/4)) + tiisg;
+            for (; i < nr0; i += 32) {
+                *(D + i) = *(C + i);
+            }
         }
     }
 }
@@ -394,12 +459,13 @@ kernel void name( \
         device const uint * tiles [[buffer(3)]], \
         device const int * ids [[buffer(4)]], \
         device float * dst [[buffer(5)]], \
+        device const char * w2 [[buffer(6)]], \
         threadgroup char * shmem [[threadgroup(0)]], \
         uint3 tgpig [[threadgroup_position_in_grid]], \
         ushort tiitg [[thread_index_in_threadgroup]], \
         ushort tiisg [[thread_index_in_simdgroup]], \
         ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    matmul_id_impl<S, S, block_q, nl, deq<typename value_type_4x4<S>::type>, float>(args, w, x, tiles, ids, dst, shmem, tgpig, tiitg, tiisg, sgitg); \
+    matmul_id_impl<S, S, block_q, nl, deq<typename value_type_4x4<S>::type>, float>(args, w, w2, x, tiles, ids, dst, shmem, tgpig, tiitg, tiisg, sgitg); \
 }
 
 MATMUL_ID_KERNEL(matmul_f32_id,     half,   float4x4,      1,     dequantize_f32)

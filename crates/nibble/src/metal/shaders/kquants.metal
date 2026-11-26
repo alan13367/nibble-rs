@@ -150,6 +150,7 @@ static inline void matvec_q3_K_impl(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         threadgroup char * shmem,
         uint3 tgpig,
         ushort tiisg,
@@ -269,7 +270,7 @@ static inline void matvec_q3_K_impl(
     }
 
     if (tiisg == 0) {
-        store_rows<NR0>(a, dst, first_row, sumf1);
+        store_rows<NR0>(a, dst, rms, first_row, sumf1);
     }
 }
 
@@ -285,6 +286,7 @@ static inline void matvec_q4_K_impl(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         threadgroup char * shmem,
         uint3 tgpig,
         ushort tiisg,
@@ -369,7 +371,7 @@ static inline void matvec_q4_K_impl(
         sumf[row] = simd_sum(sumf[row]);
     }
     if (tiisg == 0) {
-        store_rows<NR0>(a, dst, first_row, sumf);
+        store_rows<NR0>(a, dst, rms, first_row, sumf);
     }
 }
 
@@ -386,6 +388,7 @@ static inline void matvec_q5_K_impl(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         threadgroup char * shmem,
         uint3 tgpig,
         ushort tiisg,
@@ -479,7 +482,7 @@ static inline void matvec_q5_K_impl(
         sumf[row] = simd_sum(sumf[row]);
     }
     if (tiisg == 0) {
-        store_rows<NR0>(a, dst, first_row, sumf);
+        store_rows<NR0>(a, dst, rms, first_row, sumf);
     }
 }
 
@@ -496,6 +499,7 @@ static inline void matvec_q6_K_impl(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         threadgroup char * shmem,
         uint3 tgpig,
         ushort tiisg,
@@ -565,7 +569,7 @@ static inline void matvec_q6_K_impl(
         sumf[row] = simd_sum(sumf[row]);
     }
     if (tiisg == 0) {
-        store_rows<NR0>(a, dst, first_row, sumf);
+        store_rows<NR0>(a, dst, rms, first_row, sumf);
     }
 }
 
@@ -586,6 +590,7 @@ static inline void matvec_q6_K_nc(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         short nc,
         threadgroup char * shmem,
         uint3 tgpig,
@@ -655,7 +660,7 @@ static inline void matvec_q6_K_nc(
         }
     }
 
-    simd_write_nc<NR0, NC>(a, dst, sumf, nc, first_row, tiisg);
+    simd_write_nc<NR0, NC>(a, dst, rms, sumf, nc, first_row, tiisg);
 }
 
 MATVEC_KERNEL_NC(matvec_q6_K_c2, matvec_q6_K_nc, 2, 2)
@@ -677,45 +682,53 @@ static inline void embed_write16(device float * x, uint64_t at, thread const flo
 
 kernel void embed_q3_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
+        uint2 pos [[thread_position_in_grid]]) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols / 16) {
-        device const block_q3_K * b = (device const block_q3_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
+        device const block_q3_K * b = (device const block_q3_K *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q3_K(b, (short) (i % 16), reg);
-        embed_write16(x, 16 * i, reg);
+        embed_write16(x + (uint64_t) t * a.cols, 16 * i, reg);
     }
 }
 
 kernel void embed_q4_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
+        uint2 pos [[thread_position_in_grid]]) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols / 16) {
-        device const block_q4_K * b = (device const block_q4_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
+        device const block_q4_K * b = (device const block_q4_K *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q4_K(b, (short) (i % 16), reg);
-        embed_write16(x, 16 * i, reg);
+        embed_write16(x + (uint64_t) t * a.cols, 16 * i, reg);
     }
 }
 
 kernel void embed_q5_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
+        uint2 pos [[thread_position_in_grid]]) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols / 16) {
-        device const block_q5_K * b = (device const block_q5_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
+        device const block_q5_K * b = (device const block_q5_K *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q5_K(b, (short) (i % 16), reg);
-        embed_write16(x, 16 * i, reg);
+        embed_write16(x + (uint64_t) t * a.cols, 16 * i, reg);
     }
 }
 
 kernel void embed_q6_K(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
+        uint2 pos [[thread_position_in_grid]]) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols / 16) {
-        device const block_q6_K * b = (device const block_q6_K *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
+        device const block_q6_K * b = (device const block_q6_K *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes) + i / 16;
         float4x4 reg;
         dequantize_q6_K(b, (short) (i % 16), reg);
-        embed_write16(x, 16 * i, reg);
+        embed_write16(x + (uint64_t) t * a.cols, 16 * i, reg);
     }
 }
 
@@ -743,6 +756,7 @@ static inline void matvec_iq4_xs_impl(
         device const char * w2,
         device const float * y,
         device float * dst,
+        RmsCtx rms,
         threadgroup char * shmem,
         uint3 tgpig,
         ushort tiisg,
@@ -817,7 +831,7 @@ static inline void matvec_iq4_xs_impl(
         sumf[row] = simd_sum(sumf[row]);
     }
     if (tiisg == 0) {
-        store_rows<NR0>(a, dst, first_row, sumf);
+        store_rows<NR0>(a, dst, rms, first_row, sumf);
     }
 }
 
@@ -829,9 +843,11 @@ MATVEC_KERNEL(matvec_iq4_xs, matvec_iq4_xs_impl, 2)
 // them (`(d * scale) * value`).
 kernel void embed_iq4_xs(constant EmbedArgs & a [[buffer(0)]], device const char * w [[buffer(1)]],
         device float * x [[buffer(2)]], device const uint * slot [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
+        uint2 pos [[thread_position_in_grid]]) {
+    const uint i = pos.x;
+    const uint t = pos.y;
     if (i < a.cols / 16) {
-        device const block_iq4_xs * b = (device const block_iq4_xs *) (w + (uint64_t) embed_row(a, slot) * a.row_bytes) + i / 16;
+        device const block_iq4_xs * b = (device const block_iq4_xs *) (w + (uint64_t) embed_row(a, slot, t) * a.row_bytes) + i / 16;
         const short g = (i % 16) / 2;
         const short shift = 4 * (i % 2);
         const int ls = (((b->scales_l[g/2] >> 4*(g%2)) & 0xf) | (((b->scales_h >> 2*g) & 3) << 4)) - 32;
@@ -840,6 +856,6 @@ kernel void embed_iq4_xs(constant EmbedArgs & a [[buffer(0)]], device const char
         for (short j = 0; j < 16; ++j) {
             reg[j/4][j%4] = dl * kvalues_iq4nl_f[(b->qs[16*g + j] >> shift) & 0xf];
         }
-        embed_write16(x, 16 * i, reg);
+        embed_write16(x + (uint64_t) t * a.cols, 16 * i, reg);
     }
 }

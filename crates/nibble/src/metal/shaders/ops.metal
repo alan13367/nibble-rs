@@ -33,6 +33,29 @@ kernel void rmsnorm(
     }
 }
 
+struct RmsApplyArgs {
+    uint n;
+    uint off;
+    float eps;
+};
+
+// Materializes rows `tgpig` of a vector whose elements hold `x * norm` by
+// applying its deferred RMS scale from the fixed-point `atomic_ulong` sum.
+kernel void rms_apply(
+        constant RmsApplyArgs & a [[buffer(0)]],
+        device float * x [[buffer(1)]],
+        device const ulong * sums [[buffer(2)]],
+        uint t [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const float sum = float(sums[a.off + t]) * (1.0f / 1048576.0f);
+    const float scale = rsqrt(sum / float(a.n) + a.eps);
+    device float * row = x + (uint64_t) t * a.n;
+    for (uint i = tid; i < a.n; i += ntg) {
+        row[i] *= scale;
+    }
+}
+
 struct CountArgs {
     uint n;
 };
@@ -483,6 +506,7 @@ kernel void attention_prep(
         device const float * k_norm [[buffer(5)]],
         device uchar * k_cache [[buffer(6)]],
         device uchar * v_cache [[buffer(7)]],
+        device half * q_half [[buffer(8)]],
         threadgroup float * shared [[threadgroup(0)]],
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort2 tid2 [[thread_position_in_threadgroup]],
@@ -493,17 +517,26 @@ kernel void attention_prep(
     const uint n_head = a.group * (a.kv_dim / hd);
     const uint head = tgpig.x;
     const uint t = tgpig.y;
+    const uint n_real = a.chunk;
+    const uint n_padded = a.n_chunks;
     const uint pos = a.n_pos + t;
     const ushort tid = tid2.x;
     threadgroup float * tmp = shared;
     threadgroup float * res = shared + hd;
     if (head < n_head) {
+        device half * dst = q_half + ((uint64_t) head * n_padded + t) * hd;
+        if (t >= n_real) {
+            for (uint d = tid; d < hd; d += ATT_THREADS) {
+                dst[d] = half(0.0h);
+            }
+            return;
+        }
         device float * qh = q + (uint64_t) t * n_head * a.q_stride + head * a.q_stride;
         norm_rope(a, qh, q_norm, pos, a.rot_k, tmp, res, buf, tid, tiisg, sgitg);
         for (uint d = tid; d < hd; d += ATT_THREADS) {
-            qh[d] = res[d];
+            dst[d] = half(res[d]);
         }
-    } else {
+    } else if (t < n_real) {
         const uint kh = head - n_head;
         const uint off = kh * hd;
         norm_rope(a, k_new + (uint64_t) t * a.kv_dim + off, k_norm, pos, a.rot_k, tmp, res, buf, tid, tiisg, sgitg);
@@ -534,189 +567,28 @@ struct FlashArgs {
     uint v_type;
     uint k_row;
     uint v_row;
+    uint n_padded;
 };
 
 // Cached positions `attention_prompt` takes at a time (the KV cache holds a
 // multiple of them).
 #define FLASH_C 32
 
-// Causal attention for 8 tokens per simdgroup: threadgroup `tgpig` takes
-// `heads` of the `group` query heads of key head `tgpig.y / slices` (slice
-// `tgpig.y % slices`) for `tiles` tiles of 8 tokens from `8 * tiles *
-// tgpig.x`, one head and tile per simdgroup. A simdgroup keeps its queries
-// in threadgroup memory (`half`) and its output in simdgroup matrices, and
-// goes through the cache `FLASH_C` positions at a time with an online
-// softmax (scores in f32); the keys and values are read from the f16 cache
-// directly. Simdgroups share no threadgroup memory, so they need no
-// threadgroup barriers.
-template <short HD>
-static inline void attention_prompt_impl(
-        constant FlashArgs & a,
-        device const float * q,
-        device const half * k_cache,
-        device const half * v_cache,
-        device float * out,
-        threadgroup char * shmem,
-        uint2 tgpig,
-        ushort tiisg,
-        ushort sgitg) {
-    constexpr short DT = HD / 8;
-    constexpr short CT = FLASH_C / 8;
-    const uint slices = a.group / a.heads;
-    const uint kh = tgpig.y / slices;
-    const uint g = (tgpig.y % slices) * a.heads + sgitg % a.heads;
-    const uint t0 = (tgpig.x * a.tiles + sgitg / a.heads) * 8;
-    if (t0 >= a.n) {
-        return;
-    }
-    const uint h = kh * a.group + g;
-    const uint q_row = a.n_head * a.q_stride;
-    const uint nsg = a.heads * a.tiles;
-    threadgroup half * qs = (threadgroup half *) shmem + sgitg * 8 * HD;
-    threadgroup float * ss = (threadgroup float *) (shmem + nsg * 8 * HD * 2) + sgitg * (8 * FLASH_C + 64);
-    threadgroup float * dg = ss + 8 * FLASH_C;
-
-    for (short i = tiisg; i < 8 * HD; i += N_SIMDWIDTH) {
-        const uint t = t0 + i / HD;
-        qs[i] = t < a.n ? half(q[(uint64_t) t * q_row + h * a.q_stride + i % HD]) : half(0.0f);
-    }
-    for (short i = tiisg; i < 64; i += N_SIMDWIDTH) {
-        dg[i] = 0.0f;
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    simdgroup_float8x8 o[DT];
-    FOR_UNROLL (short j = 0; j < DT; ++j) {
-        o[j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    }
-    float m[8];
-    float l[8];
-    FOR_UNROLL (short r = 0; r < 8; ++r) {
-        m[r] = -INFINITY;
-        l[r] = 0.0f;
-    }
-
-    device const half * kp = k_cache + kh * HD;
-    device const half * vp = v_cache + kh * HD;
-    // Every position up to the tile's last token.
-    const uint end = a.n_past + min(a.n, t0 + 8);
-    for (uint p0 = 0; p0 < end; p0 += FLASH_C) {
-        simdgroup_float8x8 s[CT];
-        FOR_UNROLL (short c = 0; c < CT; ++c) {
-            s[c] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        }
-        FOR_UNROLL (short k = 0; k < DT; ++k) {
-            simdgroup_half8x8 mq;
-            simdgroup_load(mq, qs + 8 * k, HD, 0, false);
-            FOR_UNROLL (short c = 0; c < CT; ++c) {
-                simdgroup_half8x8 mk;
-                simdgroup_load(mk, kp + (uint64_t) (p0 + 8 * c) * a.kv_dim + 8 * k, a.kv_dim, 0, true);
-                simdgroup_multiply_accumulate(s[c], mq, mk, s[c]);
-            }
-        }
-        FOR_UNROLL (short c = 0; c < CT; ++c) {
-            simdgroup_store(s[c], ss + 8 * c, FLASH_C, 0, false);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Lane `tiisg` takes position `p0 + tiisg` of each row.
-        const uint p = p0 + tiisg;
-        FOR_UNROLL (short r = 0; r < 8; ++r) {
-            const uint pos = a.n_past + t0 + r;
-            float v = ss[r * FLASH_C + tiisg] * a.scale;
-            v = p <= pos && p < end ? v : -INFINITY;
-            const float mn = max(m[r], simd_max(v));
-            const float e = exp(v - mn);
-            const float ms = exp(m[r] - mn);
-            l[r] = l[r] * ms + simd_sum(e);
-            m[r] = mn;
-            ss[r * FLASH_C + tiisg] = e;
-            if (tiisg == 0) {
-                dg[r * 9] = ms;
-            }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        simdgroup_float8x8 md;
-        simdgroup_load(md, dg, 8, 0, false);
-        FOR_UNROLL (short j = 0; j < DT; ++j) {
-            simdgroup_multiply(o[j], md, o[j]);
-        }
-        FOR_UNROLL (short c = 0; c < CT; ++c) {
-            simdgroup_float8x8 mp;
-            simdgroup_load(mp, ss + 8 * c, FLASH_C, 0, false);
-            FOR_UNROLL (short j = 0; j < DT; ++j) {
-                simdgroup_half8x8 mv;
-                simdgroup_load(mv, vp + (uint64_t) (p0 + 8 * c) * a.kv_dim + 8 * j, a.kv_dim, 0, false);
-                simdgroup_multiply_accumulate(o[j], mp, mv, o[j]);
-            }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Divide by the sums, then write 32 values of each row at a time.
-    FOR_UNROLL (short r = 0; r < 8; ++r) {
-        if (tiisg == r) {
-            dg[r * 9] = 1.0f / l[r];
-        }
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_float8x8 md;
-    simdgroup_load(md, dg, 8, 0, false);
-    FOR_UNROLL (short j = 0; j < DT; ++j) {
-        simdgroup_multiply(o[j], md, o[j]);
-    }
-    FOR_UNROLL (short j0 = 0; j0 < DT; j0 += 4) {
-        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
-            simdgroup_store(o[j0 + jj], ss + 8 * jj, FLASH_C, 0, false);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (short i = tiisg; i < 8 * FLASH_C; i += N_SIMDWIDTH) {
-            const uint t = t0 + i / FLASH_C;
-            const uint d = j0 * 8 + i % FLASH_C;
-            if (t < a.n) {
-                float v = ss[i];
-                if (a.gated != 0) {
-                    v *= sigmoid(q[(uint64_t) t * q_row + h * a.q_stride + HD + d]);
-                }
-                out[((uint64_t) t * a.n_head + h) * HD + d] = v;
-            }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-#define ATTENTION_PROMPT_KERNEL(HD) \
-kernel void attention_prompt_d##HD( \
-        constant FlashArgs & a [[buffer(0)]], \
-        device const float * q [[buffer(1)]], \
-        device const half * k_cache [[buffer(2)]], \
-        device const half * v_cache [[buffer(3)]], \
-        device float * out [[buffer(4)]], \
-        threadgroup char * shmem [[threadgroup(0)]], \
-        uint2 tgpig [[threadgroup_position_in_grid]], \
-        ushort tiisg [[thread_index_in_simdgroup]], \
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    attention_prompt_impl<HD>(a, q, k_cache, v_cache, out, shmem, tgpig, tiisg, sgitg); \
-}
-
-ATTENTION_PROMPT_KERNEL(64)
-ATTENTION_PROMPT_KERNEL(128)
-ATTENTION_PROMPT_KERNEL(256)
+// Removed duplicate `attention_prompt_impl`: `attention_prompt_d*` uses
+// `attention_prompt_staged_impl<HD, KV_F16, KV_F16>` below.
 
 // `attention_prompt` for caches of any type: the threadgroup dequantizes
 // each block of `FLASH_C` positions of the keys, then of the values, into
-// threadgroup memory (`half`, as ggml-metal's flash attention holds them),
-// which its simdgroups multiply from. The threadgroup goes through the
-// positions its last token sees; a simdgroup masks those its own tokens do
-// not.
-template <short HD>
+// threadgroup memory (`half`), which its simdgroups multiply from.
+// `K_TY`/`V_TY` specialize the dequantizer at compile time (255 = runtime type).
+template <short HD, uint K_TY, uint V_TY>
 static inline void attention_prompt_staged_impl(
         constant FlashArgs & a,
         device const float * q,
         device const uchar * k_cache,
         device const uchar * v_cache,
         device float * out,
+        device const half * q_half,
         threadgroup char * shmem,
         uint2 tgpig,
         ushort tid,
@@ -725,6 +597,7 @@ static inline void attention_prompt_staged_impl(
         ushort sgitg) {
     constexpr short DT = HD / 8;
     constexpr short CT = FLASH_C / 8;
+    constexpr short HALF_BLKS = HD / 16;
     const uint slices = a.group / a.heads;
     const uint kh = tgpig.y / slices;
     const uint g = (tgpig.y % slices) * a.heads + sgitg % a.heads;
@@ -732,15 +605,10 @@ static inline void attention_prompt_staged_impl(
     const uint h = kh * a.group + g;
     const uint q_row = a.n_head * a.q_stride;
     const uint nsg = a.heads * a.tiles;
-    threadgroup half * qs = (threadgroup half *) shmem + sgitg * 8 * HD;
-    threadgroup float * ss = (threadgroup float *) (shmem + nsg * 8 * HD * 2) + sgitg * (8 * FLASH_C + 64);
+    threadgroup float * ss = (threadgroup float *) shmem + sgitg * (8 * FLASH_C + 64);
     threadgroup float * dg = ss + 8 * FLASH_C;
-    threadgroup half * kvs = (threadgroup half *) (shmem + nsg * (8 * HD * 2 + (8 * FLASH_C + 64) * 4));
+    threadgroup half * kvs = (threadgroup half *) (shmem + nsg * (8 * FLASH_C + 64) * 4);
 
-    for (short i = tiisg; i < 8 * HD; i += N_SIMDWIDTH) {
-        const uint t = t0 + i / HD;
-        qs[i] = t < a.n ? half(q[(uint64_t) t * q_row + h * a.q_stride + i % HD]) : half(0.0f);
-    }
     for (short i = tiisg; i < 64; i += N_SIMDWIDTH) {
         dg[i] = 0.0f;
     }
@@ -757,17 +625,31 @@ static inline void attention_prompt_staged_impl(
         l[r] = 0.0f;
     }
 
-    const uint k_head = kv_bytes(a.k_type, HD);
-    const uint v_head = kv_bytes(a.v_type, HD);
+    const uint kt = K_TY == 255 ? a.k_type : K_TY;
+    const uint vt = V_TY == 255 ? a.v_type : V_TY;
+    const uint k_head = kv_bytes(kt, HD);
+    const uint v_head = kv_bytes(vt, HD);
+    const float scale_l2 = a.scale * 1.4426950408889634f;
     const uint end = a.n_past + min(a.n, t0 + 8);
+    const uint full_end = a.n_past + t0;
     const uint tg_end = a.n_past + min(a.n, (tgpig.x + 1) * a.tiles * 8);
+    // `q_half` is padded to `n_padded` (a multiple of 8), so every active
+    // simdgroup has 8 contiguous rows of `HD` halfs starting at `qp`.
+    const uint t0_safe = min(t0, a.n_padded - 8);
+    device const half * qp = q_half + ((uint64_t) h * a.n_padded + t0_safe) * HD;
+    threadgroup half * ps = (threadgroup half *) ss;
     for (uint p0 = 0; p0 < tg_end; p0 += FLASH_C) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < FLASH_C * HD / 4; i += ntg) {
-            const uint p = p0 + i / (HD / 4);
-            const uint e = 4 * (i % (HD / 4));
-            const float4 v = p < tg_end ? kv_load4(a.k_type, k_cache + (uint64_t) p * a.k_row + kh * k_head, e) : float4(0.0f);
-            *(threadgroup half4 *) (kvs + (i / (HD / 4)) * HD + e) = half4(v);
+        for (uint i = tid; i < FLASH_C * HALF_BLKS; i += ntg) {
+            const uint r = i / HALF_BLKS;
+            const uint hb = i % HALF_BLKS;
+            const uint p = p0 + r;
+            threadgroup half4 * dst = (threadgroup half4 *) (kvs + r * HD + hb * 16);
+            if (p < tg_end) {
+                kv_load16_half(kt, k_cache + (uint64_t) p * a.k_row + kh * k_head, hb >> 1, hb & 1, dst);
+            } else {
+                dst[0] = half4(0.0h); dst[1] = half4(0.0h); dst[2] = half4(0.0h); dst[3] = half4(0.0h);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -777,7 +659,7 @@ static inline void attention_prompt_staged_impl(
         }
         FOR_UNROLL (short k = 0; k < DT; ++k) {
             simdgroup_half8x8 mq;
-            simdgroup_load(mq, qs + 8 * k, HD, 0, false);
+            simdgroup_load(mq, qp + 8 * k, HD, 0, false);
             FOR_UNROLL (short c = 0; c < CT; ++c) {
                 simdgroup_half8x8 mk;
                 simdgroup_load(mk, kvs + 8 * c * HD + 8 * k, HD, 0, true);
@@ -790,38 +672,50 @@ static inline void attention_prompt_staged_impl(
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         const uint p = p0 + tiisg;
+        const bool masked = p0 + FLASH_C > full_end;
+        bool need_scale = false;
         FOR_UNROLL (short r = 0; r < 8; ++r) {
-            const uint pos = a.n_past + t0 + r;
-            float v = ss[r * FLASH_C + tiisg] * a.scale;
-            v = p <= pos && p < end ? v : -INFINITY;
+            float v = ss[r * FLASH_C + tiisg] * scale_l2;
+            if (masked) {
+                const uint pos = a.n_past + t0 + r;
+                v = p <= pos && p < end ? v : -INFINITY;
+            }
             const float mn = max(m[r], simd_max(v));
             // A tile past the batch sees no position: keep it finite.
-            const float e = mn == -INFINITY ? 0.0f : exp(v - mn);
-            const float ms = mn == -INFINITY ? 1.0f : exp(m[r] - mn);
+            const float e = mn == -INFINITY ? 0.0f : exp2(v - mn);
+            const float ms = (p0 == 0 || mn == -INFINITY) ? 1.0f : exp2(m[r] - mn);
+            need_scale = need_scale || (p0 > 0 && mn != -INFINITY && mn > m[r]);
             l[r] = l[r] * ms + simd_sum(e);
             m[r] = mn;
-            ss[r * FLASH_C + tiisg] = e;
+            ps[r * FLASH_C + tiisg] = half(e);
             if (tiisg == 0) {
                 dg[r * 9] = ms;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < FLASH_C * HD / 4; i += ntg) {
-            const uint p = p0 + i / (HD / 4);
-            const uint e = 4 * (i % (HD / 4));
-            const float4 v = p < tg_end ? kv_load4(a.v_type, v_cache + (uint64_t) p * a.v_row + kh * v_head, e) : float4(0.0f);
-            *(threadgroup half4 *) (kvs + (i / (HD / 4)) * HD + e) = half4(v);
+        for (uint i = tid; i < FLASH_C * HALF_BLKS; i += ntg) {
+            const uint r = i / HALF_BLKS;
+            const uint hb = i % HALF_BLKS;
+            const uint p = p0 + r;
+            threadgroup half4 * dst = (threadgroup half4 *) (kvs + r * HD + hb * 16);
+            if (p < tg_end) {
+                kv_load16_half(vt, v_cache + (uint64_t) p * a.v_row + kh * v_head, hb >> 1, hb & 1, dst);
+            } else {
+                dst[0] = half4(0.0h); dst[1] = half4(0.0h); dst[2] = half4(0.0h); dst[3] = half4(0.0h);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 md;
-        simdgroup_load(md, dg, 8, 0, false);
-        FOR_UNROLL (short j = 0; j < DT; ++j) {
-            simdgroup_multiply(o[j], md, o[j]);
+        if (need_scale) {
+            simdgroup_float8x8 md;
+            simdgroup_load(md, dg, 8, 0, false);
+            FOR_UNROLL (short j = 0; j < DT; ++j) {
+                simdgroup_multiply(o[j], md, o[j]);
+            }
         }
         FOR_UNROLL (short c = 0; c < CT; ++c) {
-            simdgroup_float8x8 mp;
-            simdgroup_load(mp, ss + 8 * c, FLASH_C, 0, false);
+            simdgroup_half8x8 mp;
+            simdgroup_load(mp, ps + 8 * c, FLASH_C, 0, false);
             FOR_UNROLL (short j = 0; j < DT; ++j) {
                 simdgroup_half8x8 mv;
                 simdgroup_load(mv, kvs + 8 * c * HD + 8 * j, HD, 0, false);
@@ -864,25 +758,35 @@ static inline void attention_prompt_staged_impl(
     }
 }
 
-#define ATTENTION_PROMPT_STAGED_KERNEL(HD) \
-kernel void attention_prompt_staged_d##HD( \
+#define ATTENTION_PROMPT_STAGED_KERNEL(name, HD, K_TY, V_TY) \
+kernel void name( \
         constant FlashArgs & a [[buffer(0)]], \
         device const float * q [[buffer(1)]], \
         device const uchar * k_cache [[buffer(2)]], \
         device const uchar * v_cache [[buffer(3)]], \
         device float * out [[buffer(4)]], \
+        device const half * q_half [[buffer(5)]], \
         threadgroup char * shmem [[threadgroup(0)]], \
         uint2 tgpig [[threadgroup_position_in_grid]], \
         ushort2 tid2 [[thread_position_in_threadgroup]], \
         ushort2 ntg2 [[threads_per_threadgroup]], \
         ushort tiisg [[thread_index_in_simdgroup]], \
         ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    attention_prompt_staged_impl<HD>(a, q, k_cache, v_cache, out, shmem, tgpig, tid2.x, ntg2.x, tiisg, sgitg); \
+    attention_prompt_staged_impl<HD, K_TY, V_TY>(a, q, k_cache, v_cache, out, q_half, shmem, tgpig, tid2.x, ntg2.x, tiisg, sgitg); \
 }
 
-ATTENTION_PROMPT_STAGED_KERNEL(64)
-ATTENTION_PROMPT_STAGED_KERNEL(128)
-ATTENTION_PROMPT_STAGED_KERNEL(256)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_d64, 64, KV_F16, KV_F16)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_d128, 128, KV_F16, KV_F16)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_d256, 256, KV_F16, KV_F16)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_q8_0_d64, 64, KV_Q8_0, KV_Q8_0)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_q8_0_d128, 128, KV_Q8_0, KV_Q8_0)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_q8_0_d256, 256, KV_Q8_0, KV_Q8_0)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_q4_0_d64, 64, KV_Q4_0, KV_Q4_0)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_q4_0_d128, 128, KV_Q4_0, KV_Q4_0)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_q4_0_d256, 256, KV_Q4_0, KV_Q4_0)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_staged_d64, 64, 255, 255)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_staged_d128, 128, 255, 255)
+ATTENTION_PROMPT_STAGED_KERNEL(attention_prompt_staged_d256, 256, 255, 255)
 
 // Head `tgpig.x` of token `tgpig.y` of an attention output, rotated back
 // (llama.cpp rotates the output of attention over a quantized value cache
@@ -1780,18 +1684,18 @@ kernel void delta_chunk_scan(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // M = y_C M + W^T K: this simdgroup's 32 columns of every row.
+        // Build `y_C I` once outside the 16-tile loop.
+        if (tiisg < 8) {
+            d[tiisg * 9] = yc;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 ycm;
+        simdgroup_load(ycm, d, 8, 0, false);
         for (short jb = 0; jb < NJ / 8; ++jb) {
             for (short ib = 0; ib < 4; ++ib) {
                 const short col = 32 * sgitg + 8 * ib;
                 simdgroup_float8x8 acc;
                 simdgroup_load(acc, m + 8 * jb * DHEAD + col, DHEAD, 0, false);
-                simdgroup_float8x8 ycm = make_filled_simdgroup_matrix<float, 8>(0.0f);
-                // A scalar times the tile, as a product with y_C I.
-                if (tiisg < 8) {
-                    d[tiisg * 9] = yc;
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-                simdgroup_load(ycm, d, 8, 0, false);
                 simdgroup_multiply(acc, ycm, acc);
                 for (short sb = 0; sb < DCHUNK / 8; ++sb) {
                     simdgroup_float8x8 wt;

@@ -423,6 +423,27 @@ impl Commands {
         };
     }
 
+    /// Copies `slice` into the argument table at `index` (at most 4096 bytes).
+    ///
+    /// # Panics
+    ///
+    /// If `slice` exceeds Metal's 4096-byte `setBytes` limit.
+    pub(crate) fn set_slice<T: KernelArgs>(&mut self, index: usize, slice: &[T]) {
+        let len = std::mem::size_of_val(slice);
+        assert!(len <= 4096, "setBytes slice ({len} bytes) exceeds 4096");
+        if len == 0 {
+            return;
+        }
+        // SAFETY: `setBytes:length:atIndex:` copies `len` initialized bytes
+        // from `slice.as_ptr()` now (`T: KernelArgs` has no padding).
+        unsafe {
+            send::<()>(
+                self.encoder(),
+                sel!("setBytes:length:atIndex:"),
+                (slice.as_ptr().cast::<c_void>(), len, index),
+            );
+        };
+    }
     /// Reserves `len` bytes of threadgroup memory at `index`.
     pub(crate) fn set_threadgroup_memory(&mut self, index: usize, len: usize) {
         // SAFETY: `setThreadgroupMemoryLength:atIndex:` takes two NSUIntegers.
@@ -540,3 +561,6 @@ impl Drop for Commands {
 /// The type must be `repr(C)` with no padding bytes (only 4-byte fields,
 /// for instance), and match the MSL struct the kernel declares.
 pub(crate) unsafe trait KernelArgs: Copy {}
+
+// SAFETY: `u32` is 4-byte aligned with no padding, matching MSL `uint`.
+unsafe impl KernelArgs for u32 {}

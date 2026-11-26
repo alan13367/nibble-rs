@@ -93,6 +93,91 @@ static inline float4 kv_load4(uint ty, device const uchar * head, uint e) {
     }
 }
 
+// Loads 16 values (`half_blk` = 0 for 0..16, 1 for 16..32) of block `blk`
+// of a cached head into `dst` (4 consecutive `half4`s in threadgroup memory).
+// One scale load and vectorized reads per 16 values, for `attention_prompt_staged`.
+static inline void kv_load16_half(uint ty, device const uchar * head, uint blk, uint half_blk, threadgroup half4 * dst) {
+    switch (ty) {
+        case KV_F16: {
+            device const half4 * p = (device const half4 *) (head + (blk * 32 + half_blk * 16) * 2);
+            dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2]; dst[3] = p[3];
+            return;
+        }
+        case KV_F32: {
+            device const float4 * p = (device const float4 *) (head + (blk * 32 + half_blk * 16) * 4);
+            dst[0] = half4(p[0]); dst[1] = half4(p[1]); dst[2] = half4(p[2]); dst[3] = half4(p[3]);
+            return;
+        }
+        case KV_BF16: {
+            device const bfloat4 * p = (device const bfloat4 *) (head + (blk * 32 + half_blk * 16) * 2);
+            dst[0] = half4(p[0]); dst[1] = half4(p[1]); dst[2] = half4(p[2]); dst[3] = half4(p[3]);
+            return;
+        }
+        case KV_Q8_0: {
+            device const uchar * b = head + blk * 34;
+            const half d = as_type<half>(ushort(b[0] | (b[1] << 8)));
+            device const packed_char4 * qs = (device const packed_char4 *) (b + 2 + half_blk * 16);
+            dst[0] = half4(qs[0]) * d;
+            dst[1] = half4(qs[1]) * d;
+            dst[2] = half4(qs[2]) * d;
+            dst[3] = half4(qs[3]) * d;
+            return;
+        }
+        case KV_Q4_0: {
+            device const uchar * b = head + blk * 18;
+            const half d = as_type<half>(ushort(b[0] | (b[1] << 8)));
+            const half md = half(-8.0f) * d;
+            device const uchar * qs = b + 2;
+            const uint shift = half_blk * 4;
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                const uchar4 q = uchar4(qs[4*j], qs[4*j+1], qs[4*j+2], qs[4*j+3]);
+                dst[j] = fma(half4((q >> shift) & 0x0F), d, md);
+            }
+            return;
+        }
+        case KV_IQ4_NL: {
+            device const uchar * b = head + blk * 18;
+            const half d = as_type<half>(ushort(b[0] | (b[1] << 8)));
+            device const uchar * qs = b + 2;
+            const uint shift = half_blk * 4;
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                const uchar4 q = (uchar4(qs[4*j], qs[4*j+1], qs[4*j+2], qs[4*j+3]) >> shift) & 0x0F;
+                dst[j] = half4(kvalues_iq4nl_f[q[0]], kvalues_iq4nl_f[q[1]], kvalues_iq4nl_f[q[2]], kvalues_iq4nl_f[q[3]]) * d;
+            }
+            return;
+        }
+        case KV_Q4_1: {
+            device const uchar * b = head + blk * 20;
+            const half d = as_type<half>(ushort(b[0] | (b[1] << 8)));
+            const half m = as_type<half>(ushort(b[2] | (b[3] << 8)));
+            device const uchar * qs = b + 4;
+            const uint shift = half_blk * 4;
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                const uchar4 q = uchar4(qs[4*j], qs[4*j+1], qs[4*j+2], qs[4*j+3]);
+                dst[j] = fma(half4((q >> shift) & 0x0F), d, m);
+            }
+            return;
+        }
+        default: {
+            const bool one = ty == KV_Q5_1;
+            device const uchar * b = head + blk * (one ? 24 : 22);
+            const half d = as_type<half>(ushort(b[0] | (b[1] << 8)));
+            const half m = one ? as_type<half>(ushort(b[2] | (b[3] << 8))) : half(-16.0f) * d;
+            device const uchar * h = b + (one ? 4 : 2);
+            const uint qh = (h[0] | (h[1] << 8) | (h[2] << 16) | (uint(h[3]) << 24)) >> (half_blk * 16);
+            device const uchar * qs = h + 4;
+            const uint shift = half_blk * 4;
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                const uint4 e = uint4(4*j, 4*j+1, 4*j+2, 4*j+3);
+                const uint4 ql = (uint4(qs[4*j], qs[4*j+1], qs[4*j+2], qs[4*j+3]) >> shift) & 0x0F;
+                const uint4 q5 = ql | (((uint4(qh) >> e) & 1u) << 4);
+                dst[j] = fma(half4(q5), d, m);
+            }
+            return;
+        }
+    }
+}
+
 // Bytes of `n` values of type `ty`.
 static inline uint kv_bytes(uint ty, uint n) {
     switch (ty) {

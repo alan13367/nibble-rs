@@ -165,12 +165,10 @@ void dequantize_q5_1(device const block_q5_1 * xb, short il, thread type4x4 & re
 template <typename type4x4>
 void dequantize_q8_0(device const block_q8_0 * xb, short il, thread type4x4 & reg) {
     device const packed_char4 * qs = (device const packed_char4 *) xb->qs;
-    const float d = xb->d;
-    float4x4 reg_f;
-    for (int i = 0; i < 4; ++i) {
-        reg_f[i] = float4(qs[4*il + i]) * d;
+    const half d = xb->d;
+    FOR_UNROLL (int i = 0; i < 4; ++i) {
+        reg[i] = half4(qs[4*il + i]) * d;
     }
-    reg = (type4x4) reg_f;
 }
 
 // ggml multiplies `e8m0_to_fp32(e)` by its table of halved values; nibble's
@@ -486,7 +484,7 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
 
 // Threadgroup memory of `matmul_*`: the weight and input tiles (64 × 32
 // and 32 × 32 values of `S0`/`S1`, at most 2 bytes each), or the 64 × 32
-// f32 results of a partial tile.
+// f32 results of a partial/fused tile.
 #define MATMUL_SMEM 8192
 
 template <typename S0, typename S1, typename block_q, short nl,
@@ -495,6 +493,7 @@ template <typename S0, typename S1, typename block_q, short nl,
 void matmul_impl(
         constant MatmulArgs & args,
         device const char * src0,
+        device const char * src0_up,
         device const char * src1,
         device float * dst,
         threadgroup char * shmem,
@@ -520,22 +519,31 @@ void matmul_impl(
     const int ne0 = args.rows;
     const int ne1 = args.n;
 
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    // For fused SwiGLU, each threadgroup computes 32 rows of `gate` (rows
+    // 0..32 of `sa`) and the same 32 rows of `up` (rows 32..64 of `sa`),
+    // sharing the `sb` input tile and applying `silu(g) * u` in the epilogue.
+    const bool is_swiglu = args.mode == MATVEC_SWIGLU;
+    const int r0 = is_swiglu ? tgpig.y * (NR0 / 2) : tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
 
     // A tile at the edge of the matrix or the batch may be smaller.
-    const short nr0 = (ne0 - r0 < NR0) ? (ne0 - r0) : NR0;
+    const short row_tile = is_swiglu ? (NR0 / 2) : NR0;
+    const short nr0 = (ne0 - r0 < row_tile) ? (ne0 - r0) : row_tile;
     const short nr1 = (ne1 - r1 < NR1) ? (ne1 - r1) : NR1;
 
     // Threads past the edge load the last row instead.
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short row_id = (short) tiitg / NL0;
+    const bool is_up = is_swiglu && row_id >= (NR0 / 2);
+    const short raw_row = is_up ? (row_id - NR0 / 2) : row_id;
+    const short lr0 = raw_row < nr0 ? raw_row : nr0 - 1;
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
 
     const short il0 = (tiitg % NL0);
     short il = il0;
     const short offset1 = il0/nl;
 
-    device const block_q * x = (device const block_q *)(src0 + (uint64_t) args.row_bytes*(r0 + lr0)) + offset1;
+    device const char * w_src = is_up ? src0_up : src0;
+    device const block_q * x = (device const block_q *)(w_src + (uint64_t) args.row_bytes*(r0 + lr0)) + offset1;
 
     const short iy = 8*(tiitg % NL1);
 
@@ -553,6 +561,7 @@ void matmul_impl(
     for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
         S0_4x4 temp_a;
         dequantize_func(x, il, temp_a);
+        const S1_2x4 temp_b = (S1_2x4)(*((device T1_2x4 *) y));
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -570,7 +579,7 @@ void matmul_impl(
             const short sy = (tiitg/NL1)/8;
             const short ly = (tiitg/NL1)%8;
             const short ib = 4*sx + sy;
-            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
+            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = temp_b;
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -607,7 +616,7 @@ void matmul_impl(
         }
     }
 
-    if (args.mode != MATVEC_ADD && r0 + NR0 <= ne0 && r1 + NR1 <= ne1) {
+    if (args.mode == MATVEC_STORE && r0 + NR0 <= ne0 && r1 + NR1 <= ne1) {
         device float * C = dst + (r0 + 32*(sgitg & 1)) + (uint64_t) (r1 + 16*(sgitg >> 1))*ne0;
 
         for (short i = 0; i < 8; i++) {
@@ -624,14 +633,44 @@ void matmul_impl(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (args.mode == MATVEC_ADD) {
-            // Every thread adds a share of the tile to the output.
-            for (int e = tiitg; e < NR0*NR1; e += 4*N_SIMDWIDTH) {
-                const int j = e / NR0;
-                const int i = e % NR0;
-                if (j < nr1 && i < nr0) {
-                    device float * D = dst + r0 + i + (uint64_t) (r1 + j)*ne0;
-                    *D = *D + ((threadgroup float *) shmem)[j*NR0 + i];
+        if (args.mode == MATVEC_SWIGLU) {
+            constexpr int H = NR0 / 2;
+            if (nr0 == H && (ne0 & 3) == 0) {
+                for (int e = tiitg; e < nr1 * (H / 4); e += 4 * N_SIMDWIDTH) {
+                    const int j = e / (H / 4);
+                    const int i4 = e % (H / 4);
+                    const float4 g = ((threadgroup float4 *) shmem)[j * (NR0 / 4) + i4];
+                    const float4 u = ((threadgroup float4 *) shmem)[j * (NR0 / 4) + (H / 4) + i4];
+                    *(device float4 *)(dst + r0 + 4 * i4 + (uint64_t)(r1 + j) * ne0) = (g / (1.0f + exp(-g))) * u;
+                }
+            } else {
+                for (int e = tiitg; e < nr1 * H; e += 4 * N_SIMDWIDTH) {
+                    const int j = e / H;
+                    const int i = e % H;
+                    if (i < nr0) {
+                        const float g = ((threadgroup float *) shmem)[j * NR0 + i];
+                        const float u = ((threadgroup float *) shmem)[j * NR0 + H + i];
+                        dst[r0 + i + (uint64_t)(r1 + j) * ne0] = silu(g) * u;
+                    }
+                }
+            }
+        } else if (args.mode == MATVEC_ADD) {
+            if (nr0 == NR0 && (ne0 & 3) == 0) {
+                for (int e = tiitg; e < nr1 * (NR0 / 4); e += 4 * N_SIMDWIDTH) {
+                    const int j = e / (NR0 / 4);
+                    const int i4 = e % (NR0 / 4);
+                    device float4 * D4 = (device float4 *)(dst + r0 + 4 * i4 + (uint64_t)(r1 + j) * ne0);
+                    *D4 = *D4 + ((threadgroup float4 *) shmem)[j * (NR0 / 4) + i4];
+                }
+            } else {
+                // Every thread adds a share of the tile to the output.
+                for (int e = tiitg; e < NR0*NR1; e += 4*N_SIMDWIDTH) {
+                    const int j = e / NR0;
+                    const int i = e % NR0;
+                    if (j < nr1 && i < nr0) {
+                        device float * D = dst + r0 + i + (uint64_t) (r1 + j)*ne0;
+                        *D = *D + ((threadgroup float *) shmem)[j*NR0 + i];
+                    }
                 }
             }
         } else if (sgitg == 0) {
@@ -662,11 +701,12 @@ kernel void name( \
         device const char * w [[buffer(1)]], \
         device const char * x [[buffer(2)]], \
         device float * dst [[buffer(3)]], \
+        device const char * w2 [[buffer(4)]], \
         threadgroup char * shmem [[threadgroup(0)]], \
         uint3 tgpig [[threadgroup_position_in_grid]], \
         ushort tiitg [[thread_index_in_threadgroup]], \
         ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    matmul_impl<S, S, block_q, nl, deq<typename value_type_4x4<S>::type>, float>(args, w, x, dst, shmem, tgpig, tiitg, sgitg); \
+    matmul_impl<S, S, block_q, nl, deq<typename value_type_4x4<S>::type>, float>(args, w, w2, x, dst, shmem, tgpig, tiitg, sgitg); \
 }
 
 MATMUL_KERNEL(matmul_f32,     half,   float4x4,      1,     dequantize_f32)

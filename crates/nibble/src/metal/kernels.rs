@@ -78,18 +78,22 @@ macro_rules! kernel_args {
 
 kernel_args! {
     /// `dst = W · x`, or as `mode` says.
-    struct MatvecArgs { cols: u32, rows: u32, row_bytes: u32, nsg: u32, mode: u32, ncols: u32 }
+    struct MatvecArgs {
+        cols: u32, rows: u32, row_bytes: u32, nsg: u32, mode: u32, ncols: u32,
+        rms_in_len: u32, rms_in_off: u32, rms_in_eps: f32, rms_out_off: u32,
+    }
     /// `dst = W · x` (or `+=`, as `mode` says) for a batch of `n` inputs.
     struct MatmulArgs { cols: u32, rows: u32, row_bytes: u32, n: u32, mode: u32 }
     /// The tiles of a prompt batch's expert slots (`moe_map`).
     struct MoeMapArgs { n: u32, k: u32, n_expert: u32 }
     /// The expert products of a prompt batch (`matmul_*_id`).
     struct MatmulIdArgs {
-        cols: u32, rows: u32, row_bytes: u32, expert_bytes: u32, k: u32, per_slot: u32,
+        cols: u32, rows: u32, row_bytes: u32, expert_bytes: u32, k: u32, per_slot: u32, mode: u32,
     }
     /// Decode row `row` of a matrix.
     struct EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     struct RmsArgs { n: u32, eps: f32 }
+    struct RmsApplyArgs { n: u32, off: u32, eps: f32 }
     /// A Hadamard rotation of rows (`rotate`).
     struct RotateArgs {
         len: u32, block: u32, signs: u32, head_dim: u32, n_k: u32, rep: u32, inverse: u32,
@@ -97,7 +101,7 @@ kernel_args! {
     /// The experts of a slot (`MoeArgs` in `shaders/common.metal`).
     struct MoeArgs { k: u32, per_slot: u32, expert_rows: u32, count: u32 }
     struct RouteArgs { n_expert: u32, k: u32 }
-    struct MoeSumArgs { n: u32, k: u32 }
+    struct MoeSumArgs { n: u32, k: u32, eps: f32 }
     struct CountArgs { n: u32 }
     struct AttentionArgs {
         n_pos: u32, head_dim: u32, group: u32, kv_dim: u32, q_stride: u32, gated: u32,
@@ -108,6 +112,7 @@ kernel_args! {
     struct FlashArgs {
         n: u32, n_past: u32, kv_dim: u32, q_stride: u32, gated: u32, n_head: u32, scale: f32,
         group: u32, heads: u32, tiles: u32, k_type: u32, v_type: u32, k_row: u32, v_row: u32,
+        n_padded: u32,
     }
     struct DeltaArgs {
         n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32, rows: u32,
@@ -120,11 +125,12 @@ kernel_args! {
     }
 }
 
-/// `MatvecArgs::mode`: `dst = W · x`, `dst += W · x`, and
-/// `dst = silu(W · x) * (W2 · x)` (the `MATVEC_*` macros of the shaders).
+/// `MatvecArgs::mode`: `dst = W · x`, `dst += W · x`,
+/// `dst = silu(W · x) * (W2 · x)`, and fused residual add + deferred RMSNorm.
 pub(crate) const MATVEC_STORE: u32 = 0;
 pub(crate) const MATVEC_ADD: u32 = 1;
 pub(crate) const MATVEC_SWIGLU: u32 = 2;
+pub(crate) const MATVEC_RESIDUAL_NORM: u32 = 3;
 
 /// A matrix-vector kernel and how ggml-metal dispatches it.
 #[derive(Debug)]
@@ -355,14 +361,17 @@ pub(crate) struct PromptAttention {
 impl PromptAttention {
     /// The split, if one fits in `max_smem` bytes.
     pub(crate) fn new(group: usize, hd: usize, staged: bool, max_smem: usize) -> Option<Self> {
-        let smem = |nsg: usize| {
-            nsg * (8 * hd * 2 + (8 * FLASH_C + 64) * 4) + if staged { FLASH_C * hd * 2 } else { 0 }
-        };
+        // Both prompt attention paths read contiguous `[n_head, n_padded, hd]`
+        // `half` queries written by `attention_prep`, so threadgroup memory
+        // holds only softmax scratch (plus the dequantized K/V tile when staged).
+        let max_nsg = 8;
+        let smem = |nsg: usize| nsg * (8 * FLASH_C + 64) * 4 + FLASH_C * hd * 2;
+        let _ = staged;
         let divisors = (1..=group.min(4))
             .rev()
             .filter(|h| group.is_multiple_of(*h));
         for heads in divisors {
-            for tiles in (1..=4 / heads).rev() {
+            for tiles in (1..=max_nsg / heads).rev() {
                 let nsg = heads * tiles;
                 if smem(nsg) <= max_smem {
                     return Some(Self {
@@ -386,6 +395,7 @@ pub(crate) struct Pipelines {
     matmuls: Vec<(GgmlType, Pipeline, Pipeline)>,
     embeds: Vec<(GgmlType, Pipeline, usize)>,
     pub(crate) rmsnorm: Pipeline,
+    pub(crate) rms_apply: Pipeline,
     pub(crate) rotate: Pipeline,
     pub(crate) swiglu: Pipeline,
     pub(crate) copy: Pipeline,
@@ -398,8 +408,8 @@ pub(crate) struct Pipelines {
     attentions: Vec<(usize, usize, Pipeline)>,
     pub(crate) attention_reduce: Pipeline,
     pub(crate) attention_prep: Pipeline,
-    /// `(HD, pipeline, staged pipeline)` from [`ATTENTION_PROMPTS`].
-    attention_prompts: Vec<(usize, Pipeline, Pipeline)>,
+    /// `(HD, f16, q8_0, q4_0, staged)` from [`ATTENTION_PROMPTS`].
+    attention_prompts: Vec<(usize, Pipeline, Pipeline, Pipeline, Pipeline)>,
     pub(crate) attention_unrotate: Pipeline,
     pub(crate) delta_net: Pipeline,
     pub(crate) delta_net_batch: Pipeline,
@@ -454,6 +464,7 @@ impl Pipelines {
             matmuls,
             embeds,
             rmsnorm: get("rmsnorm")?,
+            rms_apply: get("rms_apply")?,
             rotate: get("rotate")?,
             swiglu: get("swiglu")?,
             copy: get("copy_f32")?,
@@ -474,6 +485,8 @@ impl Pipelines {
                     Ok((
                         hd,
                         get(&format!("attention_prompt_d{hd}"))?,
+                        get(&format!("attention_prompt_q8_0_d{hd}"))?,
+                        get(&format!("attention_prompt_q4_0_d{hd}"))?,
                         get(&format!("attention_prompt_staged_d{hd}"))?,
                     ))
                 })
@@ -523,7 +536,24 @@ impl Pipelines {
             .map(|a| (&a.2, a.0))
     }
 
-    /// The prompt attention kernel for heads of `head_dim` values.
+    /// The prompt attention kernel for heads of `head_dim` values and cache types `kv`.
+    pub(crate) fn attention_prompt_for(
+        &self,
+        kv: crate::backend::KvTypes,
+        head_dim: usize,
+    ) -> Option<&Pipeline> {
+        use crate::backend::KvCacheType as T;
+        let entry = self.attention_prompts.iter().find(|a| a.0 == head_dim)?;
+        Some(match (kv.k, kv.v) {
+            (T::F16, T::F16) => &entry.1,
+            (T::Q8_0, T::Q8_0) => &entry.2,
+            (T::Q4_0, T::Q4_0) => &entry.3,
+            _ => &entry.4,
+        })
+    }
+
+    /// The prompt attention kernel for heads of `head_dim` values (f16 KV).
+    #[cfg(test)]
     pub(crate) fn attention_prompt(&self, head_dim: usize) -> Option<&Pipeline> {
         self.attention_prompts
             .iter()
@@ -532,11 +562,12 @@ impl Pipelines {
     }
 
     /// The prompt attention kernel for caches of any type.
+    #[cfg(test)]
     pub(crate) fn attention_prompt_staged(&self, head_dim: usize) -> Option<&Pipeline> {
         self.attention_prompts
             .iter()
             .find(|a| a.0 == head_dim)
-            .map(|a| &a.2)
+            .map(|a| &a.4)
     }
 
     /// The DeltaNet scan for keys of `d_k` values (at most 512).

@@ -149,6 +149,7 @@ fn batched_matvec_equals_one_input_at_a_time() {
             let all = [bytes, up_bytes].concat();
             let wbuf = Weights::build(&device, &all, false, largest, usize::MAX).unwrap();
             for output in [Output::Store, Output::Add, Output::SwiGlu(&up)] {
+                let dummy = device.buffer(4).unwrap();
                 let run = |x: &[f32], initial: &[f32], ncols: usize| {
                     let (xbuf, out) = (floats(&device, x), floats(&device, initial));
                     let mut commands = device.commands().unwrap();
@@ -156,6 +157,9 @@ fn batched_matvec_equals_one_input_at_a_time() {
                         &mut commands,
                         &pipelines,
                         &wbuf,
+                        &dummy,
+                        &dummy,
+                        None,
                         &w,
                         (&xbuf, 0),
                         (&out, 0),
@@ -230,11 +234,15 @@ fn matvec_matches_cpu_reference() {
                     assert!(wbuf.pieces() > 1);
                 }
                 let out = floats(&device, &initial);
+                let dummy = device.buffer(4).unwrap();
                 let mut commands = device.commands().unwrap();
                 encode_matvec(
                     &mut commands,
                     &pipelines,
                     &wbuf,
+                    &dummy,
+                    &dummy,
+                    None,
                     &w,
                     (&xbuf, 0),
                     (&out, 0),
@@ -249,7 +257,9 @@ fn matvec_matches_cpu_reference() {
                     let (g, gm) = dot(&decoded[r], &x);
                     let (expected, magnitude) = match output {
                         Output::Store => (g, gm),
-                        Output::Add => (f64::from(initial[r]) + g, gm),
+                        Output::Add | Output::ResidualNorm { .. } => {
+                            (f64::from(initial[r]) + g, gm)
+                        }
                         Output::SwiGlu(_) => {
                             let (u, um) = dot(&up_decoded[r], &x);
                             (silu(g) * u, (gm + um) * (1.0 + u.abs() + g.abs()))
@@ -663,7 +673,8 @@ fn matmul_matches_rounded_products() {
                 let xb = floats(&device, &x);
                 let out = floats(&device, &base);
                 let mut commands = device.commands().unwrap();
-                encode_matmul(&mut commands, &pipelines, &weights, &w, &xb, &out, add, n).unwrap();
+                let mode = if add { Output::Add } else { Output::Store };
+                encode_matmul(&mut commands, &pipelines, &weights, &w, &xb, &out, mode, n).unwrap();
                 commands.commit();
                 commands.wait().unwrap();
                 let got = read(&out, n * rows);
@@ -718,8 +729,17 @@ fn matmul_timing() {
             let start = std::time::Instant::now();
             let mut commands = device.commands().unwrap();
             for _ in 0..reps {
-                encode_matmul(&mut commands, &pipelines, &weights, &w, &xb, &out, false, n)
-                    .unwrap();
+                encode_matmul(
+                    &mut commands,
+                    &pipelines,
+                    &weights,
+                    &w,
+                    &xb,
+                    &out,
+                    Output::Store,
+                    n,
+                )
+                .unwrap();
             }
             commands.commit();
             commands.wait().unwrap();
@@ -1058,4 +1078,135 @@ fn delta_net_timing() {
     metal.read(&out, &mut sink).unwrap();
     let s = start.elapsed().as_secs_f64() / f64::from(reps);
     eprintln!("delta_net, {n} tokens: {:.3} ms", s * 1e3);
+}
+
+#[test]
+#[ignore = "a timing, not a check"]
+fn attention_timing() {
+    use crate::backend::{KvCacheType as T, KvTypes};
+    let Some((device, pipelines)) = gpu() else {
+        return;
+    };
+    for hd in [64, 128, 256] {
+        let p_f16 = pipelines.attention_prompt(hd).unwrap().max_threads();
+        let p_stg = pipelines.attention_prompt_staged(hd).unwrap().max_threads();
+        eprintln!("hd={hd}: prompt max_threads={p_f16}, staged max_threads={p_stg}");
+    }
+    for (label, n_head, n_head_kv, hd, gated, n_past, kv) in [
+        (
+            "qwen3-0.6b d0 f16",
+            16,
+            8,
+            128,
+            false,
+            0,
+            KvTypes::default(),
+        ),
+        (
+            "qwen35-4b d4096 f16",
+            16,
+            4,
+            256,
+            true,
+            4096,
+            KvTypes::default(),
+        ),
+        (
+            "qwen35-4b d4096 q8_0",
+            16,
+            4,
+            256,
+            true,
+            4096,
+            KvTypes {
+                k: T::Q8_0,
+                v: T::Q8_0,
+            },
+        ),
+    ] {
+        let config = attention_config(n_head, n_head_kv, hd, hd.min(128));
+        let mut params = Params::default();
+        let qn = params.push(&vec![1.0; hd]);
+        let kn = params.push(&vec![1.0; hd]);
+        let params = params.into_vec();
+        let bytes = [0u8; 16];
+        let data = ModelData {
+            bytes: &bytes,
+            mapped: false,
+            params: &params,
+            config: &config,
+            largest_tensor: 0,
+        };
+        let n = 512;
+        let n_ctx = n_past + n;
+        let mut metal = MetalBackend::new(data, n_ctx, kv).unwrap();
+        let mut cache = metal.kv_cache(n_ctx).unwrap();
+        let q_len = n * n_head * hd * if gated { 2 } else { 1 };
+        let kv_len = n * n_head_kv * hd;
+        let q_init = values(q_len, 1);
+        let k_init = values(kv_len, 2);
+        let v_init = values(kv_len, 3);
+        let mut q = metal.vector(q_len).unwrap();
+        let mut k = metal.vector(kv_len).unwrap();
+        let mut v = metal.vector(kv_len).unwrap();
+        let mut out = metal.vector(n * n_head * hd).unwrap();
+        metal.write(&mut k, &k_init).unwrap();
+        metal.write(&mut v, &v_init).unwrap();
+        let norm = QkNorm {
+            weights: Some((qn, kn)),
+            eps: 1e-6,
+            gated,
+        };
+        let shape = super::kernels::PromptAttention::new(
+            n_head / n_head_kv,
+            hd,
+            kv != KvTypes::default(),
+            device.max_threadgroup_memory(),
+        );
+        eprintln!("{label}: shape={shape:?}");
+        // Populate `n_past` positions with distinct values per chunk so `cache`
+        // is non-repeating and `need_scale` triggers like a real prompt.
+        let mut filled = 0;
+        let mut seed = 10u32;
+        while filled < n_past {
+            let chunk = n.min(n_past - filled);
+            metal.write(&mut q, &values(q_len, seed)).unwrap();
+            metal.write(&mut k, &values(kv_len, seed + 1)).unwrap();
+            metal.write(&mut v, &values(kv_len, seed + 2)).unwrap();
+            metal.begin(filled, chunk).unwrap();
+            metal.attention(&mut q, &mut k, &v, norm, &mut cache, &mut out);
+            metal.end().unwrap();
+            filled += chunk;
+            seed += 3;
+        }
+        metal.sync().unwrap();
+        // Warm up and time `reps` evaluations at `n_past` (use fresh q in a backup buffer).
+        let mut q_src = metal.vector(q_len).unwrap();
+        metal.write(&mut q_src, &q_init).unwrap();
+        let reps = 10;
+        let mut run = |m: &mut MetalBackend<'_>, batch: usize| {
+            cache.len = n_past;
+            m.begin(n_past, batch).unwrap();
+            m.copy_rows(&q_src, 0, &mut q, 0, batch, q_len / n);
+            m.attention(&mut q, &mut k, &v, norm, &mut cache, &mut out);
+            m.end().unwrap();
+        };
+        run(&mut metal, n);
+        metal.sync().unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            run(&mut metal, n);
+        }
+        metal.sync().unwrap();
+        let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+        run(&mut metal, 508);
+        metal.sync().unwrap();
+        let start508 = std::time::Instant::now();
+        for _ in 0..reps {
+            run(&mut metal, 508);
+        }
+        metal.sync().unwrap();
+        let ms508 = start508.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+        eprintln!("{label}: n=512: {ms:.3} ms/layer, n=508: {ms508:.3} ms/layer");
+    }
 }
