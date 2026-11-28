@@ -17,6 +17,8 @@ mod codebooks;
 pub(crate) mod device;
 mod driver;
 mod kernels;
+#[cfg(test)]
+mod tests;
 
 use std::ops::Range;
 
@@ -35,6 +37,11 @@ use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
 
 const THREADS: u32 = 256;
+/// Batches of more tokens than this multiply quantized weights with the
+/// GEMM (as llama.cpp switches from `mul_mat_vec_q` to `mul_mat_q`), whose
+/// rounding differs from the one-token kernels; shorter ones, such as drafts,
+/// keep every token's one-token result.
+const GEMM_MIN_TOKENS: usize = 8;
 const MAX_EXPERTS: usize = 4096;
 const DELTA_WARPS: u32 = 4;
 const DELTA_ROWS: u32 = 4;
@@ -143,7 +150,23 @@ pub(crate) struct CudaBackend<'m> {
     logits: Buffer,
     q8: Option<(Buffer, usize)>,
     encoded: Option<EncodedKey>,
+    /// The GEMM activations (`quantize_mmq`), their size in bytes, and what
+    /// they encode.
+    mmq: Option<(Buffer, usize)>,
+    mmq_encoded: Option<EncodedKey>,
+    /// The partial tiles of stream-K GEMMs, and their size in bytes.
+    gemm_partial: Option<(Buffer, usize)>,
+    /// Per tile, how many stream-K blocks have finished it (`GemmSplitK` in
+    /// `kernels/gemm.cu`; zero between GEMMs), and how many tiles it covers.
+    gemm_counts: Option<(Buffer, usize)>,
+    /// Tokens at the end of a long batch that DeltaNet layers leave pending
+    /// (`Backend::set_delta_net_tail`).
+    delta_tail: usize,
+    sm_count: usize,
     delta_work: Option<Buffer>,
+    /// Every token's DeltaNet convolution outputs for a long batch
+    /// (`delta_prep`), and its size in bytes.
+    delta_prep: Option<(Buffer, usize)>,
     /// Attention scores of a chunk of tokens, and its size in bytes.
     scores: Option<(Buffer, usize)>,
     kv: KvTypes,
@@ -230,8 +253,21 @@ impl<'m> CudaBackend<'m> {
                 device.name()
             )));
         }
+        let sm_count = device.sm_count() as usize;
         let module = device.module(kernels::FATBIN).map_err(backend_error)?;
         let pipelines = Pipelines::new(&module, major).map_err(backend_error)?;
+        if (major, minor) >= (8, 0) {
+            for (head_dim, f) in &pipelines.fattn {
+                module
+                    .allow_shared(f, kernels::fattn_shared(*head_dim))
+                    .map_err(backend_error)?;
+            }
+            for (f, bytes) in pipelines.gemms() {
+                module
+                    .allow_shared(f, *bytes as usize)
+                    .map_err(backend_error)?;
+            }
+        }
         let stream = device.stream().map_err(backend_error)?;
         let weights = device.buffer_with(model.bytes).map_err(backend_error)?;
         let params = device
@@ -272,7 +308,14 @@ impl<'m> CudaBackend<'m> {
             logits,
             q8: None,
             encoded: None,
+            mmq: None,
+            mmq_encoded: None,
+            gemm_partial: None,
+            gemm_counts: None,
+            delta_tail: 0,
+            sm_count,
             delta_work: None,
+            delta_prep: None,
             scores: None,
             kv,
             cc: (major, minor),
@@ -330,6 +373,81 @@ impl<'m> CudaBackend<'m> {
         if self.encoded.is_some_and(|e| e.source == dst) {
             self.encoded = None;
         }
+        if self.mmq_encoded.is_some_and(|e| e.source == dst) {
+            self.mmq_encoded = None;
+        }
+    }
+
+    /// The activations `x` (`rows` tokens of `cols` values, from float `at`)
+    /// as the GEMM reads them, and the padded token count of their layout.
+    fn ensure_mmq(
+        &mut self,
+        x: &Buffer,
+        at: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Option<(u64, u32)> {
+        let ystride = rows.next_multiple_of(kernels::GEMM_TOKEN_PAD);
+        let chunks = cols.div_ceil(256) * 2;
+        let key = EncodedKey {
+            source: x.ptr(),
+            at,
+            cols,
+            rows,
+        };
+        let sizes = (
+            chunks
+                .checked_mul(ystride)
+                .and_then(|n| n.checked_mul(kernels::GEMM_CHUNK_BYTES)),
+            u32::try_from(ystride),
+            u32::try_from(chunks),
+            u32::try_from(cols),
+            u32::try_from(rows),
+        );
+        let (Some(bytes), Ok(stride), Ok(nchunks), Ok(ncols), Ok(ntok)) = sizes else {
+            self.fail("the GEMM activation size overflows".to_owned());
+            return None;
+        };
+        if self.mmq_encoded == Some(key) {
+            return self.mmq.as_ref().map(|(b, _)| (b.ptr(), stride));
+        }
+        if self.mmq.as_ref().is_none_or(|(_, cap)| *cap < bytes) {
+            if let Err(e) = self.sync() {
+                self.fail(e.to_string());
+                return None;
+            }
+            match self.device.buffer(bytes) {
+                Ok(b) => self.mmq = Some((b, bytes)),
+                Err(e) => {
+                    self.fail(e);
+                    return None;
+                }
+            }
+        }
+        let mut out = self.mmq.as_ref().map(|(b, _)| b.ptr())?;
+        let mut x = match x.offset(at) {
+            Ok(x) => x,
+            Err(e) => {
+                self.fail(e);
+                return None;
+            }
+        };
+        let (mut ncols, mut ntok, mut stride_arg) = (ncols, ntok, stride);
+        let function = &self.pipelines.quantize_mmq;
+        self.record(launch!(
+            self.stream,
+            function,
+            [stride, nchunks, 1],
+            [128, 1, 1],
+            0,
+            x,
+            out,
+            ncols,
+            ntok,
+            stride_arg
+        ));
+        self.mmq_encoded = Some(key);
+        Some((out, stride))
     }
 
     fn ensure_q8(&mut self, x: &Buffer, at: usize, cols: usize, rows: usize) -> Option<u64> {
@@ -441,6 +559,72 @@ impl<'m> CudaBackend<'m> {
             Ok(p) => p,
             Err(e) => return self.fail(e),
         };
+        if let (Some(gemms), false) = (
+            self.gemm_for(&k, ncols),
+            matches!(output, Output::SwiGlu(_)),
+        ) {
+            let Some((mut xq, mut ystride)) = self.ensure_mmq(x, x_at, w.cols, ncols) else {
+                return;
+            };
+            // The smallest tile that covers the batch, up to 128 tokens.
+            let tile = kernels::GEMM_TOKENS
+                .iter()
+                .position(|&t| ncols <= t)
+                .unwrap_or(kernels::GEMM_TOKENS.len() - 1);
+            let tokens = kernels::GEMM_TOKENS[tile];
+            let mut out_ptr = out;
+            let mut args = args;
+            let (tiles_n, tiles_m) = (ncols.div_ceil(tokens), w.rows.div_ceil(kernels::GEMM_ROWS));
+            let stages = w.cols.div_ceil(256);
+            let (mut sk, grid) = self.gemm_split(tiles_n, tiles_m, stages);
+            let (mut partial, mut counts) = (0, 0);
+            if sk.blocks > 0 {
+                // Two partial tiles per block, and a count per tile.
+                let bytes = 2 * (grid[0] * grid[1]) as usize * kernels::GEMM_ROWS * tokens * 4;
+                let tiles = tiles_n * tiles_m;
+                if self
+                    .gemm_partial
+                    .as_ref()
+                    .is_none_or(|(_, cap)| *cap < bytes)
+                    || self
+                        .gemm_counts
+                        .as_ref()
+                        .is_none_or(|(_, cap)| *cap < tiles)
+                {
+                    if let Err(e) = self.sync() {
+                        return self.fail(e.to_string());
+                    }
+                    // New counts start at zero; each GEMM leaves them so.
+                    match (self.device.buffer(bytes), self.device.buffer(4 * tiles)) {
+                        (Ok(p), Ok(c)) => {
+                            self.gemm_partial = Some((p, bytes));
+                            self.gemm_counts = Some((c, tiles));
+                        }
+                        (Err(e), _) | (_, Err(e)) => return self.fail(e),
+                    }
+                }
+                partial = self.gemm_partial.as_ref().map_or(0, |(b, _)| b.ptr());
+                counts = self.gemm_counts.as_ref().map_or(0, |(b, _)| b.ptr());
+            }
+            let (gemm, shared) = &gemms[tile];
+            self.record(launch!(
+                self.stream,
+                gemm,
+                grid,
+                [256, 1, 1],
+                *shared,
+                wptr,
+                xq,
+                out_ptr,
+                args,
+                ystride,
+                sk,
+                partial,
+                counts
+            ));
+            self.invalidate_encoded(out);
+            return;
+        }
         let up = match output {
             Output::SwiGlu(up) => up,
             _ => w,
@@ -711,6 +895,136 @@ impl<'m> CudaBackend<'m> {
         self.cc >= arch && c.n_head_kv > 1 && c.head_dim.is_multiple_of(64)
     }
 
+    /// `out = silu(gate · x) * (up · x)` for the batch with the fused
+    /// GEMMs `glu`; `gate` and `up` have the same type and shape.
+    fn encode_glu_gemm(
+        &mut self,
+        glu: &[(device::Function, u32); 3],
+        gate: &Weight,
+        up: &Weight,
+        x: &CudaVector,
+        out: &mut CudaVector,
+    ) {
+        let ncols = self.n;
+        let mut args = match (
+            u32_of(gate.cols, "a matrix width"),
+            u32_of(gate.rows, "a matrix height"),
+            u32_of(gate.row_bytes, "a matrix row"),
+            u32_of(ncols, "a batch"),
+        ) {
+            (Ok(cols), Ok(rows), Ok(row_bytes), Ok(n)) => MatvecArgs {
+                cols,
+                rows,
+                row_bytes,
+                ncols: n,
+                mode: kernels::MATVEC_STORE,
+            },
+            (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
+                return self.fail(e);
+            }
+        };
+        let (mut gptr, mut uptr) = match (self.weight_ptr(gate), self.weight_ptr(up)) {
+            (Ok(g), Ok(u)) => (g, u),
+            (Err(e), _) | (_, Err(e)) => return self.fail(e),
+        };
+        let Some((mut xq, mut ystride)) = self.ensure_mmq(&x.buffer, 0, gate.cols, ncols) else {
+            return;
+        };
+        let tile = kernels::GEMM_TOKENS
+            .iter()
+            .position(|&t| ncols <= t)
+            .unwrap_or(kernels::GEMM_TOKENS.len() - 1);
+        let grid = [
+            ncols.div_ceil(kernels::GEMM_TOKENS[tile]) as u32,
+            gate.rows.div_ceil(kernels::GEMM_ROWS / 2) as u32,
+            1,
+        ];
+        let mut out_ptr = out.buffer.ptr();
+        let (f, shared) = &glu[tile];
+        self.record(launch!(
+            self.stream,
+            f,
+            grid,
+            [256, 1, 1],
+            *shared,
+            gptr,
+            uptr,
+            xq,
+            out_ptr,
+            args,
+            ystride
+        ));
+        self.invalidate_encoded(out_ptr);
+    }
+
+    /// How a GEMM of `tiles_n` by `tiles_m` tiles of `stages` stages runs:
+    /// one block per tile when that is expected to be faster, else stream-K
+    /// over the row tiles with one block per SM in all (each holds a whole
+    /// SM's registers).
+    fn gemm_split(
+        &self,
+        tiles_n: usize,
+        tiles_m: usize,
+        stages: usize,
+    ) -> (kernels::GemmSplitK, [u32; 3]) {
+        let tiles = tiles_n * tiles_m;
+        let sms = self.sm_count.max(1);
+        let waves = tiles.div_ceil(sms);
+        let tiled = (
+            kernels::GemmSplitK {
+                blocks: 0,
+                tiles_n: 0,
+                tiles: 0,
+                stages: 0,
+            },
+            [tiles_n as u32, tiles_m as u32, 1],
+        );
+        // In stages per SM: tiling runs whole waves of tiles; stream-K runs
+        // an even share, plus about two stages for the partial tiles
+        // (measured on Qwen3 0.6B and Qwen3.5 0.8B and 4B).
+        let sk_cost = (tiles * stages).div_ceil(sms) + 2;
+        if waves * stages <= sk_cost || tiles_n > sms {
+            return tiled;
+        }
+        let blocks = (sms / tiles_n).min(tiles_m * stages);
+        match (
+            u32::try_from(blocks),
+            u32::try_from(tiles_n),
+            u32::try_from(tiles_m),
+            u32::try_from(stages),
+            u32::try_from(tiles_m as u64 * stages as u64),
+        ) {
+            (Ok(blocks), Ok(n), Ok(m), Ok(stages), Ok(_)) => (
+                kernels::GemmSplitK {
+                    blocks,
+                    tiles_n: n,
+                    tiles: m,
+                    stages,
+                },
+                [n, blocks, 1],
+            ),
+            _ => tiled,
+        }
+    }
+
+    /// The GEMM for a batch of `ncols` tokens of a weight with kernels `k`,
+    /// if the batch takes the GEMM path (its integer MMAs need Ampere).
+    fn gemm_for(
+        &self,
+        k: &kernels::TypeKernels,
+        ncols: usize,
+    ) -> Option<[(device::Function, u32); 3]> {
+        (ncols > GEMM_MIN_TOKENS && self.cc >= (8, 0))
+            .then_some(k.gemm)
+            .flatten()
+    }
+
+    /// Whether long batches of these DeltaNet sizes run `delta_seq`, which
+    /// can leave a tail pending.
+    fn delta_seq_supported(&self, d: DeltaNetDims) -> bool {
+        Self::delta_supported(d) && self.pipelines.delta_seq.iter().any(|(dk, _)| *dk == d.d_k)
+    }
+
     fn delta_supported(d: DeltaNetDims) -> bool {
         d.d_k.is_multiple_of(8) && d.d_k <= 512 && d.conv_kernel > 0
     }
@@ -772,6 +1086,14 @@ impl Backend for CudaBackend<'_> {
                 d.d_k
             )))
         }
+    }
+
+    fn delta_net_tail(&self, d: DeltaNetDims) -> bool {
+        self.delta_seq_supported(d)
+    }
+
+    fn set_delta_net_tail(&mut self, tail: usize) {
+        self.delta_tail = tail;
     }
 
     fn check_moe(&self) -> Result<()> {
@@ -1107,9 +1429,16 @@ impl Backend for CudaBackend<'_> {
         out: &mut CudaVector,
         up_out: &mut CudaVector,
     ) {
-        if (gate.ty, gate.cols, gate.rows, gate.row_bytes)
-            == (up.ty, up.cols, up.rows, up.row_bytes)
-        {
+        let gemm = self
+            .pipelines
+            .get(gate.ty)
+            .copied()
+            .and_then(|k| self.gemm_for(&k, self.n).and(k.gemm_glu));
+        let same = (gate.ty, gate.cols, gate.rows, gate.row_bytes)
+            == (up.ty, up.cols, up.rows, up.row_bytes);
+        if let (Some(glu), true) = (gemm, same) {
+            self.encode_glu_gemm(&glu, gate, up, x, out);
+        } else if gemm.is_none() && same {
             self.encode_matvec(
                 gate,
                 &x.buffer,
@@ -1385,7 +1714,33 @@ impl Backend for CudaBackend<'_> {
             args
         ));
         let mut out_ptr = out.buffer.ptr();
-        if ggml_attention(kv) && n > 0 {
+        let fattn = self
+            .pipelines
+            .fattn
+            .iter()
+            .find(|(d, _)| *d == hd)
+            .map(|(_, f)| *f)
+            .filter(|_| {
+                // It copies rows of V^T 16 bytes at a time.
+                n > GEMM_MIN_TOKENS
+                    && self.cc >= (8, 0)
+                    && cache.capacity.is_multiple_of(8)
+                    && (kv.k, kv.v) == (KvCacheType::F16, KvCacheType::F16)
+            });
+        if let Some(f) = fattn {
+            self.record(launch!(
+                self.stream,
+                &f,
+                [c.n_head as u32, n.div_ceil(64) as u32, 1],
+                [128, 1, 1],
+                kernels::fattn_shared(hd) as u32,
+                qptr,
+                k_cache,
+                v_cache,
+                out_ptr,
+                args
+            ));
+        } else if ggml_attention(kv) && n > 0 {
             let cap_pad = cache.capacity.next_multiple_of(256);
             let n_kv_max = att_n_kv(cache.len + n - 1, cap_pad);
             let row_bytes = 4 * c.n_head * n_kv_max;
@@ -1500,6 +1855,10 @@ impl Backend for CudaBackend<'_> {
             return self.fail(format!("unsupported DeltaNet head size {}", d.d_k));
         }
         let pending = (2..=MAX_PENDING).contains(&n);
+        let tail = if pending { 0 } else { self.delta_tail };
+        if tail > MAX_PENDING || (tail > 0 && n < tail + d.conv_kernel - 1) {
+            return self.fail(format!("a pending tail of {tail} in a batch of {n}"));
+        }
         if pending && self.delta_work.is_none() {
             match self.device.buffer(4 * d.state_len()) {
                 Ok(work) => self.delta_work = Some(work),
@@ -1507,7 +1866,7 @@ impl Backend for CudaBackend<'_> {
             }
         }
         let r = state.keep;
-        let ba_write = if pending {
+        let ba_write = if pending || tail > 0 {
             (state.pending_row + MAX_PENDING) % (2 * MAX_PENDING)
         } else {
             0
@@ -1531,6 +1890,8 @@ impl Backend for CudaBackend<'_> {
             // llama.cpp's L2 norm: rms_norm with eps / d_k, scaled by 1 / sqrt(d_k).
             l2_eps: eps / d.d_k as f32,
             l2_scale: 1.0 / (d.d_k as f32).sqrt(),
+            prepped: 0,
+            tail: tail as u32,
         };
         let mut xptr = qkv.buffer.ptr();
         let mut ring = state.conv.buffer.ptr();
@@ -1558,30 +1919,104 @@ impl Backend for CudaBackend<'_> {
         let mut state_out_ptr = state_out;
         let mut pending_ba = state.pending_ba.buffer.ptr();
         let mut commit = ssm;
-        self.record(launch!(
-            self.stream,
-            &self.pipelines.delta_net_batch,
-            [
-                d.n_v_heads as u32,
-                d.d_v.div_ceil(DELTA_GROUP_ROWS as usize) as u32,
-                1
-            ],
-            [32 * DELTA_WARPS, 1, 1],
-            (4 * (2 * d.d_k + DELTA_GROUP_ROWS as usize)) as u32,
-            xptr,
-            ring,
-            taps,
-            beta_ptr,
-            alpha_ptr,
-            dt_bias,
-            a_log,
-            ssm,
-            out_ptr,
-            state_out_ptr,
-            pending_ba,
-            commit,
-            args
-        ));
+        // A long batch computes every token's convolution and norms in
+        // parallel first (same arithmetic); the sequential kernel then only
+        // applies the delta rule.
+        let mut prep = 0;
+        let mut gates = 0;
+        let mut seq = None;
+        if !pending && n > GEMM_MIN_TOKENS {
+            let steps = r + n;
+            let bytes = 4 * steps * (d.conv_dim() + 2 * d.n_v_heads);
+            if self
+                .delta_prep
+                .as_ref()
+                .is_none_or(|(_, have)| *have < bytes)
+            {
+                if let Err(e) = self.sync() {
+                    return self.fail(e.to_string());
+                }
+                match self.device.buffer(bytes) {
+                    Ok(b) => self.delta_prep = Some((b, bytes)),
+                    Err(e) => return self.fail(e),
+                }
+            }
+            prep = self.delta_prep.as_ref().map_or(0, |(b, _)| b.ptr());
+            gates = prep + (4 * steps * d.conv_dim()) as u64;
+            args.prepped = 1;
+            let value_blocks = d.value_dim().div_ceil(128);
+            self.record(launch!(
+                self.stream,
+                &self.pipelines.delta_prep,
+                [steps as u32, (d.n_k_heads + value_blocks + 1) as u32, 1],
+                [128, 1, 1],
+                (8 * d.d_k) as u32,
+                xptr,
+                ring,
+                taps,
+                beta_ptr,
+                alpha_ptr,
+                dt_bias,
+                a_log,
+                pending_ba,
+                prep,
+                gates,
+                args
+            ));
+            seq = self
+                .pipelines
+                .delta_seq
+                .iter()
+                .find(|(dk, _)| *dk == d.d_k)
+                .map(|(_, f)| *f);
+        }
+        if tail > 0 && seq.is_none() {
+            return self.fail(format!("no pending tail for DeltaNet heads of {}", d.d_k));
+        }
+        if let Some(f) = seq {
+            self.record(launch!(
+                self.stream,
+                &f,
+                [
+                    d.n_v_heads as u32,
+                    d.d_v.div_ceil(DELTA_GROUP_ROWS as usize) as u32,
+                    1
+                ],
+                [32 * DELTA_WARPS, 1, 1],
+                0,
+                prep,
+                gates,
+                ssm,
+                out_ptr,
+                args
+            ));
+        } else {
+            self.record(launch!(
+                self.stream,
+                &self.pipelines.delta_net_batch,
+                [
+                    d.n_v_heads as u32,
+                    d.d_v.div_ceil(DELTA_GROUP_ROWS as usize) as u32,
+                    1
+                ],
+                [32 * DELTA_WARPS, 1, 1],
+                (4 * (2 * d.d_k + DELTA_GROUP_ROWS as usize)) as u32,
+                xptr,
+                ring,
+                taps,
+                beta_ptr,
+                alpha_ptr,
+                dt_bias,
+                a_log,
+                ssm,
+                out_ptr,
+                state_out_ptr,
+                pending_ba,
+                commit,
+                prep,
+                args
+            ));
+        }
         let mut norm_ptr = match self.param_ptr(p.norm) {
             Ok(p) => p,
             Err(e) => return self.fail(e),
@@ -1598,10 +2033,12 @@ impl Backend for CudaBackend<'_> {
             norm_ptr,
             args
         ));
+        // The convolution keeps its window before the first pending token,
+        // then the pending tokens' inputs.
         let first = if pending {
             0
         } else {
-            n.saturating_sub(d.conv_kernel - 1)
+            n.saturating_sub(d.conv_kernel - 1 + tail)
         };
         let slot = (state.oldest + d.conv_kernel - 1 + r + first) % d.conv_rows();
         let count = n - first;
@@ -1622,10 +2059,10 @@ impl Backend for CudaBackend<'_> {
             state.keep = n;
             state.pending_row = ba_write;
         } else {
-            state.oldest = (state.oldest + r + n) % d.conv_rows();
-            state.pending = 0;
-            state.keep = 0;
-            state.pending_row = 0;
+            state.oldest = (state.oldest + r + n - tail) % d.conv_rows();
+            state.pending = tail;
+            state.keep = tail;
+            state.pending_row = if tail > 0 { ba_write } else { 0 };
         }
         self.invalidate_encoded(out.buffer.ptr());
     }

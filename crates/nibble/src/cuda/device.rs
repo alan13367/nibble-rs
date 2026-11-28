@@ -22,6 +22,7 @@ use super::driver::{
 
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 const CU_STREAM_NON_BLOCKING: u32 = 1;
 
 /// Makes wrappers movable without permitting shared access through `&T` on
@@ -73,6 +74,7 @@ pub(crate) struct Device {
     context: Arc<Context>,
     name: String,
     compute_capability: (u32, u32),
+    sm_count: u32,
     _not_sync: NotSync,
 }
 
@@ -133,10 +135,12 @@ impl Device {
         let name = String::from_utf8_lossy(&name[..name_len]).into_owned();
         let major = device_attribute(&context, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
         let minor = device_attribute(&context, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let sm_count = device_attribute(&context, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
         Ok(Self {
             context,
             name,
             compute_capability: (major, minor),
+            sm_count,
             _not_sync: PhantomData,
         })
     }
@@ -144,6 +148,11 @@ impl Device {
     /// The device's display name.
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The number of streaming multiprocessors.
+    pub(crate) fn sm_count(&self) -> u32 {
+        self.sm_count
     }
 
     /// `(major, minor)` compute capability, for example `(8, 9)`.
@@ -179,8 +188,8 @@ impl Device {
 
 fn device_attribute(context: &Context, attribute: i32) -> Result<u32, String> {
     let mut value = 0;
-    // SAFETY: `value` is a valid out-pointer, `attribute` is one of the two
-    // compute-capability attributes, and the device handle is live.
+    // SAFETY: `value` is a valid out-pointer, `attribute` is an integer
+    // device attribute, and the device handle is live.
     let code = unsafe { (context.api.device_get_attribute)(&mut value, attribute, context.device) };
     context.api.check(code, "cuDeviceGetAttribute")?;
     u32::try_from(value)
@@ -376,6 +385,24 @@ impl Module {
             }),
             _not_sync: PhantomData,
         })
+    }
+
+    /// Lets `function` (from this module) launch with up to `bytes` of
+    /// dynamic shared memory, past the default 48 KiB.
+    pub(crate) fn allow_shared(&self, function: &Function, bytes: usize) -> Result<(), String> {
+        const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+        let bytes = i32::try_from(bytes).map_err(|_| format!("{bytes} bytes of shared memory"))?;
+        self.inner.context.activate()?;
+        // SAFETY: `function` came from this live module, whose context is
+        // current; the attribute takes a byte count.
+        let code = unsafe {
+            (self.inner.context.api.func_set_attribute)(
+                function.raw,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        };
+        self.inner.context.api.check(code, "cuFuncSetAttribute")
     }
 
     /// Looks up a kernel by its unmangled CUDA name.

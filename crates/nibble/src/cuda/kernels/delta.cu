@@ -30,6 +30,13 @@ struct DeltaBatchArgs {
     // computed on the host as llama.cpp does.
     float l2_eps;
     float l2_scale;
+    // The convolution outputs (q and k normalized) of every token were
+    // computed by delta_prep into `prep`, conv_dim values per token.
+    unsigned int prepped;
+    // The last `tail` tokens of a prepped batch stay pending: the state is
+    // committed before them, and delta_prep keeps their beta and alpha
+    // projections from row ba_write of pending_ba.
+    unsigned int tail;
 };
 
 __device__ __forceinline__ float silu_delta(float x) {
@@ -64,7 +71,7 @@ extern "C" __global__ void __launch_bounds__(128, 1) delta_net_batch(const float
         const float * ring, const float * taps, const float * beta_in,
         const float * alpha_in, const float * dt_bias, const float * a_log,
         const float * state, float * out, float * state_out, float * pending_ba,
-        float * commit, DeltaBatchArgs a) {
+        float * commit, const float * prep, DeltaBatchArgs a) {
     extern __shared__ float shared[];
     __shared__ float partial[32];
     constexpr int WARPS = 4;
@@ -101,21 +108,31 @@ extern "C" __global__ void __launch_bounds__(128, 1) delta_net_batch(const float
         const bool replayed = u < a.replay;
         const unsigned int t = u - a.replay;
         if (u > 0) __syncthreads();
-        for (int i = tid; i < dk; i += blockDim.x) {
-            qn[i] = conv_channel(a, ring, x, taps, u, kh * dk + i);
-            kn[i] = conv_channel(a, ring, x, taps, u, a.key_dim + kh * dk + i);
+        if (a.prepped) {
+            const float * pu = prep + (size_t) u * a.conv_dim;
+            for (int i = tid; i < dk; i += blockDim.x) {
+                qn[i] = pu[kh * dk + i];
+                kn[i] = pu[a.key_dim + kh * dk + i];
+            }
+            if (tid < rows_per_group && j0 + tid < dv) vv[tid] = pu[2 * a.key_dim + h * dv + j0 + tid];
+            __syncthreads();
+        } else {
+            for (int i = tid; i < dk; i += blockDim.x) {
+                qn[i] = conv_channel(a, ring, x, taps, u, kh * dk + i);
+                kn[i] = conv_channel(a, ring, x, taps, u, a.key_dim + kh * dk + i);
+            }
+            if (tid < rows_per_group && j0 + tid < dv) {
+                vv[tid] = conv_channel(a, ring, x, taps, u, 2 * a.key_dim + h * dv + j0 + tid);
+            }
+            __syncthreads();
+            const float q_scale = rms_scale(qn, dk, a.l2_eps, partial);
+            const float k_scale = rms_scale(kn, dk, a.l2_eps, partial);
+            for (int i = tid; i < dk; i += blockDim.x) {
+                qn[i] = q_scale * qn[i] * a.l2_scale;
+                kn[i] = k_scale * kn[i] * a.l2_scale;
+            }
+            __syncthreads();
         }
-        if (tid < rows_per_group && j0 + tid < dv) {
-            vv[tid] = conv_channel(a, ring, x, taps, u, 2 * a.key_dim + h * dv + j0 + tid);
-        }
-        __syncthreads();
-        const float q_scale = rms_scale(qn, dk, a.l2_eps, partial);
-        const float k_scale = rms_scale(kn, dk, a.l2_eps, partial);
-        for (int i = tid; i < dk; i += blockDim.x) {
-            qn[i] = q_scale * qn[i] * a.l2_scale;
-            kn[i] = k_scale * kn[i] * a.l2_scale;
-        }
-        __syncthreads();
         const float beta_raw = replayed ? pending_ba[(a.ba_read + u) * 2 * nh + h]
                                         : beta_in[(size_t) t * nh + h];
         const float alpha_raw = replayed ? pending_ba[(a.ba_read + u) * 2 * nh + nh + h]
@@ -164,6 +181,148 @@ extern "C" __global__ void __launch_bounds__(128, 1) delta_net_batch(const float
         }
     }
 }
+
+// The convolution (with SiLU) and the L2 norms of q and k for every token of
+// the batch (replayed ones first) at once, with delta_net_batch's arithmetic,
+// so that its sequential loop only applies the delta rule. Blocks of y below
+// n_k_heads take a key head's q and k; the others 128 value channels each.
+extern "C" __global__ void __launch_bounds__(128, 1) delta_prep(const float * x, const float * ring,
+        const float * taps, const float * beta_in, const float * alpha_in, const float * dt_bias,
+        const float * a_log, float * pending_ba, float * prep, float * gates, DeltaBatchArgs a) {
+    extern __shared__ float shared[];
+    __shared__ float partial[32];
+    const unsigned int u = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int dk = a.d_k;
+    const int value_dim = a.conv_dim - 2 * a.key_dim;
+    const int nh = value_dim / a.d_v;
+    float * pu = prep + (size_t) u * a.conv_dim;
+    if (blockIdx.y == gridDim.y - 1) {
+        // The gates of every value head: sigmoid(beta) and exp(softplus(alpha + dt) * A).
+        const bool replayed = u < a.replay;
+        const unsigned int t = u - a.replay;
+        for (int h = tid; h < nh; h += blockDim.x) {
+            const float beta_raw = replayed ? pending_ba[(a.ba_read + u) * 2 * nh + h] : beta_in[(size_t) t * nh + h];
+            const float alpha_raw = replayed ? pending_ba[(a.ba_read + u) * 2 * nh + nh + h] : alpha_in[(size_t) t * nh + h];
+            const float biased = alpha_raw + dt_bias[h];
+            const float softplus = biased > 20.0f ? biased : log1pf(expf(biased));
+            const float gate = softplus * a_log[h];
+            gates[(size_t) u * 2 * nh + h] = sigmoid_delta(beta_raw);
+            gates[(size_t) u * 2 * nh + nh + h] = expf(gate);
+            if (!replayed && t + a.tail >= a.n) {
+                const unsigned int row = a.ba_write + t - (a.n - a.tail);
+                pending_ba[row * 2 * nh + h] = beta_raw;
+                pending_ba[row * 2 * nh + nh + h] = alpha_raw;
+            }
+        }
+    } else if ((int) blockIdx.y < (int) a.n_k_heads) {
+        const int kh = blockIdx.y;
+        float * qn = shared;
+        float * kn = qn + dk;
+        for (int i = tid; i < dk; i += blockDim.x) {
+            qn[i] = conv_channel(a, ring, x, taps, u, kh * dk + i);
+            kn[i] = conv_channel(a, ring, x, taps, u, a.key_dim + kh * dk + i);
+        }
+        __syncthreads();
+        const float q_scale = rms_scale(qn, dk, a.l2_eps, partial);
+        const float k_scale = rms_scale(kn, dk, a.l2_eps, partial);
+        for (int i = tid; i < dk; i += blockDim.x) {
+            pu[kh * dk + i] = q_scale * qn[i] * a.l2_scale;
+            pu[a.key_dim + kh * dk + i] = k_scale * kn[i] * a.l2_scale;
+        }
+    } else {
+        const int c = (blockIdx.y - a.n_k_heads) * blockDim.x + tid;
+        if (c < value_dim) pu[2 * a.key_dim + c] = conv_channel(a, ring, x, taps, u, 2 * a.key_dim + c);
+    }
+}
+
+// The delta rule over a long batch from delta_prep's outputs, with
+// delta_net_batch's partition and arithmetic: no shared memory or barriers,
+// and each lane loads the next token's values while the current one is
+// applied. RPL = d_k / 8 rows per lane. Replayed tokens update the state only;
+// the last `a.tail` tokens do not (they stay pending).
+template<int RPL>
+__device__ __forceinline__ void delta_seq_impl(const float * prep, const float * gates, float * state,
+        float * out, DeltaBatchArgs a) {
+    constexpr int LANES = 8;
+    const int h = blockIdx.x;
+    const int dk = a.d_k;
+    const int dv = a.d_v;
+    const int value_dim = a.conv_dim - 2 * a.key_dim;
+    const int nh = value_dim / dv;
+    const int kh = h % a.n_k_heads;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int lane_in_col = lane % LANES;
+    const int j = blockIdx.y * 16 + warp * 4 + lane / LANES;
+    const int jc = min(j, dv - 1);
+    float s[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) s[r] = state[((size_t) h * dv + jc) * dk + r * LANES + lane_in_col];
+    const unsigned int steps = a.replay + a.n;
+    const float * pq = prep + kh * dk + lane_in_col;
+    const float * pk = prep + a.key_dim + kh * dk + lane_in_col;
+    const float * pv = prep + 2 * a.key_dim + h * dv + jc;
+    float q[RPL], k[RPL], v, beta, g;
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        q[r] = pq[r * LANES];
+        k[r] = pk[r * LANES];
+    }
+    v = pv[0];
+    beta = gates[h];
+    g = gates[nh + h];
+    for (unsigned int u = 0; u < steps; ++u) {
+        float qc[RPL], kc[RPL];
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            qc[r] = q[r];
+            kc[r] = k[r];
+        }
+        const float vc = v, betac = beta, gc = g;
+        if (u + 1 < steps) {
+            const size_t off = (size_t) (u + 1) * a.conv_dim;
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                q[r] = pq[off + r * LANES];
+                k[r] = pk[off + r * LANES];
+            }
+            v = pv[off];
+            beta = gates[(size_t) (u + 1) * 2 * nh + h];
+            g = gates[(size_t) (u + 1) * 2 * nh + nh + h];
+        }
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) kv_shard += s[r] * kc[r];
+        const float kv_col = warp_sum<LANES>(kv_shard);
+        const float delta_col = (vc - gc * kv_col) * betac;
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            s[r] = gc * s[r] + kc[r] * delta_col;
+            attn_partial += s[r] * qc[r];
+        }
+        const float attn_col = warp_sum<LANES>(attn_partial);
+        if (u >= a.replay && lane_in_col == 0 && j < dv) {
+            out[(size_t) (u - a.replay) * value_dim + h * dv + j] = attn_col * a.scale;
+        }
+        // The state is committed before the pending tail, if any.
+        if (u + 1 + a.tail == steps && j < dv) {
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) state[((size_t) h * dv + j) * dk + r * LANES + lane_in_col] = s[r];
+        }
+    }
+}
+
+#define EXPORT_DELTA_SEQ(DK) \
+    extern "C" __global__ void __launch_bounds__(128) delta_seq_##DK(const float * prep, const float * gates, \
+            float * state, float * out, DeltaBatchArgs a) { \
+        delta_seq_impl<DK / 8>(prep, gates, state, out, a); \
+    }
+
+EXPORT_DELTA_SEQ(64)
+EXPORT_DELTA_SEQ(128)
+EXPORT_DELTA_SEQ(256)
 
 extern "C" __global__ void delta_norm(float * out, const float * z, const float * norm, DeltaBatchArgs a) {
     extern __shared__ float values[];

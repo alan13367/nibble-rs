@@ -30,3 +30,5 @@
 #include "ops.cu"
 #include "attention.cu"
 #include "delta.cu"
+#include "gemm.cu"
+#include "fattn.cu"

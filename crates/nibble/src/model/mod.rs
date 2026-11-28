@@ -26,7 +26,7 @@ use nibble_gguf::{Gguf, Storage};
 
 pub use config::ModelConfig;
 
-use crate::backend::{Backend, MAX_LOGIT_ROWS, ModelData, Params};
+use crate::backend::{Backend, MAX_LOGIT_ROWS, MAX_PENDING, ModelData, Params};
 use crate::chat::ChatTemplate;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionOptions};
@@ -367,29 +367,53 @@ impl Model {
         }
     }
 
+    /// Whether the state has recurrent parts that [`Model::save_state`]
+    /// copies (sessions take checkpoints only then).
+    pub(crate) const fn has_recurrent_state(&self) -> bool {
+        !matches!(self.arch, Arch::Qwen3(_))
+    }
+
     /// Copies the parts of `state` that cannot be rewound into `snapshot`,
-    /// reusing its buffers. Returns false, leaving `snapshot` as it is, for
-    /// architectures whose state rewinds without one.
+    /// reusing its buffers: the state as it is, or as it was before the
+    /// last `drop` tokens, which must be a pending tail of the last batch
+    /// ([`Model::keeps_tail`]). Returns false, leaving `snapshot` as it is,
+    /// for architectures whose state rewinds without one.
     pub(crate) fn save_state<B: Backend>(
         &self,
         b: &mut B,
-        state: &State<B>,
+        state: &mut State<B>,
         snapshot: &mut Option<Snapshot>,
+        drop: usize,
     ) -> Result<bool> {
         // A Bonsai model's recurrent state is Qwen3.5's.
         let (dims, s) = match (&self.arch, state) {
             (Arch::Qwen35(m), State::Qwen35(s)) => (m.dims(), s),
-            (Arch::Bonsai(m), State::Bonsai(s)) => (m.dims(), &s.base),
+            (Arch::Bonsai(m), State::Bonsai(s)) => (m.dims(), &mut s.base),
             _ => return Ok(false),
         };
         if let Some(Snapshot::Qwen35(target)) = snapshot {
-            s.save(b, dims, target)?;
+            s.save(b, dims, target, drop)?;
         } else {
             let mut target = qwen35::Snapshot::default();
-            s.save(b, dims, &mut target)?;
+            s.save(b, dims, &mut target, drop)?;
             *snapshot = Some(Snapshot::Qwen35(target));
         }
         Ok(true)
+    }
+
+    /// Whether a batch of `n` tokens can run with its last `tail` left
+    /// pending in the recurrent layers ([`Backend::set_delta_net_tail`]),
+    /// so that the state before them can be saved after the batch.
+    pub(crate) fn keeps_tail<B: Backend>(&self, b: &B, n: usize, tail: usize) -> bool {
+        let d = match &self.arch {
+            Arch::Qwen35(m) => m.dims(),
+            Arch::Bonsai(m) => m.dims(),
+            Arch::Qwen3(_) => return false,
+        };
+        b.delta_net_tail(d)
+            && n > MAX_PENDING
+            && (1..=MAX_PENDING).contains(&tail)
+            && n >= tail + d.conv_kernel - 1
     }
 
     /// Returns `state` to the moment `snapshot` was taken, `n_pos` tokens

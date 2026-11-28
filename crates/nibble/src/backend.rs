@@ -489,6 +489,25 @@ pub(crate) trait Backend {
         Ok(())
     }
 
+    /// Whether [`Backend::delta_net`] can leave the last tokens of a batch
+    /// of more than [`MAX_PENDING`] pending ([`Backend::set_delta_net_tail`])
+    /// for layers of these sizes.
+    fn delta_net_tail(&self, d: DeltaNetDims) -> bool {
+        let _ = d;
+        false
+    }
+
+    /// From now on [`Backend::delta_net`] leaves the last `tail` tokens
+    /// (at most [`MAX_PENDING`], 0 for none) of each batch pending, leaving
+    /// the state as if they had come as a batch of their own after the
+    /// rest; each token's output is the same. Only called when
+    /// [`Backend::delta_net_tail`] holds, for batches of more than
+    /// [`MAX_PENDING`] tokens with at least `conv_kernel - 1` before the
+    /// tail.
+    fn set_delta_net_tail(&mut self, tail: usize) {
+        let _ = tail;
+    }
+
     /// Checks, when a session starts, that the backend can run
     /// mixture-of-experts layers ([`Backend::moe_route`] and the ops after it).
     fn check_moe(&self) -> Result<()> {

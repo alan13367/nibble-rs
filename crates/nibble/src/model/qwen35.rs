@@ -245,6 +245,7 @@ impl Qwen35 {
                 h: b.vector(n_batch * c.n_embd)?,
                 pair: b.vector(n_batch * 2 * c.n_embd)?,
                 last_h: b.vector(c.n_embd)?,
+                checkpoint_h: b.vector(c.n_embd)?,
                 draft_h: b.vector(c.n_embd)?,
                 batch: 0..0,
                 n_embd: c.n_embd,
@@ -697,6 +698,9 @@ pub(super) struct MtpState<B: Backend> {
     /// The trunk's hidden state at the last position, which the next token
     /// pairs with.
     pub(super) last_h: B::Vector,
+    /// The trunk's hidden state before a batch's pending tail, read by a
+    /// checkpoint there ([`State::save`]).
+    pub(super) checkpoint_h: B::Vector,
     /// The head's output at the last draft step, which the next draft token
     /// pairs with.
     pub(super) draft_h: B::Vector,
@@ -768,10 +772,23 @@ impl<B: Backend> State<B> {
         Ok(true)
     }
 
-    /// Copies the recurrent state into `snapshot`, reusing its buffers.
-    pub(crate) fn save(&self, b: &mut B, d: DeltaNetDims, snapshot: &mut Snapshot) -> Result<()> {
+    /// Copies the recurrent state into `snapshot`, reusing its buffers: as
+    /// it is, or with `drop` > 0 as it was before the last `drop` kept
+    /// pending tokens (a checkpoint inside the last batch).
+    pub(crate) fn save(
+        &mut self,
+        b: &mut B,
+        d: DeltaNetDims,
+        snapshot: &mut Snapshot,
+        drop: usize,
+    ) -> Result<()> {
         let (cd, rows) = (d.conv_dim(), d.conv_rows());
-        let keep = self.delta_nets().next().map_or(0, |s| s.keep);
+        let kept = self.delta_nets().next().map_or(0, |s| s.keep);
+        let Some(keep) = kept.checked_sub(drop) else {
+            return Err(crate::Error::Backend(format!(
+                "a checkpoint {drop} tokens back with {kept} pending"
+            )));
+        };
         let window = d.conv_kernel - 1 + keep;
         let n_layers = self.delta_nets().count();
         snapshot.keep = keep;
@@ -784,7 +801,7 @@ impl<B: Backend> State<B> {
         let ba_len = d.pending_len();
         let mut pending = vec![0.0; ba_len];
         for (i, s) in self.delta_nets().enumerate() {
-            debug_assert_eq!(s.keep, keep, "DeltaNet layers keep different tokens");
+            debug_assert_eq!(s.keep, kept, "DeltaNet layers keep different tokens");
             b.read(&s.conv, &mut snapshot.ring)?;
             let conv = &mut snapshot.conv[i * window * cd..(i + 1) * window * cd];
             for (r, out) in conv.chunks_exact_mut(cd).enumerate() {
@@ -800,9 +817,24 @@ impl<B: Backend> State<B> {
             let n = d.state_len();
             b.read(&s.ssm, &mut snapshot.ssm[i * n..(i + 1) * n])?;
         }
-        if let Some(m) = &self.mtp {
+        if let Some(m) = &mut self.mtp {
             snapshot.mtp_h.resize(m.n_embd, 0.0);
-            b.read(&m.last_h, &mut snapshot.mtp_h)?;
+            if drop == 0 {
+                b.read(&m.last_h, &mut snapshot.mtp_h)?;
+            } else {
+                // Row r of the last catch-up is the trunk's state before
+                // its token r, which the token after the checkpoint pairs
+                // with.
+                let Some(row) = (m.batch.end - drop).checked_sub(m.batch.start) else {
+                    return Err(crate::Error::Backend(
+                        "a checkpoint before the MTP head's batch".to_owned(),
+                    ));
+                };
+                b.begin(m.batch.end, 0)?;
+                b.copy_rows(&m.h, row, &mut m.checkpoint_h, 0, 1, m.n_embd);
+                b.end()?;
+                b.read(&m.checkpoint_h, &mut snapshot.mtp_h)?;
+            }
         }
         Ok(())
     }

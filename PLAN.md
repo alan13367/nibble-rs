@@ -13,15 +13,15 @@ has the full record of phases 0–6 and the first steps of phase 7).
 | Area | State |
 |---|---|
 | Done | GGUF reader/writer and `inspect`; tokenizer (ids identical to llama.cpp); `qwen3`, `qwen35` and `qwen35moe` on every listed weight type; Ternary Bonsai (`qwen35` with `prism.hadamard` folded weights, Q2_0) on CPU and Metal; CPU engine (NEON for all types but Q2_K and the IQ1–IQ3 codebooks, AVX2 for F32/F16/BF16/Q8_0/Q2_0); Metal backend, the default (`auto`) on macOS; CUDA backend (Windows, Linux), the default where an NVIDIA GPU is present; OpenAI server with tools, logprobs and recurrent-state checkpoints; batched evaluation, DeltaNet rollback, the MTP head and `--draft N`; Metal prompt GEMM; CPU prompt batches (parallel batch ops and attention, NEON `i8mm` 8-input K-quant tiles); llama.cpp's KV cache types on both backends |
-| Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot (rechecked after the CPU prompt work on Qwen3-0.6B Q8_0, Qwen3.5-0.8B Q4_K_M and 4B Q8_0); kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta. CUDA: logits bit-identical to llama.cpp b12675's CUDA build (`-ngl 99 -fa off -ub 1`) on every local file (Qwen3-0.6B Q8_0/BF16; Qwen3.5-0.8B BF16, Q8_0, Q6_K, Q4_K, Q3_K, Q2_K, IQ2_M; 4B Q8_0; 9B Q3_K_M and UD-Q4_K_XL), at 8, 19, 300 and 4329 tokens, batched or not; greedy text identical on all of them. RTX 3070 Ti (sm_86) only |
+| Correctness | CPU: greedy output identical to llama.cpp (`-fa off --no-repack -ub 1`) except one BF16 near-tie caused by nibble's faster bf16 dot (rechecked after the CPU prompt work on Qwen3-0.6B Q8_0, Qwen3.5-0.8B Q4_K_M and 4B Q8_0); kernels checked bit for bit against `libggml-cpu`. Metal: identical to llama.cpp's Metal path except 0.001 ties on Qwen3-0.6B. KV cache types: 50/50 CPU runs identical, Metal identical where llama.cpp runs the same path. Tested on an M4 Max only; the x86 path only under Rosetta. CUDA: logits bit-identical to llama.cpp b12675's CUDA build (`-ngl 99 -fa off -ub 1`) on every local file (Qwen3-0.6B Q8_0/BF16; Qwen3.5-0.8B BF16, Q8_0, Q6_K, Q4_K, Q3_K, Q2_K, IQ2_M; 4B Q8_0; 9B Q3_K_M and UD-Q4_K_XL), at 8, 19, 300 and 4329 tokens, one token at a time or in batches of up to 8; greedy text identical on all of them. CUDA prompt batches (more than 8 tokens): greedy text identical to llama.cpp's default batching on Qwen3-0.6B Q8_0/BF16, 0.8B Q8_0/Q4_K_M and 9B UD-Q4_K_XL; the 4B Q8_0 differs after a 0.05 near-tie where llama.cpp's own `-ub 1` and default runs differ too (nibble takes the `-ub 1` token). RTX 3070 Ti (sm_86) only |
 | Decode (M4 Max) | Faster than llama.cpp on every local file on Metal (empty context and 4096 tokens, `-fa` off and on) and on the CPU. Qwen3.5-4B Q8_0 Metal 74 tok/s, 131 with `--draft 3` (llama.cpp 64, 124); Qwen3-0.6B Q8_0 CPU 295 (261) |
 | Prompt (M4 Max, pp512) | Metal level with llama.cpp on the 0.8B Q4_K_M, the 35B MoE and the 4B with a q8_0 cache at depth 4096; 5% behind on the 4B and on Qwen3-0.6B (its flash attention). CPU 11–23% behind llama.cpp, whose CPU prompt products run in Accelerate (Phase 7 step 6) |
-| Tests | 261 pass in `cargo test --workspace` (Metal tests skip without a device); 14 reference tests on real models with `--ignored` (13 pass here; `qwen35_bf16` needs a file not on this machine) |
-| Decode (RTX 3070 Ti, CUDA) | Qwen3.5-4B Q8_0 97 tok/s (llama.cpp 98), 9B UD-Q4_K_XL 82 (85), Qwen3-0.6B Q8_0 237 (400), 0.8B Q4_K_M 267 (393); at depth 4096: 0.6B 169 (291), 4B 88 (95). Small models lose to launch overhead (no CUDA graphs yet) |
-| Prompt (RTX 3070 Ti, CUDA) | pp512 12–20× behind llama.cpp: every token runs as a decode step (llama.cpp's batched GEMM rounds differently, so a faster prompt path must keep the one-token arithmetic) |
+| Tests | 261 pass in `cargo test --workspace` on the M4 Max (Metal tests skip without a device), 247 on Windows with the RTX 3070 Ti (including 4 CUDA kernel tests); 17 reference tests on real models with `--ignored` (the 3 CUDA ones pass on the 3070 Ti; `qwen35_bf16` needs a file not on the Mac) |
+| Decode (RTX 3070 Ti, CUDA) | tg128, 2026-11-28: Qwen3.5-4B Q8_0 98 tok/s (llama.cpp 101), 9B UD-Q4_K_XL 84 (88), Qwen3-0.6B Q8_0 224–232 (402), 0.8B Q4_K_M 263 (408); at depth 4096 (2026-11-26): 0.6B 169 (291), 4B 88 (95). Small models lose to launch overhead (no CUDA graphs yet) |
+| Prompt (RTX 3070 Ti, CUDA) | pp512, 2026-11-28, against `llama-bench -ngl 99 -fa 0`: Qwen3-0.6B Q8_0 23.7k tok/s (llama.cpp 19.1k), 0.8B Q4_K_M 16.1k (19.3k), 4B Q8_0 4.8k (5.9k), 9B UD-Q4_K_XL 1.7k (3.5k: its 10 IQ4_XS gate/up tensors have no GEMM and run per token) |
 | Not started | PrismML's PTQ1_0 and PQ2_0 (their llama.cpp fork's types); AVX2 kernels beyond F32/F16/BF16/Q8_0/Q2_0; NEON kernels for Q2_K and the IQ1–IQ3 codebooks; AVX2 prompt tiles; parallel server slots |
 | To rerun | The 5600X comparisons (correctness and speed) predate the attention and fused-multiply-add fixes |
-| Git | Committed through `94f7d5b` (not pushed); the fixes from the 2026-11-26 review (Q8_0 prompt tiles dropped, deferred RMSNorm precision) are not committed |
+| Git | Committed through `87b2dc0` (the bit-exact CUDA backend); the CUDA prompt batches (GEMM, flash attention, split DeltaNet) are not committed |
 
 ## Decisions
 
@@ -97,8 +97,40 @@ kernels:
   llama.cpp's graph and disables its fusions for that token: observe only
   the ends of fused chains.
 
-Next: CUDA graphs per token (launch overhead on small models), a prompt path
-faster than per-token decode steps, partial offload, and the plan below.
+**Prompt batches** (more than 8 tokens, sm_80 and newer) take a separate
+path that rounds differently from one token at a time, as llama.cpp's
+batched kernels do (a decision of 2026-11-26; batches of up to 8 tokens
+keep the exact kernels):
+
+- **Int8 tensor-core GEMM** (`kernels/gemm.cu`) laid out as ggml-cuda's
+  `mul_mat_q` on Ampere: 256 threads, 128 rows by 32/64/128 tokens, weights
+  of 256 values per row unpacked to int8 in shared memory by whole warps,
+  activations in a `block_q8_1_mmq`-like layout (`quantize_mmq`) copied in
+  with `cp.async` and double-buffered, `ldmatrix` + `mma.sync`. All of Q8_0,
+  Q4_0, Q4_1, Q5_0, Q5_1 and Q2_K–Q6_K. Stream-K (reduced in block order, so
+  deterministic) where whole tiles would leave waves half empty, and a fused
+  gate/up kernel that applies SwiGLU. MoE expert products still run per
+  token.
+- **Flash attention** for F16 caches (head sizes 64, 128, 256), K and V
+  copied with `cp.async` while the other is in use.
+- **DeltaNet** in two kernels: convolution, norms and gates for every token
+  in parallel (`delta_prep`), then the sequential delta rule
+  (`delta_seq`), with the exact path's arithmetic (bit-identical). A batch
+  can leave its last tokens pending, so the session's checkpoint 4 tokens
+  before the end costs no split batch (`Backend::set_delta_net_tail`).
+- **Measured, not kept:** loader unrolls below full (load latency bounds
+  the GEMM), the int-to-float trick with `0x4B400000` (more registers than
+  `I2F`), a separate stream-K fixup kernel (its launches cost more than the
+  in-kernel reduction), `delta_seq` at six blocks per SM (spills).
+- **Where the time goes** (4B Q8_0, 512 tokens, ~103 ms of GPU time against
+  llama.cpp's ~88): the GEMMs 73 ms (llama.cpp ~57), `delta_seq` 16 ms
+  (llama.cpp's chunked tensor-core `gdn_single` 8 ms). Our GEMM uses all 255
+  registers and spills; ggml's Q8_0 kernel uses 222 with no stack.
+
+Next: GEMM loaders for the IQ types (IQ4_XS first: the 9B UD-Q4_K_XL's
+gate/up products), the GEMM's register pressure, a chunked DeltaNet (ggml's
+`gated-delta-net-mma.cu`), CUDA graphs per token (launch overhead on small
+models), partial offload, and the plan below.
 
 - **Driver API only**, loaded at runtime from `nvcuda.dll` / `libcuda.so.1`.
   Entry points are resolved through `cuGetProcAddress`, which avoids the

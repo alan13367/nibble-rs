@@ -147,9 +147,9 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
 - **Use `--no-repack`.** By default llama.cpp repacks Q4_K, Q5_K, Q6_K and
   Q8_0 weights and multiplies them with other kernels than the ones nibble
   transcribes.
-- **Use `-ub 1`.** nibble evaluates a prompt in batches whose results are
-  bit-identical to evaluating it one token at a time; llama.cpp evaluates
-  a batch with GEMM kernels that round differently. Keep `-b`
+- **Use `-ub 1`.** nibble's CPU evaluates a prompt in batches whose results
+  are bit-identical to evaluating it one token at a time; llama.cpp
+  evaluates a batch with GEMM kernels that round differently. Keep `-b`
   large: llama-completion stops early when a chunk of `-b` prompt tokens
   ends with an end-of-generation token such as `<|im_end|>`, which every
   chat prompt contains.
@@ -240,12 +240,20 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
   tokens in its BLAS backend (Accelerate), even with `-ngl 0 -dev none`,
   so its CPU prompt speed is Accelerate's, not ggml-cpu's: say so when
   comparing.
-- **Batched kernels keep the one-input kernel's rounding.** A kernel for
-  several inputs must give each the one-input kernel's result bit for bit
-  (`batched_products_equal_per_token_products`, and per kernel tests such
-  as `wide_dots_equal_one_input_dots`): prompt batches then match `-ub 1`
-  and drafts match plain decoding. A GEMM that sums differently (e.g. a
-  Q8_0 `i8mm` tile) changes greedy output; do not add one.
+- **Batched kernels keep the one-input kernel's rounding** on the CPU and
+  Metal. A kernel for several inputs must give each the one-input kernel's
+  result bit for bit (`batched_products_equal_per_token_products`, and per
+  kernel tests such as `wide_dots_equal_one_input_dots`): prompt batches then
+  match `-ub 1` and drafts match plain decoding. A GEMM that sums differently
+  (e.g. a Q8_0 `i8mm` tile) changes greedy output; do not add one there.
+- **CUDA prompt batches are the exception.** Batches of more than
+  `GEMM_MIN_TOKENS` (8) tokens run the tensor-core GEMM, flash attention and
+  the split DeltaNet kernels, which round differently from one token at a
+  time, as llama.cpp's `mul_mat_q` and flash attention do. Batches of up to 8
+  tokens (decode, draft verification) keep the exact kernels and stay bit
+  for bit equal to llama.cpp `-ub 1`. Each prompt kernel has a test against
+  the one-token kernels with a documented tolerance (`cuda/tests.rs`); the
+  DeltaNet split must stay bit-identical.
 - **An optimization must not change results** beyond the tolerance its kernel
   test documents. Greedy output on the comparison prompts should stay the same.
 - **Prefer clear code** unless a measurement shows the faster version matters.
@@ -260,7 +268,16 @@ tools/llama.cpp/<build>/llama-completion -m models/MODEL.gguf -f prompt.txt -n 6
   or a required feature is missing.
 - **CUDA kernels are compiled offline** with nvcc into an artifact that is
   committed. `cargo build` must not need the CUDA toolkit. Test CUDA changes on
-  a local NVIDIA GPU.
+  a local NVIDIA GPU, and commit the full multi-arch fatbin (the command is
+  in `kernels/kernels.cu`), never an sm_86-only build used while iterating.
+- **CUDA is compared with llama.cpp's CUDA build** (`-ngl 99 -fa off`).
+  Decode and short batches: with `-ub 1`, logits equal bit for bit. Prompt
+  batches: with llama.cpp's default batching (no `-ub`), greedy output
+  should match except after near-ties (top two logits within about 0.1),
+  as llama.cpp's own `-ub 1` and default runs differ there too. Measure
+  prompt speed against `llama-bench -ngl 99 -fa 0 -p 512`. Profiling runs
+  under `nsys` can leave `nibble.exe` hung and spinning; check for such
+  processes before trusting a benchmark.
 - **Metal is tested on an Apple Silicon Mac.** Compare greedy output with
   llama.cpp's Metal path, which has the same numerics, and expect the CPU
   path to differ only after near-ties:

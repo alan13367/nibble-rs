@@ -69,6 +69,7 @@ type ModuleLoadDataEx = unsafe extern "system" fn(
     *mut *mut c_void,
 ) -> ResultCode;
 type ModuleUnload = unsafe extern "system" fn(RawModule) -> ResultCode;
+type FuncSetAttribute = unsafe extern "system" fn(RawFunction, c_int, c_int) -> ResultCode;
 type ModuleGetFunction =
     unsafe extern "system" fn(*mut RawFunction, RawModule, *const c_char) -> ResultCode;
 type LaunchKernel = unsafe extern "system" fn(
@@ -132,6 +133,7 @@ pub(super) struct ApiInner {
     pub(super) module_load_data_ex: ModuleLoadDataEx,
     pub(super) module_unload: ModuleUnload,
     pub(super) module_get_function: ModuleGetFunction,
+    pub(super) func_set_attribute: FuncSetAttribute,
     pub(super) launch_kernel: LaunchKernel,
     pub(super) stream_create: StreamCreate,
     pub(super) stream_destroy: StreamDestroy,
@@ -199,6 +201,11 @@ impl ApiInner {
                     c"cuModuleLoadDataEx",
                 )?,
                 module_unload: resolve(get_proc_address, get_error_string, c"cuModuleUnload")?,
+                func_set_attribute: resolve(
+                    get_proc_address,
+                    get_error_string,
+                    c"cuFuncSetAttribute",
+                )?,
                 module_get_function: resolve(
                     get_proc_address,
                     get_error_string,

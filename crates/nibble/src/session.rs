@@ -489,17 +489,29 @@ impl<'m> Session<'m> {
         self.logits_row = 0;
         let n_vocab = self.model.config().n_vocab;
         let model = self.model;
-        // The checkpoint is taken before token `cut`, so a batch ends there.
-        let cut = tokens.len().checked_sub(CHECKPOINT_TAIL);
+        // The checkpoint is taken before token `cut`, so a batch ends there
+        // (for models that have recurrent state to save).
+        let cut = tokens
+            .len()
+            .checked_sub(CHECKPOINT_TAIL)
+            .filter(|_| model.has_recurrent_state());
         on_engine!(&mut self.engine, |b, state| {
             let mut start = 0;
             while start < tokens.len() {
                 let mut end = (start + self.n_batch).min(tokens.len());
+                // A checkpoint inside the batch is taken after it, from the
+                // state before its pending tail, where the backend can keep
+                // one; else the batch ends there.
+                let mut tail = 0;
                 if let Some(cut) = cut.filter(|&cut| start < cut && cut < end) {
-                    end = cut;
+                    if model.keeps_tail(b, end - start, end - cut) {
+                        tail = end - cut;
+                    } else {
+                        end = cut;
+                    }
                 }
                 if Some(start) == cut {
-                    checkpoint(model, b, state, self.tokens.len(), &mut self.checkpoints)?;
+                    checkpoint(model, b, state, self.tokens.len(), 0, &mut self.checkpoints)?;
                 }
                 // Only the last token's logits are needed.
                 let logits = (end == tokens.len()).then(|| Logits {
@@ -507,8 +519,15 @@ impl<'m> Session<'m> {
                     out: &mut self.logits[..n_vocab],
                 });
                 let batch = &tokens[start..end];
-                model.forward(b, state, batch, self.tokens.len(), logits)?;
+                b.set_delta_net_tail(tail);
+                let result = model.forward(b, state, batch, self.tokens.len(), logits);
+                b.set_delta_net_tail(0);
+                result?;
                 self.tokens.extend_from_slice(batch);
+                if tail > 0 {
+                    let n_pos = self.tokens.len() - tail;
+                    checkpoint(model, b, state, n_pos, tail, &mut self.checkpoints)?;
+                }
                 start = end;
             }
         });
@@ -616,7 +635,7 @@ impl<'m> Session<'m> {
             // diverge too (a client resending a shared prefix, such as a
             // harness's system prompt): keep the state there.
             if len > from {
-                checkpoint(model, b, state, len, &mut self.checkpoints)?;
+                checkpoint(model, b, state, len, 0, &mut self.checkpoints)?;
             }
             Ok(len - from)
         })
@@ -833,11 +852,14 @@ impl<'m> Session<'m> {
 /// Saves what `state` cannot rewind at position `n_pos`, evicting the
 /// oldest checkpoint (and reusing its buffers) when there are
 /// [`MAX_CHECKPOINTS`]. Does nothing for models that rewind without them.
+/// Keeps a checkpoint of `state` at `n_pos`: as it is, or `drop` tokens
+/// back (a pending tail of the last batch).
 fn checkpoint<B: Backend>(
     model: &Model,
     b: &mut B,
-    state: &State<B>,
+    state: &mut State<B>,
     n_pos: usize,
+    drop: usize,
     checkpoints: &mut Vec<Checkpoint>,
 ) -> Result<()> {
     if n_pos == 0 {
@@ -845,7 +867,7 @@ fn checkpoint<B: Backend>(
     }
     let mut snapshot =
         (checkpoints.len() == MAX_CHECKPOINTS).then(|| checkpoints.remove(0).snapshot);
-    if model.save_state(b, state, &mut snapshot)?
+    if model.save_state(b, state, &mut snapshot, drop)?
         && let Some(snapshot) = snapshot
     {
         checkpoints.push(Checkpoint { n_pos, snapshot });

@@ -22,6 +22,7 @@ macro_rules! args {
 
 args! {
     MatvecArgs { cols: u32, rows: u32, row_bytes: u32, ncols: u32, mode: u32 }
+    GemmSplitK { blocks: u32, tiles_n: u32, tiles: u32, stages: u32 }
     MoeArgs { k: u32, per_slot: u32, expert_rows: u32, count: u32 }
     EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     CountArgs { n: u32 }
@@ -42,6 +43,7 @@ args! {
         n_k_heads: u32, d_k: u32, d_v: u32, key_dim: u32, conv_dim: u32, taps: u32,
         rows: u32, oldest: u32, replay: u32, n: u32, pending: u32, ba_read: u32,
         ba_write: u32, eps: f32, scale: f32, l2_eps: f32, l2_scale: f32,
+        prepped: u32, tail: u32,
     }
 }
 
@@ -56,6 +58,12 @@ pub(crate) struct TypeKernels {
     pub(crate) matvec_c4: Function,
     pub(crate) matvec_id: Function,
     pub(crate) embed: Function,
+    /// The prompt-batch GEMMs (`kernels/gemm.cu`) for the tiles of
+    /// `GEMM_TOKENS`, with their dynamic shared memory, for the types they
+    /// cover.
+    pub(crate) gemm: Option<[(Function, u32); 3]>,
+    /// The fused gate/up GEMMs with SwiGLU (`gemm_glu_*`), as `gemm`.
+    pub(crate) gemm_glu: Option<[(Function, u32); 3]>,
     /// `(values per block, warps, output rows per block)`.
     pub(crate) shape: (u32, u32, u32),
 }
@@ -65,6 +73,8 @@ pub(crate) struct TypeKernels {
 pub(crate) struct Pipelines {
     types: Vec<(u32, TypeKernels)>,
     pub(crate) quantize_q8_1: Function,
+    /// Activations for the GEMM (`quantize_mmq` in `kernels/gemm.cu`).
+    pub(crate) quantize_mmq: Function,
     pub(crate) copy: Function,
     pub(crate) swiglu: Function,
     pub(crate) rmsnorm: Function,
@@ -79,7 +89,12 @@ pub(crate) struct Pipelines {
     pub(crate) attention_kq_mma: Function,
     pub(crate) attention_softmax: Function,
     pub(crate) attention_kqv: Function,
+    /// Prompt-batch flash attention for an F16 cache, by head size.
+    pub(crate) fattn: [(usize, Function); 3],
     pub(crate) delta_net_batch: Function,
+    pub(crate) delta_prep: Function,
+    /// The sequential delta rule after `delta_prep`, by key head size.
+    pub(crate) delta_seq: [(usize, Function); 3],
     pub(crate) delta_norm: Function,
 }
 
@@ -101,6 +116,30 @@ impl Pipelines {
                     matvec_c4: get(&format!("matvec_{name}_c4"))?,
                     matvec_id: get(&format!("matvec_{name}_id"))?,
                     embed: get(&format!("embed_{name}"))?,
+                    gemm: if GEMM_TYPES.contains(code) {
+                        let tile = |t: usize| -> Result<(Function, u32), String> {
+                            Ok((get(&format!("gemm_{name}_{t}"))?, gemm_shared(*code, t)))
+                        };
+                        Some([
+                            tile(GEMM_TOKENS[0])?,
+                            tile(GEMM_TOKENS[1])?,
+                            tile(GEMM_TOKENS[2])?,
+                        ])
+                    } else {
+                        None
+                    },
+                    gemm_glu: if GEMM_TYPES.contains(code) {
+                        let tile = |t: usize| -> Result<(Function, u32), String> {
+                            Ok((get(&format!("gemm_glu_{name}_{t}"))?, gemm_shared(*code, t)))
+                        };
+                        Some([
+                            tile(GEMM_TOKENS[0])?,
+                            tile(GEMM_TOKENS[1])?,
+                            tile(GEMM_TOKENS[2])?,
+                        ])
+                    } else {
+                        None
+                    },
                     shape: *shape,
                 },
             ));
@@ -108,6 +147,7 @@ impl Pipelines {
         Ok(Self {
             types,
             quantize_q8_1: get("quantize_q8_1")?,
+            quantize_mmq: get("quantize_mmq")?,
             copy: get("copy_f32")?,
             swiglu: get("swiglu")?,
             rmsnorm: get("rmsnorm")?,
@@ -122,9 +162,27 @@ impl Pipelines {
             attention_kq_mma: get("attention_kq_mma")?,
             attention_softmax: get("attention_softmax")?,
             attention_kqv: get("attention_kqv")?,
+            fattn: [
+                (64, get("fattn_f16_64")?),
+                (128, get("fattn_f16_128")?),
+                (256, get("fattn_f16_256")?),
+            ],
             delta_net_batch: get("delta_net_batch")?,
+            delta_prep: get("delta_prep")?,
+            delta_seq: [
+                (64, get("delta_seq_64")?),
+                (128, get("delta_seq_128")?),
+                (256, get("delta_seq_256")?),
+            ],
             delta_norm: get("delta_norm")?,
         })
+    }
+
+    /// Every GEMM with its dynamic shared memory.
+    pub(crate) fn gemms(&self) -> impl Iterator<Item = &(Function, u32)> {
+        self.types
+            .iter()
+            .flat_map(|(_, k)| k.gemm.iter().chain(&k.gemm_glu).flatten())
     }
 
     pub(crate) fn get(&self, ty: GgmlType) -> Option<&TypeKernels> {
@@ -169,6 +227,34 @@ pub(crate) const fn is_quantized(ty: GgmlType) -> bool {
         Some(code) => code >= 3,
         None => false,
     }
+}
+
+/// Dynamic shared memory of `fattn_f16_{head_dim}` (`FattnShape` in
+/// `kernels/fattn.cu`).
+pub(crate) const fn fattn_shared(head_dim: usize) -> usize {
+    let kb = if head_dim >= 256 { 32 } else { 64 };
+    2 * (64 * (head_dim + 8) + kb * (head_dim + 8) + head_dim * (kb + 8))
+}
+
+/// The type codes `kernels/gemm.cu` exports a GEMM for.
+const GEMM_TYPES: [u32; 10] = [3, 4, 5, 6, 7, 10, 11, 12, 13, 14];
+
+/// Weight rows of one GEMM block (`GEMM_BM`), and the token tiles of the
+/// exported GEMMs, in the order of `TypeKernels::gemm`.
+pub(crate) const GEMM_ROWS: usize = 128;
+pub(crate) const GEMM_TOKENS: [usize; 3] = [32, 64, 128];
+/// Tokens of the GEMM activations are padded to this (`GEMM_TOK_PAD`), and
+/// a token's activations take this many bytes per 128 values (`GEMM_YS`).
+pub(crate) const GEMM_TOKEN_PAD: usize = 128;
+pub(crate) const GEMM_CHUNK_BYTES: usize = 4 * 44;
+
+/// Dynamic shared memory of the GEMM for type `code` with tiles of
+/// `tokens` (`GemmShared` in `kernels/gemm.cu`): weight rows of 100 words
+/// for types with a min term (Q4_1, Q5_1, Q2_K, Q4_K, Q5_K), else 84, and
+/// two buffers of activations.
+const fn gemm_shared(code: u32, tokens: usize) -> u32 {
+    let with_min = matches!(code, 5 | 7 | 10 | 12 | 13);
+    (4 * (GEMM_ROWS * if with_min { 100 } else { 84 } + 2 * tokens * 44)) as u32
 }
 
 #[rustfmt::skip]

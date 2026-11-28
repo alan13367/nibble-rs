@@ -532,10 +532,13 @@ const PRIME_PROMPT: &str = "Write a short Python function that checks whether a 
 
 /// CUDA against llama.cpp's CUDA path: b12675's
 /// `llama-bin-win-cuda-13.5-x64` build with `-ngl 99 -fa off -b 512 -ub 1`
-/// (the command above otherwise) on an RTX 3070 Ti. The backend's logits
-/// equal llama.cpp's bit for bit, so near-ties are included on purpose: the
-/// Qwen3 Q8_0 case picks " The" over " This" by 0.02 and the Q3_K_M case
-/// "," over " in" by 0.005, where the earlier kernels picked the other token.
+/// (the command above otherwise) on an RTX 3070 Ti. The prompt is evaluated
+/// one token at a time, as `-ub 1` does: batches of more than 8 tokens take
+/// the prompt GEMM, which rounds differently (see
+/// `cuda_prompt_batches_match_llama_cpp_batches`). Those logits equal
+/// llama.cpp's bit for bit, so near-ties are included on purpose: the Qwen3
+/// Q8_0 case picks " The" over " This" by 0.02 and the Q3_K_M case "," over
+/// " in" by 0.005, where the earlier kernels picked the other token.
 #[test]
 #[ignore = "needs models/Qwen3-0.6B-{Q8_0,BF16}.gguf, Qwen3.5-0.8B-{Q8_0,Q3_K_M}.gguf, \
             Qwen3.5-4B-Q8_0.gguf and an NVIDIA GPU"]
@@ -586,7 +589,58 @@ fn cuda_greedy_matches_llama_cpp_cuda() {
     ];
     for (file, prompt, want) in cases {
         let model = load_model(file);
-        let (text, _, _) = greedy_on(&model, prompt, 64, nibble::BackendKind::Cuda, 0);
+        let (text, _, _) = greedy_with(
+            &model,
+            prompt,
+            64,
+            SessionOptions {
+                n_ctx: 512,
+                backend: nibble::BackendKind::Cuda,
+                n_batch: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(text.trim_end(), want, "{file}");
+    }
+}
+
+/// CUDA prompt batches (more than 8 tokens: the GEMM, flash attention and the
+/// split DeltaNet) against llama.cpp b12675's CUDA build with its default
+/// batching (`-ngl 99 -fa off -b 512`, no `-ub`), which runs its own batched
+/// kernels. Both round differently from one token at a time, so the two need
+/// not agree after a near-tie; on these cases they agree. Qwen3.5-4B-Q8_0 is
+/// left out: after "we" its top two logits are 0.05 apart (" can" 24.609,
+/// " need" 24.557 in nibble), and llama.cpp itself flips there between `-ub 1`
+/// (" can", as nibble's batches) and its default batching (" need").
+#[test]
+#[ignore = "needs models/Qwen3-0.6B-{Q8_0,BF16}.gguf, Qwen3.5-0.8B-{Q8_0,Q4_K_M}.gguf, \
+            Qwen3.5-9B-UD-Q4_K_XL.gguf and an NVIDIA GPU"]
+fn cuda_prompt_batches_match_llama_cpp_batches() {
+    let cases = [
+        (
+            "Qwen3-0.6B-Q8_0.gguf",
+            " Also, write a function that takes a list of numbers and returns the sum of the numbers. Additionally, write a function that takes a list of numbers and returns the sum of the numbers, but only if the number is even. Also, write a function that takes a list of numbers and returns the sum of the numbers",
+        ),
+        (
+            "Qwen3-0.6B-BF16.gguf",
+            " - LeetCode\nLeetCode\nLeetCode\nHome\nProblems\nSolutions\nLeetCode\nLeetCode\nHome\nProblems\nSolutions\nLeetCode\nLeetCode\nHome\nProblems\nSolutions\nLeetCode\nLeetCode\nHome\nProblems\nSolutions\nLeetCode\nLe",
+        ),
+        (
+            "Qwen3.5-0.8B-Q8_0.gguf",
+            "\n\nTo determine if a number is prime, we need to check if it has any divisors other than 1 and itself. A prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself.\n\nHere is the Python function:\n\n```python\ndef is_prime",
+        ),
+        (
+            "Qwen3.5-0.8B-Q4_K_M.gguf",
+            "\n\nTo determine if a number is prime, we need to check if it has any divisors other than 1 and itself. A number is prime if it has no divisors other than 1 and itself.\n\nHow does the function work?\n\nThe function takes a number as input and checks if it has any",
+        ),
+        (
+            "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+            "\n\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```\n\nThis function",
+        ),
+    ];
+    for (file, want) in cases {
+        let model = load_model(file);
+        let (text, _, _) = greedy_on(&model, PRIME_PROMPT, 64, nibble::BackendKind::Cuda, 0);
         assert_eq!(text.trim_end(), want, "{file}");
     }
 }
