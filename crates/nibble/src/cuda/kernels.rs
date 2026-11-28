@@ -27,7 +27,8 @@ args! {
     EmbedArgs { cols: u32, row: u32, row_bytes: u32, from_slot: u32 }
     CountArgs { n: u32 }
     RmsArgs { n: u32, eps: f32 }
-    RouteArgs { n_expert: u32, k: u32 }
+    ShortConvArgs { n_embd: u32, taps: u32, rows: u32, oldest: u32, n: u32 }
+    RouteArgs { n_expert: u32, k: u32, sigmoid: u32 }
     MoeSumArgs { n: u32, k: u32, eps: f32 }
     RotateArgs {
         len: u32, block: u32, signs: u32, head_dim: u32, n_k: u32, rep: u32, inverse: u32
@@ -96,6 +97,11 @@ pub(crate) struct Pipelines {
     /// The sequential delta rule after `delta_prep`, by key head size.
     pub(crate) delta_seq: [(usize, Function); 3],
     pub(crate) delta_norm: Function,
+    /// LFM2's shortconv convolution, and the ring store after it.
+    pub(crate) lfm_short_conv: Function,
+    pub(crate) lfm_conv_store: Function,
+    /// `x += add`, then the next block's norm of `x`.
+    pub(crate) add_norm: Function,
 }
 
 impl Pipelines {
@@ -175,6 +181,9 @@ impl Pipelines {
                 (256, get("delta_seq_256")?),
             ],
             delta_norm: get("delta_norm")?,
+            lfm_short_conv: get("lfm_short_conv")?,
+            lfm_conv_store: get("lfm_conv_store")?,
+            add_norm: get("add_norm")?,
         })
     }
 

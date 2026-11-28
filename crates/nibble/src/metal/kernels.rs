@@ -106,8 +106,9 @@ kernel_args! {
     }
     /// The experts of a slot (`MoeArgs` in `shaders/common.metal`).
     struct MoeArgs { k: u32, per_slot: u32, expert_rows: u32, count: u32 }
-    struct RouteArgs { n_expert: u32, k: u32 }
+    struct RouteArgs { n_expert: u32, k: u32, sigmoid: u32 }
     struct MoeSumArgs { n: u32, k: u32, eps: f32 }
+    struct ShortConvArgs { n_embd: u32, taps: u32, rows: u32, oldest: u32, n: u32 }
     struct CountArgs { n: u32 }
     struct AttentionArgs {
         n_pos: u32, head_dim: u32, group: u32, kv_dim: u32, q_stride: u32, gated: u32,
@@ -410,6 +411,11 @@ pub(crate) struct Pipelines {
     pub(crate) moe_map: Pipeline,
     pub(crate) moe_combine: Pipeline,
     pub(crate) moe_residual: Pipeline,
+    /// LFM2's shortconv convolution, and the ring store after it.
+    pub(crate) lfm_short_conv: Pipeline,
+    pub(crate) lfm_conv_store: Pipeline,
+    /// `x += add`, then the next block's norm of `x`.
+    pub(crate) add_norm: Pipeline,
     /// `(G, D, pipeline)` from [`ATTENTIONS`].
     attentions: Vec<(usize, usize, Pipeline)>,
     pub(crate) attention_reduce: Pipeline,
@@ -479,6 +485,9 @@ impl Pipelines {
             moe_map: get("moe_map")?,
             moe_combine: get("moe_combine")?,
             moe_residual: get("moe_residual")?,
+            lfm_short_conv: get("lfm_short_conv")?,
+            lfm_conv_store: get("lfm_conv_store")?,
+            add_norm: get("add_norm")?,
             attentions: ATTENTIONS
                 .iter()
                 .map(|&(g, d)| Ok((g, d, get(&format!("attention_g{g}_d{d}"))?)))

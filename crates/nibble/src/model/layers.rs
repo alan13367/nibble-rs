@@ -8,7 +8,7 @@ use nibble_gguf::Gguf;
 
 use super::bind::{experts, matrix, vector};
 use super::{Logits, ModelConfig};
-use crate::backend::{Backend, Param, Params, QkNorm};
+use crate::backend::{Backend, Gating, Param, Params, QkNorm};
 use crate::cpu::{Experts, Weight};
 use crate::error::Result;
 
@@ -23,6 +23,17 @@ impl Head {
     /// Binds `token_embd`, `output_norm` and `output` (or the token embeddings
     /// when the output projection is tied).
     pub(crate) fn load(g: &Gguf<'_>, c: &ModelConfig, p: &mut Params) -> Result<Self> {
+        Self::load_with_norm(g, c, p, "output_norm.weight")
+    }
+
+    /// As [`Head::load`], with the final norm's tensor name (LFM2 stores it
+    /// as `token_embd_norm`).
+    pub(crate) fn load_with_norm(
+        g: &Gguf<'_>,
+        c: &ModelConfig,
+        p: &mut Params,
+        norm: &str,
+    ) -> Result<Self> {
         let token_embd = matrix(g, "token_embd.weight", c.n_embd, c.n_vocab)?;
         let output = if c.tied_embeddings {
             token_embd
@@ -32,7 +43,7 @@ impl Head {
         Ok(Self {
             token_embd,
             output,
-            output_norm: vector(g, p, "output_norm.weight", c.n_embd)?,
+            output_norm: vector(g, p, norm, c.n_embd)?,
         })
     }
 
@@ -393,7 +404,7 @@ impl Moe {
                 (&self.shared_gate, &mut f.shared_gate),
             ],
         );
-        b.moe_route(&f.logits, n_expert, self.k, &mut f.route);
+        b.moe_route(&f.logits, Gating::Softmax, n_expert, self.k, &mut f.route);
         b.moe_swiglu(
             &self.gate,
             &self.up,

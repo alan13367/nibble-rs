@@ -5,44 +5,58 @@
 struct RouteArgs {
     uint n_expert;
     uint k;
+    uint sigmoid;
 };
 
 // The route of row `t` of the router logits (one simdgroup per row): the
-// softmax, the `k` largest probabilities (the first of equal ones), and
-// those divided by their sum, as the CPU's `moe_route` computes them.
-// `probs` holds `n_expert` floats.
+// gating's probabilities (a softmax over the experts, or LFM2's sigmoid of
+// each with `bias` added to the selection scores, the weights unbiased),
+// the `k` largest scores (the first of equal ones), and the probabilities
+// of those divided by their sum, as the CPU's `moe_route` computes them.
+// `probs` holds `n_expert` floats, `sel` as many after it.
 kernel void moe_route(
         constant RouteArgs & a [[buffer(0)]],
         device const float * logits [[buffer(1)]],
-        device float * route [[buffer(2)]],
+        device const float * bias [[buffer(2)]],
+        device float * route [[buffer(3)]],
         threadgroup float * probs [[threadgroup(0)]],
         uint t [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]]) {
     const uint n = a.n_expert, k = a.k;
+    threadgroup float * sel = probs + n;
     device const float * l = logits + (uint64_t) t * n;
     device float * r = route + (uint64_t) t * 2 * k;
-    float mx = -INFINITY;
-    for (uint i = lane; i < n; i += N_SIMDWIDTH) {
-        mx = max(mx, l[i]);
-    }
-    mx = simd_max(mx);
-    float sum = 0.0f;
-    for (uint i = lane; i < n; i += N_SIMDWIDTH) {
-        const float p = exp(l[i] - mx);
-        probs[i] = p;
-        sum += p;
-    }
-    const float inv = 1.0f / simd_sum(sum);
-    for (uint i = lane; i < n; i += N_SIMDWIDTH) {
-        probs[i] *= inv;
+    if (a.sigmoid == 0) {
+        float mx = -INFINITY;
+        for (uint i = lane; i < n; i += N_SIMDWIDTH) {
+            mx = max(mx, l[i]);
+        }
+        mx = simd_max(mx);
+        float sum = 0.0f;
+        for (uint i = lane; i < n; i += N_SIMDWIDTH) {
+            const float p = exp(l[i] - mx);
+            probs[i] = p;
+            sum += p;
+        }
+        const float inv = 1.0f / simd_sum(sum);
+        for (uint i = lane; i < n; i += N_SIMDWIDTH) {
+            probs[i] *= inv;
+            sel[i] = probs[i];
+        }
+    } else {
+        for (uint i = lane; i < n; i += N_SIMDWIDTH) {
+            const float p = sigmoid(l[i]);
+            probs[i] = p;
+            sel[i] = p + bias[i];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint j = 0; j < k; ++j) {
         float best = -INFINITY;
         uint bi = 0xFFFFFFFFu;
         for (uint i = lane; i < n; i += N_SIMDWIDTH) {
-            if (probs[i] > best) {
-                best = probs[i];
+            if (sel[i] > best) {
+                best = sel[i];
                 bi = i;
             }
         }
@@ -51,8 +65,8 @@ kernel void moe_route(
         if (lane == 0) {
             const uint e = win < n ? win : 0;
             r[j] = (float) e;
-            r[k + j] = m;
-            probs[e] = -INFINITY;
+            r[k + j] = probs[e];
+            sel[e] = -INFINITY;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -124,6 +138,36 @@ kernel void moe_residual(
     float sum = 0.0f;
     for (uint i = tid; i < a.n; i += ntg) {
         const float v = x[row + i] + (moe[row + i] + shared[row + i] * g);
+        x[row + i] = v;
+        sum += v * v;
+    }
+    sum = threadgroup_sum(sum, buf, tiisg, sgitg, nsg);
+    const float scale = 1.0f / sqrt(sum / a.n + a.eps);
+    for (uint i = tid; i < a.n; i += ntg) {
+        out[row + i] = x[row + i] * scale * norm[i];
+    }
+}
+
+// Fused `x[t][i] += add[t][i]`, then `out[t][i] = rmsnorm(x[t])[i] * norm[i]`:
+// one threadgroup per token; the end of a feed-forward whose output has no
+// projection of its own (a mixture of experts' weighted sum).
+kernel void add_norm(
+        constant RmsArgs & a [[buffer(0)]],
+        device const float * add [[buffer(1)]],
+        device float * x [[buffer(2)]],
+        device const float * norm [[buffer(3)]],
+        device float * out [[buffer(4)]],
+        uint t [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[N_SIMDWIDTH];
+    const uint64_t row = (uint64_t) t * a.n;
+    float sum = 0.0f;
+    for (uint i = tid; i < a.n; i += ntg) {
+        const float v = x[row + i] + add[row + i];
         x[row + i] = v;
         sum += v * v;
     }

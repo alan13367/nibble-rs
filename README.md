@@ -4,7 +4,8 @@ A tiny, fast, cross-platform inference engine for GGUF models, written in Rust
 with **zero external dependencies**.
 
 > Early development. Today: Qwen3 (`qwen3`), Qwen3.5 (`qwen35`, hybrid
-> Gated DeltaNet), Qwen3.5/3.6 mixture-of-experts models (`qwen35moe`) and
+> Gated DeltaNet), Qwen3.5/3.6 mixture-of-experts models (`qwen35moe`),
+> Liquid's LFM2 (`lfm2`, hybrid shortconv / attention, and `lfm2moe`) and
 > PrismML's Ternary Bonsai (`qwen35` files with Hadamard-folded weights,
 > `prism.hadamard`) on F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_0,
 > Q2_K–Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL,

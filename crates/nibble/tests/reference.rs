@@ -91,7 +91,10 @@ fn greedy_with(
     options: SessionOptions,
 ) -> (String, StopReason, nibble::DraftStats) {
     let tok = model.tokenizer();
-    let tokens = tok.encode(prompt, true);
+    // BOS first when the model asks for it, as `nibble run` and llama.cpp
+    // start a prompt.
+    let mut tokens: Vec<u32> = tok.bos().filter(|_| tok.add_bos()).into_iter().collect();
+    tokens.extend(tok.encode(prompt, true));
     let mut session = model.session(options).unwrap();
     let mut sampler = Sampler::new(SamplerConfig::greedy());
     let mut decoder = StreamDecoder::new();
@@ -183,6 +186,50 @@ fn qwen35_tokenizer_matches_llama_cpp() {
         &[
             9008, 239, 101, 373, 235, 9008, 239, 102, 373, 235, 9008, 239, 100, 373, 235, 9008,
             239, 99, 2902, 262,
+        ],
+    ];
+    for (text, ids) in TOKENIZER_CASES.iter().zip(expected) {
+        assert_eq!(tok.encode(text, true), ids, "{text:?}");
+        assert_eq!(tok.decode(ids, true), *text);
+    }
+}
+
+/// `llama-tokenize --no-bos` on LFM2's `lfm2` pre-tokenizer (llama.cpp's
+/// llama3 split: digits in groups of three, and whole-token lookups before
+/// merging).
+#[test]
+#[ignore = "needs models/LFM2-350M-Q8_0.gguf"]
+fn lfm2_tokenizer_matches_llama_cpp() {
+    let tok = load_tokenizer("LFM2-350M-Q8_0.gguf");
+    assert!(tok.add_bos());
+    let expected: [&[u32]; 7] = [
+        &[
+            36309, 2031, 510, 859, 6217, 6976, 767, 12914, 509, 905, 730, 10293, 2637, 5743, 523,
+        ],
+        &[
+            637, 739, 574, 4223, 540, 14810, 13328, 49182, 510, 37555, 13174, 1084, 4374, 4459,
+            7133, 1147, 32620, 2763, 2071, 978, 54342, 732, 13421, 749, 745, 13421, 747, 631, 2116,
+            6838, 1124, 35499,
+        ],
+        &[
+            8208, 4644, 2712, 521, 1023, 6016, 2130, 523, 859, 516, 41972, 4549, 936, 521, 2008,
+            1901, 1010, 6351, 540, 5090, 41231, 516, 2753,
+        ],
+        &[
+            730, 5845, 15153, 7954, 707, 707, 905, 61940, 861, 508, 767, 52600, 1764, 767,
+        ],
+        &[
+            6, 6423, 708, 42120, 7, 708, 6, 64015, 708, 537, 36943, 539, 509, 1281, 36943, 539, 509,
+        ],
+        &[
+            6355, 611, 6355, 616, 6355, 626, 34801, 607, 50008, 17903, 609, 14860, 733, 6355, 611,
+            61840, 617, 30170, 730, 14922, 613, 14922, 610, 14922, 619, 14922, 613, 14922, 752,
+            14922, 623, 14922, 736, 14922, 606, 14922, 619, 14922, 758, 16686, 6836, 753, 2626,
+            49663, 821, 10186, 578, 10186,
+        ],
+        &[
+            13421, 749, 611, 844, 745, 13421, 749, 612, 844, 745, 13421, 749, 610, 844, 745, 13421,
+            749, 609, 2832, 861,
         ],
     ];
     for (text, ids) in TOKENIZER_CASES.iter().zip(expected) {
@@ -333,6 +380,66 @@ fn qwen35_q3_k_m_greedy_matches_llama_cpp() {
 /// tokens of plain decoding, which match llama.cpp's on the CPU, and the
 /// drafts are mostly accepted (llama.cpp b12722's own MTP drafting accepts
 /// 81% on Metal and 88% on the CPU for the chat prompt, 3 drafts per step).
+/// LFM2's shortconv / attention hybrid: a plain completion, code, and a
+/// ChatML turn (the template's `{{bos_token}}` is the BOS the session adds).
+#[test]
+#[ignore = "needs models/LFM2-350M-Q8_0.gguf"]
+fn lfm2_q8_0_greedy_matches_llama_cpp() {
+    let model = load_model("LFM2-350M-Q8_0.gguf");
+    let cases = [
+        (
+            PRESS_PROMPT,
+            " the invention of movable type in the 15th century. This innovation, attributed to \
+             Johannes Gutenberg in Mainz, Germany, revolutionized the dissemination of \
+             information. Before this, books were painstakingly copied by hand, a process that \
+             was both time-consuming and expensive. Gutenberg's press, which",
+        ),
+        (
+            PRIME_PROMPT,
+            "\n\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in \
+             range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    \
+             return True\n```\n\nHow does this function work",
+        ),
+        (
+            "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n",
+            "To solve \\( 17 \\times 23 \\), we can use the distributive property (also known \
+             as the FOIL method for binomials):\n\n\\[\n17 \\times 23 = (20 - 3) \\times \
+             23\n\\]\n\nFirst, multiply the first terms:\n\n\\[\n20 \\",
+        ),
+    ];
+    for (prompt, want) in cases {
+        let (text, _) = greedy(&model, prompt, 64);
+        assert_eq!(text.trim_end(), want, "{prompt:?}");
+    }
+}
+
+/// The same prompts on the unquantized file (F16 weights meet the f32
+/// activations as they are). These also agree with llama.cpp with flash
+/// attention on.
+#[test]
+#[ignore = "needs models/LFM2-350M-F16.gguf"]
+fn lfm2_f16_greedy_matches_llama_cpp() {
+    let model = load_model("LFM2-350M-F16.gguf");
+    let cases = [
+        (
+            PRESS_PROMPT,
+            " the invention of movable type in the 15th century. This innovation, attributed to Johannes Gutenberg in Mainz, Germany, revolutionized the dissemination of information. Before this, books were painstakingly copied by hand, a process that was both time-consuming and expensive. Gutenberg's press, which",
+        ),
+        (
+            PRIME_PROMPT,
+            "\n\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```\n\nHow does this function work",
+        ),
+        (
+            "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n",
+            "To solve \\( 17 \\times 23 \\), we can use the distributive property (also known as the FOIL method for binomials):\n\n\\[\n17 \\times 23 = (20 - 3) \\times 23\n\\]\n\nFirst, multiply the first terms:\n\n\\[\n20 \\",
+        ),
+    ];
+    for (prompt, want) in cases {
+        let (text, _) = greedy(&model, prompt, 64);
+        assert_eq!(text.trim_end(), want, "{prompt:?}");
+    }
+}
+
 #[test]
 #[ignore = "needs models/Qwen3.5-4B-Q8_0.gguf"]
 fn qwen35_4b_drafting_gives_the_tokens_of_plain_decoding() {
@@ -538,10 +645,12 @@ const PRIME_PROMPT: &str = "Write a short Python function that checks whether a 
 /// `cuda_prompt_batches_match_llama_cpp_batches`). Those logits equal
 /// llama.cpp's bit for bit, so near-ties are included on purpose: the Qwen3
 /// Q8_0 case picks " The" over " This" by 0.02 and the Q3_K_M case "," over
-/// " in" by 0.005, where the earlier kernels picked the other token.
+/// " in" by 0.005, where the earlier kernels picked the other token. LFM2's
+/// case follows llama.cpp's CUDA text, " Which" after "15th century.",
+/// where llama.cpp's CPU path (and nibble's) continues " This".
 #[test]
 #[ignore = "needs models/Qwen3-0.6B-{Q8_0,BF16}.gguf, Qwen3.5-0.8B-{Q8_0,Q3_K_M}.gguf, \
-            Qwen3.5-4B-Q8_0.gguf and an NVIDIA GPU"]
+            Qwen3.5-4B-Q8_0.gguf, LFM2-350M-{Q8_0,F16}.gguf and an NVIDIA GPU"]
 fn cuda_greedy_matches_llama_cpp_cuda() {
     let cases = [
         (
@@ -586,6 +695,18 @@ fn cuda_greedy_matches_llama_cpp_cuda() {
              divisibility by all integers from 2 up to the square root of the number. If any \
              of these divide the number evenly, it is",
         ),
+        (
+            "LFM2-350M-Q8_0.gguf",
+            PRESS_PROMPT,
+            " the invention of movable type in the 15th century. Which of the following figures \
+             is credited with the first known use of movable type in Europe?\nA) Johannes \
+             Gutenberg\nB) Aldus Manutius\nC) William Caen\nD) Johannes Föhrt\nAnswer: A",
+        ),
+        (
+            "LFM2-350M-F16.gguf",
+            PRIME_PROMPT,
+            "\n\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```\n\nHow does this function work",
+        ),
     ];
     for (file, prompt, want) in cases {
         let model = load_model(file);
@@ -614,7 +735,7 @@ fn cuda_greedy_matches_llama_cpp_cuda() {
 /// (" can", as nibble's batches) and its default batching (" need").
 #[test]
 #[ignore = "needs models/Qwen3-0.6B-{Q8_0,BF16}.gguf, Qwen3.5-0.8B-{Q8_0,Q4_K_M}.gguf, \
-            Qwen3.5-9B-UD-Q4_K_XL.gguf and an NVIDIA GPU"]
+            Qwen3.5-9B-UD-Q4_K_XL.gguf, LFM2-350M-Q8_0.gguf and an NVIDIA GPU"]
 fn cuda_prompt_batches_match_llama_cpp_batches() {
     let cases = [
         (
@@ -636,6 +757,10 @@ fn cuda_prompt_batches_match_llama_cpp_batches() {
         (
             "Qwen3.5-9B-UD-Q4_K_XL.gguf",
             "\n\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```\n\nThis function",
+        ),
+        (
+            "LFM2-350M-Q8_0.gguf",
+            "\n\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```\n\nHow does this function work",
         ),
     ];
     for (file, want) in cases {

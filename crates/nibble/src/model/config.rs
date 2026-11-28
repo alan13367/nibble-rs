@@ -121,8 +121,48 @@ pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConf
             .ok_or_else(|| Error::MissingMetadata(m.key("feed_forward_length")))?,
     };
     let n_ff = non_zero("feed_forward_length", n_ff)?;
+    let block_count = m.usize("block_count")?;
     let n_head = m.usize("attention.head_count")?;
-    let n_head_kv = m.usize_opt("attention.head_count_kv")?.unwrap_or(n_head);
+    // LFM2 stores one count per block here, 0 for a shortconv block; the
+    // attention blocks must share one count (llama.cpp's `get_key_or_arr`).
+    let n_head_kv = match g.get(&m.key("attention.head_count_kv")) {
+        None => n_head,
+        Some(v) => match v.as_u64() {
+            Some(n) => usize::try_from(n)
+                .map_err(|_| m.invalid("attention.head_count_kv", "does not fit"))?,
+            None => {
+                let arr = v.as_array().ok_or_else(|| {
+                    m.invalid(
+                        "attention.head_count_kv",
+                        format!("expected an unsigned integer, found {v:?}"),
+                    )
+                })?;
+                if arr.len() != block_count {
+                    return Err(
+                        m.invalid("attention.head_count_kv", "must have one value per block")
+                    );
+                }
+                let mut kv = 0;
+                for e in arr.iter() {
+                    let n = e
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| m.invalid("attention.head_count_kv", "expected integers"))?;
+                    if n != 0 {
+                        if kv == 0 {
+                            kv = n;
+                        } else if n != kv {
+                            return Err(m.invalid(
+                                "attention.head_count_kv",
+                                "a non-zero count must be one value; 0 marks a shortconv block",
+                            ));
+                        }
+                    }
+                }
+                kv
+            }
+        },
+    };
     if n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 {
         return Err(m.invalid(
             "attention.head_count_kv",
@@ -146,7 +186,6 @@ pub(crate) fn read(g: &Gguf<'_>, architecture: Architecture) -> Result<ModelConf
             "must be even and at most the head size",
         ));
     }
-    let block_count = m.usize("block_count")?;
     let nextn = m.usize_opt("nextn_predict_layers")?.unwrap_or(0);
     let n_layer = block_count
         .checked_sub(nextn)

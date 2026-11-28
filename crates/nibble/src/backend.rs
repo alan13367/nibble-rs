@@ -400,6 +400,59 @@ impl DeltaNetDims {
     }
 }
 
+/// The sizes of an LFM2 shortconv layer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShortConvDims {
+    /// Taps of the causal convolution (`lfm2.shortconv.l_cache`), oldest
+    /// first.
+    pub(crate) taps: usize,
+    /// Channels: the model's hidden size.
+    pub(crate) n_embd: usize,
+}
+
+impl ShortConvDims {
+    /// Rows of the convolution history: the `taps - 1` values of `b * x`
+    /// before the next token, a ring whose oldest live row is
+    /// [`ShortConvState::oldest`].
+    pub(crate) const fn conv_rows(self) -> usize {
+        self.taps - 1
+    }
+
+    /// Length of the convolution history ([`ShortConvDims::conv_rows`] rows
+    /// of [`ShortConvDims::n_embd`] values).
+    pub(crate) const fn conv_len(self) -> usize {
+        self.conv_rows() * self.n_embd
+    }
+}
+
+/// An LFM2 shortconv layer's recurrent state: the last
+/// [`ShortConvDims::conv_rows`] values of `b * x`, oldest first from
+/// [`ShortConvState::oldest`], which the next batch's first tokens read
+/// before their own values.
+pub(crate) struct ShortConvState<V> {
+    /// The convolution history ([`ShortConvDims::conv_len`]).
+    pub(crate) conv: V,
+    /// The ring row of the oldest value in `conv`.
+    pub(crate) oldest: usize,
+}
+
+/// How a mixture-of-experts router turns its logits into the experts it
+/// runs, as llama.cpp's `build_moe_ffn` does.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Gating {
+    /// `ggml_soft_max` over every expert: the `k` most probable, weighted
+    /// by their probabilities divided by their sum (Qwen's routers).
+    Softmax,
+    /// LFM2's: `ggml_sigmoid` of each expert on its own, the top `k` of the
+    /// sigmoid values plus `bias` (DeepSeek's selection bias, the
+    /// `ffn_exp_probs_b` bias) selected, weighted by the unbiased values
+    /// divided by their sum.
+    Sigmoid {
+        /// The selection bias, one value per expert.
+        bias: Param,
+    },
+}
+
 /// A DeltaNet layer's parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DeltaNetParams {
@@ -634,13 +687,14 @@ pub(crate) trait Backend {
     );
 
     /// The experts of every row of the router `logits` (`n_expert` values
-    /// per row), as llama.cpp's `build_moe_ffn` chooses them with softmax
-    /// gating: the `k` most probable, with their probabilities divided by
-    /// their sum. Row `t` of `route` holds the `k` expert indices (as exact
-    /// floats) then their `k` weights.
+    /// per row), as llama.cpp's `build_moe_ffn` chooses them under `gating`:
+    /// the `k` most probable, with their weights divided by their sum. Row
+    /// `t` of `route` holds the `k` expert indices (as exact floats) then
+    /// their `k` weights.
     fn moe_route(
         &mut self,
         logits: &Self::Vector,
+        gating: Gating,
         n_expert: usize,
         k: usize,
         route: &mut Self::Vector,
@@ -732,6 +786,33 @@ pub(crate) trait Backend {
         z: &mut Self::Vector,
         beta: &mut Self::Vector,
         alpha: &mut Self::Vector,
+        out: &mut Self::Vector,
+    );
+
+    /// The batch's tokens through an LFM2 shortconv layer after its
+    /// `in_proj` into `bcx` (3 rows of `n_embd` values per token: the gates
+    /// `b`, then `c`, then the input `x`): each token's `b * x` joins the
+    /// state's window, its causal convolution over the window's `taps`
+    /// values (oldest tap first) is gated by the token's own `c`, and the
+    /// ring keeps the last `taps - 1` values for the next batch.
+    fn short_conv(
+        &mut self,
+        d: ShortConvDims,
+        taps: Param,
+        state: &mut ShortConvState<Self::Vector>,
+        bcx: &Self::Vector,
+        out: &mut Self::Vector,
+    );
+
+    /// `x += add`, then `out = rmsnorm(x) * norm` for every row: the end of
+    /// a block whose output has no projection of its own (a mixture of
+    /// experts' weighted sum).
+    fn add_norm(
+        &mut self,
+        add: &Self::Vector,
+        x: &mut Self::Vector,
+        norm: Param,
+        eps: f32,
         out: &mut Self::Vector,
     );
 }

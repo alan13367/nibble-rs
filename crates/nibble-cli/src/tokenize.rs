@@ -14,6 +14,8 @@ Usage: nibble tokenize -m <model.gguf> (-p TEXT | -f FILE) [options]
   -f, --file FILE          Read the text from a file
       --ids                Print only the ids, as a list
       --no-parse-special   Treat control tokens like <|im_start|> as plain text
+      --no-bos             Do not start with the BOS token (added, as
+                           llama-tokenize adds it, when the model asks for one)
       --specials           List the special tokens instead
 ";
 
@@ -21,6 +23,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     let mut model = ModelOptions::new();
     let mut prompt = None;
     let (mut ids_only, mut parse_special, mut list_specials) = (false, true, false);
+    let mut bos = true;
     while let Some(arg) = args.next()? {
         match arg {
             Arg::Flag(f)
@@ -28,6 +31,7 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
             Arg::Flag(f) => match f.as_str() {
                 "--ids" => ids_only = true,
                 "--no-parse-special" => parse_special = false,
+                "--no-bos" => bos = false,
                 "--specials" => list_specials = true,
                 "-h" | "--help" => {
                     print!("{HELP}");
@@ -82,7 +86,14 @@ pub(crate) fn run(mut args: Args) -> CliResult<()> {
     }
 
     let text = prompt.ok_or("nothing to tokenize: pass -p TEXT or -f FILE")?;
-    let ids = tok.encode(&text, parse_special);
+    let mut ids = Vec::new();
+    if bos
+        && tok.add_bos()
+        && let Some(bos) = tok.bos()
+    {
+        ids.push(bos);
+    }
+    ids.extend(tok.encode(&text, parse_special));
     if ids_only {
         writeln!(out, "{ids:?}")?;
     } else {

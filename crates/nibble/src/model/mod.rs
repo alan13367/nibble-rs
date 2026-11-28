@@ -16,6 +16,7 @@ mod bonsai;
 mod config;
 mod hadamard;
 mod layers;
+mod lfm2;
 mod qwen3;
 mod qwen35;
 
@@ -42,11 +43,22 @@ pub enum Architecture {
     Qwen35,
     /// Qwen3.5 hybrid models with mixture-of-experts feed-forwards (`qwen35moe`).
     Qwen35Moe,
+    /// Liquid's hybrid shortconv / attention models (`lfm2`).
+    Lfm2,
+    /// Liquid's hybrid models with mixture-of-experts feed-forwards
+    /// (`lfm2moe`).
+    Lfm2Moe,
 }
 
 impl Architecture {
     /// Every supported architecture.
-    pub const ALL: &'static [Self] = &[Self::Qwen3, Self::Qwen35, Self::Qwen35Moe];
+    pub const ALL: &'static [Self] = &[
+        Self::Qwen3,
+        Self::Qwen35,
+        Self::Qwen35Moe,
+        Self::Lfm2,
+        Self::Lfm2Moe,
+    ];
 
     /// The GGUF architecture name.
     #[must_use]
@@ -55,6 +67,8 @@ impl Architecture {
             Self::Qwen3 => "qwen3",
             Self::Qwen35 => "qwen35",
             Self::Qwen35Moe => "qwen35moe",
+            Self::Lfm2 => "lfm2",
+            Self::Lfm2Moe => "lfm2moe",
         }
     }
 
@@ -77,6 +91,7 @@ enum Arch {
     Qwen35(qwen35::Qwen35),
     /// A `qwen35` file with folded weights (PrismML's Ternary Bonsai).
     Bonsai(Box<bonsai::Bonsai>),
+    Lfm2(lfm2::Lfm2),
 }
 
 /// Per-session state of an architecture (KV caches, recurrent state, scratch)
@@ -85,6 +100,7 @@ pub(crate) enum State<B: Backend> {
     Qwen3(qwen3::State<B>),
     Qwen35(qwen35::State<B>),
     Bonsai(bonsai::State<B>),
+    Lfm2(lfm2::State<B>),
 }
 
 /// A loaded model: weights (memory-mapped or in memory), tokenizer and config.
@@ -161,7 +177,12 @@ impl Model {
             let arch = match architecture {
                 // Folded weights would compute wrong results unrotated; only
                 // dense `qwen35` files have a model that rotates them.
-                Architecture::Qwen3 | Architecture::Qwen35Moe if bonsai::is_folded(&g) => {
+                Architecture::Qwen3
+                | Architecture::Qwen35Moe
+                | Architecture::Lfm2
+                | Architecture::Lfm2Moe
+                    if bonsai::is_folded(&g) =>
+                {
                     return Err(Error::InvalidMetadata {
                         key: "prism.hadamard.version".into(),
                         reason: format!("folded weights are not supported for {architecture}"),
@@ -173,6 +194,9 @@ impl Model {
                 }
                 Architecture::Qwen35 | Architecture::Qwen35Moe => {
                     Arch::Qwen35(qwen35::Qwen35::load(&g, &config, p)?)
+                }
+                Architecture::Lfm2 | Architecture::Lfm2Moe => {
+                    Arch::Lfm2(lfm2::Lfm2::load(&g, &config, p)?)
                 }
             };
             let tokenizer = Tokenizer::from_gguf(&g)?;
@@ -230,7 +254,7 @@ impl Model {
     #[must_use]
     pub const fn has_mtp(&self) -> bool {
         match &self.arch {
-            Arch::Qwen3(_) => false,
+            Arch::Qwen3(_) | Arch::Lfm2(_) => false,
             Arch::Qwen35(m) => m.has_mtp(),
             Arch::Bonsai(m) => m.has_mtp(),
         }
@@ -279,6 +303,7 @@ impl Model {
             Arch::Qwen3(_) => State::Qwen3(qwen3::Qwen3::new_state(b, c, n_ctx, n_batch)?),
             Arch::Qwen35(m) => State::Qwen35(m.new_state(b, c, n_ctx, n_batch, mtp)?),
             Arch::Bonsai(m) => State::Bonsai(m.new_state(b, c, n_ctx, n_batch, mtp)?),
+            Arch::Lfm2(m) => State::Lfm2(m.new_state(b, c, n_ctx, n_batch)?),
         })
     }
 
@@ -341,6 +366,7 @@ impl Model {
             (Arch::Qwen3(m), State::Qwen3(s)) => m.forward(b, c, s, tokens, pos, logits),
             (Arch::Qwen35(m), State::Qwen35(s)) => m.forward(b, c, s, tokens, pos, logits),
             (Arch::Bonsai(m), State::Bonsai(s)) => m.forward(b, c, s, tokens, pos, logits),
+            (Arch::Lfm2(m), State::Lfm2(s)) => m.forward(b, c, s, tokens, pos, logits),
             _ => unreachable!("session state belongs to a different architecture"),
         }
     }
@@ -364,13 +390,21 @@ impl Model {
             }
             State::Qwen35(s) => s.rewind(b, from, to),
             State::Bonsai(s) => s.base.rewind(b, from, to),
+            State::Lfm2(s) => match &self.arch {
+                Arch::Lfm2(m) => s.rewind(b, m.has_conv(), from, to),
+                _ => unreachable!("session state belongs to a different architecture"),
+            },
         }
     }
 
     /// Whether the state has recurrent parts that [`Model::save_state`]
     /// copies (sessions take checkpoints only then).
     pub(crate) const fn has_recurrent_state(&self) -> bool {
-        !matches!(self.arch, Arch::Qwen3(_))
+        match &self.arch {
+            Arch::Qwen3(_) => false,
+            Arch::Lfm2(m) => m.has_conv(),
+            _ => true,
+        }
     }
 
     /// Copies the parts of `state` that cannot be rewound into `snapshot`,
@@ -385,6 +419,19 @@ impl Model {
         snapshot: &mut Option<Snapshot>,
         drop: usize,
     ) -> Result<bool> {
+        // LFM2's shortconv histories have no pending tokens, so a tail
+        // would never be dropped ([`Model::keeps_tail`] is false).
+        if let (Arch::Lfm2(m), State::Lfm2(s)) = (&self.arch, &mut *state) {
+            debug_assert_eq!(drop, 0);
+            if let Some(Snapshot::Lfm2(target)) = snapshot {
+                s.save(b, m.dims(), target)?;
+            } else {
+                let mut target = lfm2::Snapshot::default();
+                s.save(b, m.dims(), &mut target)?;
+                *snapshot = Some(Snapshot::Lfm2(target));
+            }
+            return Ok(true);
+        }
         // A Bonsai model's recurrent state is Qwen3.5's.
         let (dims, s) = match (&self.arch, state) {
             (Arch::Qwen35(m), State::Qwen35(s)) => (m.dims(), s),
@@ -408,7 +455,7 @@ impl Model {
         let d = match &self.arch {
             Arch::Qwen35(m) => m.dims(),
             Arch::Bonsai(m) => m.dims(),
-            Arch::Qwen3(_) => return false,
+            Arch::Qwen3(_) | Arch::Lfm2(_) => return false,
         };
         b.delta_net_tail(d)
             && n > MAX_PENDING
@@ -432,6 +479,9 @@ impl Model {
             (Arch::Bonsai(m), State::Bonsai(s), Snapshot::Qwen35(saved)) => {
                 s.base.restore(b, m.dims(), saved, n_pos)
             }
+            (Arch::Lfm2(m), State::Lfm2(s), Snapshot::Lfm2(saved)) => {
+                s.restore(b, m.dims(), saved, n_pos)
+            }
             _ => unreachable!("snapshot belongs to a different architecture"),
         }
     }
@@ -448,4 +498,5 @@ pub(crate) struct Logits<'a> {
 /// they were at some position.
 pub(crate) enum Snapshot {
     Qwen35(qwen35::Snapshot),
+    Lfm2(lfm2::Snapshot),
 }

@@ -43,12 +43,12 @@ use device::{Buffer, Commands, Device, Size};
 use kernels::{
     AttentionArgs, CountArgs, DeltaArgs, DeltaBatchArgs, EmbedArgs, FlashArgs, MatmulArgs,
     MatmulIdArgs, MatvecArgs, MoeArgs, MoeMapArgs, MoeSumArgs, Pipelines, RmsApplyArgs, RmsArgs,
-    RotateArgs, RouteArgs,
+    RotateArgs, RouteArgs, ShortConvArgs,
 };
 
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvCacheType, KvTypes, MAX_LOGIT_ROWS,
-    MAX_PENDING, ModelData, Param, QkNorm, Rotation,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, Gating, KvCacheType, KvTypes,
+    MAX_LOGIT_ROWS, MAX_PENDING, ModelData, Param, QkNorm, Rotation, ShortConvDims, ShortConvState,
 };
 use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
@@ -1289,6 +1289,7 @@ impl Backend for MetalBackend<'_> {
     fn moe_route(
         &mut self,
         logits: &MetalVector,
+        gating: Gating,
         n_expert: usize,
         k: usize,
         route: &mut MetalVector,
@@ -1297,7 +1298,11 @@ impl Backend for MetalBackend<'_> {
             u32_of(n_expert, "an expert count"),
             u32_of(k, "an expert count"),
         ) {
-            (Ok(n_expert), Ok(k)) => RouteArgs { n_expert, k },
+            (Ok(n_expert), Ok(k)) => RouteArgs {
+                n_expert,
+                k,
+                sigmoid: matches!(gating, Gating::Sigmoid { .. }) as u32,
+            },
             (Err(e), _) | (_, Err(e)) => return self.fail(e),
         };
         if n_expert > MAX_EXPERTS {
@@ -1306,6 +1311,12 @@ impl Backend for MetalBackend<'_> {
         if self.n == 0 || !self.reserve(1) {
             return;
         }
+        // The bias is only read under sigmoid gating; binding the arena is
+        // simpler than a second pipeline for the softmax path.
+        let bias = match gating {
+            Gating::Sigmoid { bias } => Self::param_offset(bias),
+            Gating::Softmax => 0,
+        };
         self.moe_mapped = None;
         let Some(commands) = self.commands.as_mut() else {
             return;
@@ -1314,8 +1325,10 @@ impl Backend for MetalBackend<'_> {
         commands.set_pipeline(&self.pipelines.moe_route);
         commands.set_bytes(0, &args);
         commands.set_buffer(1, &logits.buffer, 0);
-        commands.set_buffer(2, &route.buffer, 0);
-        commands.set_threadgroup_memory(0, 4 * n_expert.next_multiple_of(4));
+        commands.set_buffer(2, &self.params, bias);
+        commands.set_buffer(3, &route.buffer, 0);
+        // The kernel keeps the probabilities and the selection scores.
+        commands.set_threadgroup_memory(0, 8 * n_expert.next_multiple_of(4));
         commands.dispatch(Size::new(self.n, 1, 1), Size::new(32, 1, 1));
     }
 
@@ -1461,6 +1474,93 @@ impl Backend for MetalBackend<'_> {
             commands.dispatch(Size::new(self.n, 1, 1), Size::new(THREADS, 1, 1));
             self.clear_rms_if(&out.buffer);
         }
+    }
+
+    fn short_conv(
+        &mut self,
+        d: ShortConvDims,
+        taps: Param,
+        state: &mut ShortConvState<MetalVector>,
+        bcx: &MetalVector,
+        out: &mut MetalVector,
+    ) {
+        let rows = d.conv_rows();
+        let args = match (
+            u32_of(d.n_embd, "a hidden size"),
+            u32_of(d.taps, "a tap count"),
+            u32_of(rows, "a history size"),
+            u32_of(state.oldest, "a ring row"),
+            u32_of(self.n, "a batch size"),
+        ) {
+            (Ok(n_embd), Ok(taps), Ok(rows), Ok(oldest), Ok(n)) => ShortConvArgs {
+                n_embd,
+                taps,
+                rows,
+                oldest,
+                n,
+            },
+            (Err(e), _, _, _, _)
+            | (_, Err(e), _, _, _)
+            | (_, _, Err(e), _, _)
+            | (_, _, _, Err(e), _)
+            | (_, _, _, _, Err(e)) => {
+                return self.fail(e);
+            }
+        };
+        if self.n == 0 || !self.reserve(2) {
+            return;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return;
+        };
+        let blocks = d.n_embd.div_ceil(THREADS);
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.lfm_short_conv);
+        commands.set_bytes(0, &args);
+        commands.set_buffer(1, &bcx.buffer, 0);
+        commands.set_buffer(2, &self.params, Self::param_offset(taps));
+        commands.set_buffer(3, &state.conv.buffer, 0);
+        commands.set_buffer(4, &out.buffer, 0);
+        commands.dispatch(Size::new(self.n, blocks, 1), Size::new(THREADS, 1, 1));
+        // The last rows' `b * x` values go back into the ring after the
+        // convolutions have read it (one encoder commits the two kernels).
+        let keep = self.n.min(rows);
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.lfm_conv_store);
+        commands.set_bytes(0, &args);
+        commands.set_buffer(1, &bcx.buffer, 0);
+        commands.set_buffer(2, &state.conv.buffer, 0);
+        commands.dispatch(Size::new(keep, blocks, 1), Size::new(THREADS, 1, 1));
+        state.oldest = (state.oldest + self.n) % rows;
+    }
+
+    fn add_norm(
+        &mut self,
+        add: &MetalVector,
+        x: &mut MetalVector,
+        norm: Param,
+        eps: f32,
+        out: &mut MetalVector,
+    ) {
+        let args = RmsArgs {
+            n: norm.len() as u32,
+            eps,
+        };
+        if self.n == 0 || !self.reserve(1) {
+            return;
+        }
+        let Some(commands) = self.commands.as_mut() else {
+            return;
+        };
+        commands.barrier();
+        commands.set_pipeline(&self.pipelines.add_norm);
+        commands.set_bytes(0, &args);
+        commands.set_buffer(1, &add.buffer, 0);
+        commands.set_buffer(2, &x.buffer, 0);
+        commands.set_buffer(3, &self.params, Self::param_offset(norm));
+        commands.set_buffer(4, &out.buffer, 0);
+        commands.dispatch(Size::new(self.n, 1, 1), Size::new(THREADS, 1, 1));
+        self.clear_rms_if(&out.buffer);
     }
 
     fn check_delta_net(&self, d: DeltaNetDims) -> Result<()> {

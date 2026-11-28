@@ -26,12 +26,12 @@ use device::{Buffer, Device, Module, Stream};
 use driver::DevicePtr;
 use kernels::{
     AttentionArgs, CountArgs, DeltaBatchArgs, EmbedArgs, MatvecArgs, MoeArgs, MoeSumArgs,
-    Pipelines, RmsArgs, RotateArgs, RouteArgs,
+    Pipelines, RmsArgs, RotateArgs, RouteArgs, ShortConvArgs,
 };
 
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvCacheType, KvTypes, MAX_LOGIT_ROWS,
-    MAX_PENDING, ModelData, Param, QkNorm, Rotation,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, Gating, KvCacheType, KvTypes,
+    MAX_LOGIT_ROWS, MAX_PENDING, ModelData, Param, QkNorm, Rotation, ShortConvDims, ShortConvState,
 };
 use crate::cpu::{Experts, Weight};
 use crate::error::{Error, Result};
@@ -1462,6 +1462,7 @@ impl Backend for CudaBackend<'_> {
     fn moe_route(
         &mut self,
         logits: &CudaVector,
+        gating: Gating,
         n_expert: usize,
         k: usize,
         route: &mut CudaVector,
@@ -1472,19 +1473,30 @@ impl Backend for CudaBackend<'_> {
             }
             return;
         }
+        let mut bias = match gating {
+            Gating::Softmax => 0,
+            Gating::Sigmoid { bias } => match self.param_ptr(bias) {
+                Ok(p) => p,
+                Err(e) => return self.fail(e),
+            },
+        };
         let mut logits = logits.buffer.ptr();
         let mut out = route.buffer.ptr();
         let mut args = RouteArgs {
             n_expert: n_expert as u32,
             k: k as u32,
+            sigmoid: matches!(gating, Gating::Sigmoid { .. }) as u32,
         };
+        // The kernel keeps the probabilities and the selection scores.
+        let shared = 2 * n_expert.next_multiple_of(4);
         self.record(launch!(
             self.stream,
             &self.pipelines.moe_route,
             [self.n as u32, 1, 1],
             [32, 1, 1],
-            (4 * n_expert.next_multiple_of(4)) as u32,
+            (4 * shared) as u32,
             logits,
+            bias,
             out,
             args
         ));
@@ -2065,5 +2077,95 @@ impl Backend for CudaBackend<'_> {
             state.pending_row = if tail > 0 { ba_write } else { 0 };
         }
         self.invalidate_encoded(out.buffer.ptr());
+    }
+
+    fn short_conv(
+        &mut self,
+        d: ShortConvDims,
+        taps: Param,
+        state: &mut ShortConvState<CudaVector>,
+        bcx: &CudaVector,
+        out: &mut CudaVector,
+    ) {
+        if self.n == 0 {
+            return;
+        }
+        let e = d.n_embd as u32;
+        let rows = d.conv_rows();
+        let mut taps = match self.param_ptr(taps) {
+            Ok(p) => p,
+            Err(err) => return self.fail(err),
+        };
+        let mut args = ShortConvArgs {
+            n_embd: e,
+            taps: d.taps as u32,
+            rows: rows as u32,
+            oldest: state.oldest as u32,
+            n: self.n as u32,
+        };
+        let mut bcx = bcx.buffer.ptr();
+        let mut ring = state.conv.buffer.ptr();
+        let mut out_ptr = out.buffer.ptr();
+        self.record(launch!(
+            self.stream,
+            &self.pipelines.lfm_short_conv,
+            [self.n as u32, e.div_ceil(THREADS), 1],
+            [THREADS, 1, 1],
+            0,
+            bcx,
+            taps,
+            ring,
+            out_ptr,
+            args
+        ));
+        // The last rows' `b * x` values go back into the ring after the
+        // convolutions have read it (a stream orders the two kernels).
+        let keep = self.n.min(rows);
+        self.record(launch!(
+            self.stream,
+            &self.pipelines.lfm_conv_store,
+            [keep as u32, e.div_ceil(THREADS), 1],
+            [THREADS, 1, 1],
+            0,
+            bcx,
+            ring,
+            args
+        ));
+        state.oldest = (state.oldest + self.n) % rows;
+    }
+
+    fn add_norm(
+        &mut self,
+        add: &CudaVector,
+        x: &mut CudaVector,
+        norm: Param,
+        eps: f32,
+        out: &mut CudaVector,
+    ) {
+        if self.n == 0 {
+            return;
+        }
+        let e = norm.len();
+        let mut add_ptr = add.buffer.ptr();
+        let mut xptr = x.buffer.ptr();
+        let mut norm_ptr = match self.param_ptr(norm) {
+            Ok(p) => p,
+            Err(err) => return self.fail(err),
+        };
+        let mut out_ptr = out.buffer.ptr();
+        let mut args = RmsArgs { n: e as u32, eps };
+        self.record(launch!(
+            self.stream,
+            &self.pipelines.add_norm,
+            [self.n as u32, 1, 1],
+            [rms_block_size(e).max(THREADS), 1, 1],
+            0,
+            add_ptr,
+            xptr,
+            norm_ptr,
+            out_ptr,
+            args
+        ));
+        self.invalidate_encoded(out_ptr);
     }
 }

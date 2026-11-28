@@ -15,6 +15,10 @@
 //!
 //! `Qwen35` is the same with `\p{M}` (combining marks) joined to letters:
 //! `[\p{L}\p{M}]+` in the second branch and `[^\s\p{L}\p{M}\p{N}]+` in the fourth.
+//!
+//! `Llama3` (`llama3`, and LFM2's `lfm2` alias) differs only in its third
+//! branch: `\p{N}{1,3}`, numbers in groups of up to three digits, as
+//! llama.cpp's `unicode_regex_split_custom_llama3` splits them.
 
 use super::unicode::{is_letter, is_mark, is_number, is_space};
 
@@ -25,17 +29,21 @@ pub(crate) enum PreTokenizer {
     Qwen2,
     /// `qwen35` (Qwen3.5 and later).
     Qwen35,
+    /// `llama3`, and LFM2's `lfm2` alias of it (llama.cpp maps both to its
+    /// llama3 pattern).
+    Llama3,
 }
 
 impl PreTokenizer {
     /// The `tokenizer.ggml.pre` values this module implements.
-    pub(crate) const NAMES: &[&str] = &["qwen2", "qwen35"];
+    pub(crate) const NAMES: &[&str] = &["qwen2", "qwen35", "llama3", "lfm2"];
 
     /// Maps a `tokenizer.ggml.pre` value to a pre-tokenizer.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "qwen2" => Some(Self::Qwen2),
             "qwen35" => Some(Self::Qwen35),
+            "llama3" | "lfm2" => Some(Self::Llama3),
             _ => None,
         }
     }
@@ -97,9 +105,15 @@ impl PreTokenizer {
             return word_run(i + 1);
         }
 
-        // 3. \p{N}
+        // 3. \p{N} for Qwen, \p{N}{1,3} for Llama3: numbers in groups
+        // of up to three digits.
         if is_number(c) {
-            return i + 1;
+            let max = if self == Self::Llama3 { 3 } else { 1 };
+            let mut j = i + 1;
+            while j < n && j - i < max && is_number(s[j].1) {
+                j += 1;
+            }
+            return j;
         }
 
         // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
@@ -199,6 +213,25 @@ mod tests {
         // A combining mark ends a Qwen2 word but joins a Qwen35 one.
         check(Qwen2, "e\u{301}x", &["e", "\u{301}x"]);
         check(Qwen35, "e\u{301}x", &["e\u{301}x"]);
+    }
+
+    #[test]
+    fn llama3_groups_digits() {
+        use super::PreTokenizer::Llama3;
+        check(Llama3, "Hello world", &["Hello", " world"]);
+        check(Llama3, "12345", &["123", "45"]);
+        check(Llama3, "1234567", &["123", "456", "7"]);
+        check(Llama3, "a 1,234.5", &["a", " ", "1", ",", "234", ".", "5"]);
+        check(Llama3, "I'm 2x", &["I", "'m", " ", "2", "x"]);
+        check(Llama3, "x\n\ny", &["x", "\n\n", "y"]);
+        check(
+            Llama3,
+            "they'RE we'll you'd",
+            &["they", "'RE", " we", "'ll", " you", "'d"],
+        );
+        // Qwen keeps single digits; Llama3 differs only there.
+        check(Qwen2, "12345", &["1", "2", "3", "4", "5"]);
+        assert_eq!(Llama3.split("x 1 y").concat(), "x 1 y");
     }
 
     #[test]

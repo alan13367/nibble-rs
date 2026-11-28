@@ -179,7 +179,9 @@ impl Tokenizer {
         let add_bos = g
             .get("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(match &encoder {
+                Encoder::Bpe(b) => b.adds_bos(),
+            });
 
         let mut end_of_generation: Vec<u32> = [eos, eot].into_iter().flatten().collect();
         for (i, text) in texts.iter().enumerate() {

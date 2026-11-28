@@ -12,8 +12,8 @@ use super::{
     l2_norm_chunks, rmsnorm, rmsnorm_chunks, rope_neox, rope_table, sigmoid, softplus,
 };
 use crate::backend::{
-    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, KvTypes, MAX_LOGIT_ROWS, MAX_PENDING,
-    ModelData, Param, QkNorm, Rotation,
+    Backend, DeltaNetDims, DeltaNetParams, DeltaNetState, Gating, KvTypes, MAX_LOGIT_ROWS,
+    MAX_PENDING, ModelData, Param, QkNorm, Rotation, ShortConvDims, ShortConvState,
 };
 use crate::error::Result;
 
@@ -41,9 +41,11 @@ pub(crate) struct CpuBackend<'m> {
     /// The token slots of [`Backend::argmax`].
     slots: [u32; MAX_LOGIT_ROWS],
     /// The experts of the current mixture-of-experts layer, `k` per token,
-    /// and the router's probabilities and their order for one token.
+    /// and the router's probabilities, selection scores and order for one
+    /// token.
     expert_ids: Vec<usize>,
     probs: Vec<f32>,
+    sel: Vec<f32>,
     order: Vec<usize>,
     /// One DeltaNet layer's state, which a batch that stays pending runs on.
     work: Vec<f32>,
@@ -72,6 +74,7 @@ impl<'m> CpuBackend<'m> {
             slots: [0; MAX_LOGIT_ROWS],
             expert_ids: Vec::new(),
             probs: Vec::new(),
+            sel: Vec::new(),
             order: Vec::new(),
             work: Vec::new(),
             replay: Default::default(),
@@ -359,25 +362,56 @@ impl Backend for CpuBackend<'_> {
             .swiglu(self.model.bytes, gate, up, x, &mut self.input, out, up_out);
     }
 
-    fn moe_route(&mut self, logits: &Vec<f32>, n_expert: usize, k: usize, route: &mut Vec<f32>) {
+    fn moe_route(
+        &mut self,
+        logits: &Vec<f32>,
+        gating: Gating,
+        n_expert: usize,
+        k: usize,
+        route: &mut Vec<f32>,
+    ) {
         let kernels = self.cpu.kernels();
         // Grows once, to the router's width.
         self.probs.resize(n_expert, 0.0);
+        self.sel.resize(n_expert, 0.0);
         self.order.resize(n_expert, 0);
         let rows = logits
             .chunks_exact(n_expert)
             .zip(route.chunks_exact_mut(2 * k));
         for (logits, route) in rows.take(self.n) {
-            let (probs, order) = (&mut self.probs, &mut self.order);
-            probs.copy_from_slice(logits);
-            kernels.softmax(probs);
+            let bias = match gating {
+                Gating::Sigmoid { bias } => Some(self.param(bias)),
+                Gating::Softmax => None,
+            };
+            let (probs, sel, order) = (&mut self.probs, &mut self.sel, &mut self.order);
+            match bias {
+                None => {
+                    probs.copy_from_slice(logits);
+                    kernels.softmax(probs);
+                    sel.copy_from_slice(probs);
+                }
+                // Each expert's probability on its own; the selection
+                // scores also carry the bias (`build_moe_ffn`'s
+                // `selection_probs`), the weights stay unbiased.
+                Some(bias) => {
+                    for (((p, s), &l), &b) in probs
+                        .iter_mut()
+                        .zip(sel.iter_mut())
+                        .zip(logits.iter())
+                        .zip(bias)
+                    {
+                        *p = sigmoid(l);
+                        *s = *p + b;
+                    }
+                }
+            }
             // ggml's `argsort` (descending, `std::sort`) then its first `k`;
-            // equal probabilities, which ggml leaves in no particular order,
-            // go by index here.
+            // equal scores, which ggml leaves in no particular order, go by
+            // index here.
             for (i, o) in order.iter_mut().enumerate() {
                 *o = i;
             }
-            let by_prob = |a: &usize, b: &usize| probs[*b].total_cmp(&probs[*a]).then(a.cmp(b));
+            let by_prob = |a: &usize, b: &usize| sel[*b].total_cmp(&sel[*a]).then(a.cmp(b));
             if k < n_expert {
                 order.select_nth_unstable_by(k, by_prob);
             }
@@ -755,6 +789,128 @@ impl Backend for CpuBackend<'_> {
                     *o *= z;
                 }
             }
+        }
+    }
+
+    fn short_conv(
+        &mut self,
+        d: ShortConvDims,
+        taps: Param,
+        state: &mut ShortConvState<Vec<f32>>,
+        bcx: &Vec<f32>,
+        out: &mut Vec<f32>,
+    ) {
+        let (e, rows) = (d.n_embd, d.conv_rows());
+        let taps = self.param(taps);
+        let n = self.n;
+        let bcx = &bcx[..n * 3 * e];
+        let out = &mut out[..n * e];
+        // Each token's convolution over the taps values before it and its
+        // own: the ring's window for the values before the batch, the
+        // batch's own b and x rows after. Each channel sums from zero,
+        // oldest tap first, with one fused multiply-add per tap, as clang
+        // compiles ggml_ssm_conv's sumf += s*c, and the b * x values are
+        // rounded products, as ggml_mul makes them.
+        let token = |t: usize, out: &mut [f32], ring: &[f32], oldest: usize| {
+            out.fill(0.0);
+            for (k, tap) in taps.chunks_exact(e).enumerate() {
+                let p = t as isize - rows as isize + k as isize;
+                if p >= 0 {
+                    let p = p as usize;
+                    let b = &bcx[p * 3 * e..p * 3 * e + e];
+                    let x = &bcx[p * 3 * e + 2 * e..p * 3 * e + 3 * e];
+                    for (((o, &bi), &xi), &w) in out.iter_mut().zip(b).zip(x).zip(tap) {
+                        *o = (bi * xi).mul_add(w, *o);
+                    }
+                } else {
+                    let row = ((oldest as isize + rows as isize + p) as usize) % rows;
+                    let v = &ring[row * e..(row + 1) * e];
+                    for ((o, &x), &w) in out.iter_mut().zip(v).zip(tap) {
+                        *o = x.mul_add(w, *o);
+                    }
+                }
+            }
+            let c = &bcx[t * 3 * e + e..t * 3 * e + 2 * e];
+            for (o, &g) in out.iter_mut().zip(c) {
+                *o *= g;
+            }
+        };
+        if n >= 4 && self.cpu.threads() > 1 {
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let split = Split {
+                segments: 1,
+                chunk_len: per_task * e,
+            };
+            let ring: &[f32] = &state.conv;
+            let oldest = state.oldest;
+            self.cpu
+                .pool()
+                .for_each_segment_chunk([&mut out[..n * e]], split, |_, _, chunk| {
+                    let t0 = chunk.start() / e;
+                    for (t, out) in chunk.segment(0).chunks_exact_mut(e).enumerate() {
+                        token(t0 + t, out, ring, oldest);
+                    }
+                });
+        } else {
+            for (t, out) in out.chunks_exact_mut(e).enumerate() {
+                token(t, out, &state.conv, state.oldest);
+            }
+        }
+        // The ring keeps the last rows' values, each written to the row
+        // after its window, as the serial loop would leave them.
+        let keep = n.min(rows);
+        for t in (n - keep)..n {
+            let row = (state.oldest + t) % rows;
+            let b = &bcx[t * 3 * e..t * 3 * e + e];
+            let x = &bcx[t * 3 * e + 2 * e..t * 3 * e + 3 * e];
+            for ((o, &bi), &xi) in state.conv[row * e..(row + 1) * e].iter_mut().zip(b).zip(x) {
+                *o = bi * xi;
+            }
+        }
+        state.oldest = (state.oldest + n) % rows;
+    }
+
+    fn add_norm(
+        &mut self,
+        add: &Vec<f32>,
+        x: &mut Vec<f32>,
+        norm: Param,
+        eps: f32,
+        out: &mut Vec<f32>,
+    ) {
+        let (d, n) = (norm.len(), self.n);
+        let weight = self.param(norm);
+        let (add, x, out) = (&add[..n * d], &mut x[..n * d], &mut out[..n * d]);
+        if n >= 4 && self.cpu.threads() > 1 {
+            let per_task = n.div_ceil(self.cpu.threads() * 2).max(1);
+            let split = Split {
+                segments: 1,
+                chunk_len: per_task * d,
+            };
+            self.cpu.pool().for_each_segment_chunk_pair(
+                x,
+                split,
+                out,
+                split,
+                |_, x_chunk, out_chunk| {
+                    let start = x_chunk.start();
+                    let xs = x_chunk.segment(0);
+                    let os = out_chunk.segment(0);
+                    add_in_place(xs, &add[start..start + xs.len()]);
+                    for (o, xv) in os.chunks_exact_mut(d).zip(xs.chunks_exact(d)) {
+                        rmsnorm(o, xv, weight, eps);
+                    }
+                },
+            );
+            return;
+        }
+        for ((x, o), a) in x
+            .chunks_exact_mut(d)
+            .zip(out.chunks_exact_mut(d))
+            .zip(add.chunks_exact(d))
+        {
+            add_in_place(x, a);
+            rmsnorm(o, x, weight, eps);
         }
     }
 }

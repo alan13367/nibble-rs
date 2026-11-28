@@ -1791,3 +1791,67 @@ kernel void argmax(
         slot[0] = idx == 0xFFFFFFFFu ? 0 : idx;
     }
 }
+
+// --- LFM2's shortconv block -----------------------------------------------
+
+struct ShortConvArgs {
+    uint n_embd;
+    uint taps;
+    uint rows;   // taps - 1
+    uint oldest;
+    uint n;      // tokens of the batch
+};
+
+// One thread per channel of one token: the causal convolution of `b * x`
+// over the taps values before the token (the ring's window before the
+// batch, the batch's own `b` and `x` rows after), oldest tap first, one
+// fused multiply-add per tap as ggml-metal's `kernel_ssm_conv_f32_f32`
+// sums (the serial kernel, which it picks for a tap count not divisible by
+// four), gated by the token's own `c`.
+kernel void lfm_short_conv(
+        constant ShortConvArgs & a [[buffer(0)]],
+        device const float * bcx [[buffer(1)]],
+        device const float * taps [[buffer(2)]],
+        device const float * ring [[buffer(3)]],
+        device float * out [[buffer(4)]],
+        uint2 tpg [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const int c = int(tpg.y * ntg + tiitg);
+    if (c >= int(a.n_embd)) {
+        return;
+    }
+    const int e = int(a.n_embd);
+    const int t = int(tpg.x);
+    float sumf = 0.0f;
+    for (uint k = 0; k < a.taps; ++k) {
+        const int p = t - int(a.rows) + int(k);
+        const float bx = p >= 0
+            ? bcx[(uint64_t) p * 3 * e + c] * bcx[(uint64_t) p * 3 * e + 2 * e + c]
+            : ring[(uint64_t) ((int(a.oldest) + int(a.rows) + p) % int(a.rows)) * e + c];
+        sumf = fma(bx, taps[k * e + c], sumf);
+    }
+    out[(uint64_t) t * e + c] = bcx[(uint64_t) t * 3 * e + e + c] * sumf;
+}
+
+// The last `threadgroups_per_grid.x` tokens' `b * x` values go back into
+// the ring, each to the row after its window, as the serial semantics
+// leaves them. One encoder commits this after `lfm_short_conv`, so no
+// token reads a row this overwrites.
+kernel void lfm_conv_store(
+        constant ShortConvArgs & a [[buffer(0)]],
+        device const float * bcx [[buffer(1)]],
+        device float * ring [[buffer(2)]],
+        uint3 tpg [[threadgroup_position_in_grid]],
+        uint3 tpgig [[threadgroups_per_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const int c = int(tpg.y * ntg + tiitg);
+    if (c >= int(a.n_embd)) {
+        return;
+    }
+    const int e = int(a.n_embd);
+    const uint t = a.n - tpgig.x + tpg.x;
+    const uint row = (a.oldest + t) % a.rows;
+    ring[(uint64_t) row * e + c] = bcx[(uint64_t) t * 3 * e + c] * bcx[(uint64_t) t * 3 * e + 2 * e + c];
+}

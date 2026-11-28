@@ -16,6 +16,10 @@ pub(super) struct Bpe {
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Token for each single byte.
     byte_tokens: [u32; 256],
+    /// The byte-encoded text of every token, when a pre-tokenized piece is
+    /// looked up whole before merging (`ignore_merges`, llama.cpp's
+    /// `llama3`/`lfm2` pre-tokenizers).
+    pieces: Option<HashMap<Box<str>, u32>>,
     pre: PreTokenizer,
 }
 
@@ -48,6 +52,18 @@ impl Bpe {
                 .ok_or_else(|| err(format!("no token for byte 0x{b:02x}")))?;
         }
 
+        // llama.cpp's `llama3` and `lfm2` pre-tokenizers set
+        // `ignore_merges`: a pre-tokenized piece that is itself a token is
+        // looked up whole, its bytes mapped as any merge's are.
+        let ignore_merges = matches!(pre, PreTokenizer::Llama3);
+        let pieces = ignore_merges.then(|| {
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.as_str().into(), i as u32))
+                .collect()
+        });
+
         let merge_list = g
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.as_array())
@@ -76,13 +92,33 @@ impl Bpe {
         Ok(Self {
             merges,
             byte_tokens,
+            pieces,
             pre,
         })
     }
 
+    /// Whether prompts start with BOS when `tokenizer.ggml.add_bos_token`
+    /// is absent: llama.cpp's default for the pre-tokenizer.
+    pub(super) const fn adds_bos(&self) -> bool {
+        matches!(self.pre, PreTokenizer::Llama3)
+    }
+
     /// Encodes plain text (no special tokens) into `out`.
     pub(super) fn encode(&self, text: &str, out: &mut Vec<u32>) {
+        let mut mapped = String::new();
         for piece in self.pre.split(text) {
+            if let Some(pieces) = &self.pieces {
+                // The piece in GPT-2's byte encoding, as llama.cpp's split
+                // (`byte_encode = true`) hands `text_to_token`.
+                mapped.clear();
+                for b in piece.bytes() {
+                    mapped.push(BYTE_TO_CHAR[b as usize]);
+                }
+                if let Some(&id) = pieces.get(mapped.as_str()) {
+                    out.push(id);
+                    continue;
+                }
+            }
             self.merge_piece(piece, out);
         }
     }
